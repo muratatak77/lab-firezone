@@ -1,0 +1,379 @@
+defmodule Portal.FlowLog do
+  use Ecto.Schema
+  import Ecto.Changeset
+  require Logger
+
+  defmodule Outer do
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    @type t :: %__MODULE__{
+            src_ip: String.t() | nil,
+            src_port: :inet.port_number() | nil,
+            dst_ip: String.t(),
+            dst_port: :inet.port_number(),
+            path_activated_at: DateTime.t() | nil
+          }
+
+    embedded_schema do
+      field :src_ip, :string
+      field :src_port, :integer
+      field :dst_ip, :string
+      field :dst_port, :integer
+      field :path_activated_at, :utc_datetime_usec
+    end
+
+    def changeset(outer, attrs) do
+      outer
+      |> cast(attrs, [:src_ip, :src_port, :dst_ip, :dst_port, :path_activated_at])
+      |> validate_required([:dst_ip, :dst_port])
+      |> validate_source_endpoint()
+      |> validate_ip(:src_ip)
+      |> validate_ip(:dst_ip)
+      |> validate_number(:src_port,
+        greater_than_or_equal_to: 0,
+        less_than_or_equal_to: 65_535
+      )
+      |> validate_number(:dst_port,
+        greater_than_or_equal_to: 0,
+        less_than_or_equal_to: 65_535
+      )
+    end
+
+    defp validate_source_endpoint(changeset) do
+      case {get_field(changeset, :src_ip), get_field(changeset, :src_port)} do
+        {nil, nil} ->
+          changeset
+
+        {nil, _src_port} ->
+          add_error(changeset, :src_ip, "must be present when src_port is present")
+
+        {_src_ip, nil} ->
+          add_error(changeset, :src_port, "must be present when src_ip is present")
+
+        {_src_ip, _src_port} ->
+          changeset
+      end
+    end
+
+    defp validate_ip(changeset, field) do
+      case get_field(changeset, field) do
+        nil ->
+          changeset
+
+        value ->
+          case Portal.Types.IP.cast(value) do
+            {:ok, ip} -> put_change(changeset, field, Portal.Types.IP.to_string(ip))
+            {:error, opts} -> add_error(changeset, field, "is invalid", opts)
+            :error -> add_error(changeset, field, "is invalid")
+          end
+      end
+    end
+  end
+
+  @primary_key false
+  @foreign_key_type :binary_id
+  @timestamps_opts [type: :utc_datetime_usec]
+
+  @type t :: %__MODULE__{
+          account_id: Ecto.UUID.t(),
+          log_id: Portal.Types.LogId.t(),
+          seq: pos_integer(),
+          initiator_device_id: Ecto.UUID.t(),
+          responder_device_id: Ecto.UUID.t(),
+          role: :initiator | :responder,
+          policy_authorization_id: Ecto.UUID.t(),
+          policy_id: Ecto.UUID.t(),
+          initiator_auth_provider_id: Ecto.UUID.t() | nil,
+          resource_id: Ecto.UUID.t(),
+          resource_name: String.t(),
+          resource_address: String.t() | nil,
+          initiator_actor_id: Ecto.UUID.t(),
+          initiator_actor_email: String.t() | nil,
+          initiator_actor_name: String.t(),
+          authorized_at: DateTime.t(),
+          authorization_expires_at: DateTime.t(),
+          initiator_client_version: String.t() | nil,
+          initiator_device_os_name: String.t() | nil,
+          initiator_device_os_version: String.t() | nil,
+          initiator_device_serial: String.t() | nil,
+          initiator_device_uuid: String.t() | nil,
+          initiator_device_identifier_for_vendor: String.t() | nil,
+          initiator_device_firebase_installation_id: String.t() | nil,
+          protocol: :tcp | :udp,
+          inner_src_ip: Portal.Types.IP.t(),
+          inner_dst_ip: Portal.Types.IP.t(),
+          inner_src_port: :inet.port_number(),
+          inner_dst_port: :inet.port_number(),
+          domain: String.t() | nil,
+          outers: [Outer.t()] | nil,
+          flow_start: DateTime.t(),
+          flow_end: DateTime.t() | nil,
+          last_packet: DateTime.t() | nil,
+          rx_packets: non_neg_integer() | nil,
+          tx_packets: non_neg_integer() | nil,
+          rx_bytes: non_neg_integer() | nil,
+          tx_bytes: non_neg_integer() | nil,
+          inserted_at: DateTime.t()
+        }
+
+  @roles [:initiator, :responder]
+  @protocols [:tcp, :udp]
+
+  # No column is relative to the side that reported the row: connlib orients
+  # the inner tunnel tuple to (initiator-src, responder-dst) and counts tx as
+  # initiator-to-responder on both sides, so a flow's two rows differ only in
+  # `role` and in the counters each side observed independently.
+  #
+  # The primary key is the natural flow identity, tagged primary_key: true
+  # field-by-field below: the account, the initiating device, the reporting
+  # role, the inner tunnel 6-tuple (protocol, inner src/dst ip+port), the
+  # resource, and flow_start. responder_device_id stays out of it because the
+  # authorization already determines it. log_id is a random public handle, not
+  # part of the key. flow_start is included partly because Postgres requires
+  # the partition key in every key on a partitioned table. See the partition
+  # migration.
+  schema "flow_logs" do
+    belongs_to :account, Portal.Account, primary_key: true
+    field :log_id, Portal.Types.LogId
+    field :seq, :integer, read_after_writes: true
+    field :start_seq, :integer
+
+    field :initiator_device_id, :binary_id, primary_key: true
+    field :responder_device_id, :binary_id
+    field :role, Ecto.Enum, values: @roles, primary_key: true
+
+    field :policy_authorization_id, :binary_id
+    field :policy_id, :binary_id
+    field :resource_id, :binary_id, primary_key: true
+    field :resource_name, :string
+    field :resource_address, :string
+    field :authorized_at, :utc_datetime_usec
+    field :authorization_expires_at, :utc_datetime_usec
+
+    # For device-to-device flows the receiving client has an owner of its own
+    # that these do not record.
+    field :initiator_actor_id, :binary_id
+    field :initiator_actor_email, :string
+    field :initiator_actor_name, :string
+    field :initiator_auth_provider_id, :binary_id
+
+    field :initiator_client_version, :string
+    field :initiator_device_os_name, :string
+    field :initiator_device_os_version, :string
+    field :initiator_device_serial, :string
+    field :initiator_device_uuid, :string
+    field :initiator_device_identifier_for_vendor, :string
+    field :initiator_device_firebase_installation_id, :string
+
+    field :protocol, Ecto.Enum, values: @protocols, primary_key: true
+
+    field :inner_src_ip, Portal.Types.IP, primary_key: true
+    field :inner_dst_ip, Portal.Types.IP, primary_key: true
+    field :inner_src_port, :integer, primary_key: true
+    field :inner_dst_port, :integer, primary_key: true
+    field :domain, :string
+
+    embeds_many :outers, Outer, on_replace: :delete
+
+    field :flow_start, :utc_datetime_usec, primary_key: true
+    field :flow_end, :utc_datetime_usec
+    field :last_packet, :utc_datetime_usec
+
+    field :rx_packets, :integer
+    field :tx_packets, :integer
+    field :rx_bytes, :integer
+    field :tx_bytes, :integer
+
+    timestamps(updated_at: false)
+  end
+
+  # Postgres bigint is a signed 64-bit integer.
+  @bigint_max 9_223_372_036_854_775_807
+
+  @uuid_fields ~w[account_id initiator_device_id responder_device_id policy_authorization_id
+                  policy_id initiator_auth_provider_id resource_id initiator_actor_id]a
+  @port_fields ~w[inner_src_port inner_dst_port]a
+  @counter_fields ~w[rx_packets tx_packets rx_bytes tx_bytes]a
+  @bounded_string_fields ~w[resource_name resource_address initiator_actor_name
+                            initiator_actor_email initiator_client_version
+                            initiator_device_os_name initiator_device_os_version
+                            initiator_device_serial initiator_device_uuid
+                            initiator_device_identifier_for_vendor
+                            initiator_device_firebase_installation_id domain]a
+
+  # The attribution snapshot, inner tunnel tuple, protocol, and flow_start are
+  # all known when a flow side opens, so they are required. Outer paths may be
+  # included on open and are replaced by the complete accumulated path list on
+  # close. flow_end, last_packet, and byte/packet counters are nullable to
+  # support open-then-close reporting; domain is nullable because only DNS resources carry one,
+  # resource_address because internet and device-pool resources have none, and
+  # initiator_actor_email / initiator_auth_provider_id because not every actor
+  # or credential has one.
+  def changeset(%Ecto.Changeset{} = changeset) do
+    changeset
+    |> cast_embed(:outers, with: &Outer.changeset/2)
+    |> validate_required([
+      :account_id,
+      :log_id,
+      :initiator_device_id,
+      :responder_device_id,
+      :role,
+      :policy_authorization_id,
+      :policy_id,
+      :resource_id,
+      :resource_name,
+      :initiator_actor_id,
+      :initiator_actor_name,
+      :authorized_at,
+      :authorization_expires_at,
+      :protocol,
+      :inner_src_ip,
+      :inner_dst_ip,
+      :inner_src_port,
+      :inner_dst_port,
+      :flow_start
+    ])
+    |> validate_uuids()
+    |> validate_ports()
+    |> validate_counters()
+    |> validate_outers_match_flow_state()
+    |> validate_close_complete()
+    |> validate_string_lengths()
+    |> validate_partition_window()
+    # Flow ordering against authorized_at / flow_end is not enforced because
+    # endpoint clocks may be skewed. Only the retained partition window bounds
+    # flow_start. These constraints duplicate the DB CHECKs because the
+    # controller writes via insert_all, which
+    # raises on a CHECK violation instead of returning a 422.
+    |> check_constraint(:role,
+      name: :flow_logs_role_chk,
+      message: "must be initiator or responder"
+    )
+    |> check_constraint(:protocol,
+      name: :flow_logs_protocol_chk,
+      message: "must be tcp or udp"
+    )
+  end
+
+  # Match the UTC dates guaranteed by PartitionLogTables, including on a fresh
+  # database. A timestamp outside this window must not fail the entire batch.
+  defp validate_partition_window(changeset) do
+    %Date.Range{first: first, last: last} =
+      Portal.Workers.PartitionLogTables.ingestion_dates(Date.utc_today())
+
+    case get_field(changeset, :flow_start) do
+      %DateTime{} = flow_start ->
+        date = DateTime.to_date(flow_start)
+
+        if Date.compare(date, first) == :lt or Date.compare(date, last) == :gt do
+          add_error(
+            changeset,
+            :flow_start,
+            "must be within the ingestion window (%{first} through %{last} UTC)",
+            first: Date.to_iso8601(first),
+            last: Date.to_iso8601(last)
+          )
+        else
+          changeset
+        end
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp validate_uuids(changeset) do
+    Enum.reduce(@uuid_fields, changeset, fn field, cs ->
+      case get_field(cs, field) do
+        nil -> cs
+        value -> validate_uuid(cs, field, value)
+      end
+    end)
+  end
+
+  defp validate_uuid(changeset, field, value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, _} -> changeset
+      :error -> add_error(changeset, field, "is not a valid UUID")
+    end
+  end
+
+  defp validate_ports(changeset) do
+    Enum.reduce(@port_fields, changeset, fn field, cs ->
+      validate_number(cs, field, greater_than_or_equal_to: 0, less_than_or_equal_to: 65_535)
+    end)
+  end
+
+  # The gateway counts packets/bytes in u64, but bigint is a signed i64, so a
+  # counter above the column max would overflow and raise on insert_all, taking
+  # the whole batch with it. It should never happen in normal operation, so the
+  # record is rejected (surfaced as a 422) and an error is logged so we are
+  # alerted if it ever does.
+  defp validate_counters(changeset) do
+    Enum.reduce(@counter_fields, changeset, fn field, cs ->
+      case get_field(cs, field) do
+        value when is_integer(value) and value > @bigint_max ->
+          Logger.error("flow_log #{field} exceeds the bigint maximum, rejecting record",
+            account_id: get_field(cs, :account_id),
+            initiator_device_id: get_field(cs, :initiator_device_id),
+            role: get_field(cs, :role),
+            value: value
+          )
+
+          add_error(cs, field, "must be less than or equal to %{number}",
+            number: @bigint_max,
+            validation: :number,
+            kind: :less_than_or_equal_to
+          )
+
+        _ ->
+          validate_number(cs, field, greater_than_or_equal_to: 0)
+      end
+    end)
+  end
+
+  defp validate_outers_match_flow_state(changeset) do
+    case {get_field(changeset, :flow_end), get_field(changeset, :outers)} do
+      {nil, _outers} -> changeset
+      {_flow_end, []} -> add_error(changeset, :outers, "can't be blank")
+      {_flow_end, _outers} -> changeset
+    end
+  end
+
+  # A close (flow_end set) must carry its accounting: the gateway flow tracker
+  # always emits last_packet and the counters on a completed flow, so a close
+  # missing them is malformed. An open (flow_end nil) leaves them nil. Counters
+  # may be zero (one-way flows, payload-less packets), so only presence, not a
+  # positive value, is required. Mirrors the flow_logs_close_complete DB CHECK,
+  # which would otherwise raise on insert_all instead of returning a 422.
+  defp validate_close_complete(changeset) do
+    case get_field(changeset, :flow_end) do
+      nil -> changeset
+      _ -> validate_required(changeset, [:last_packet | @counter_fields])
+    end
+  end
+
+  defp validate_string_lengths(changeset) do
+    Enum.reduce(@bounded_string_fields, changeset, fn field, cs ->
+      validate_length(cs, field, max: 255)
+    end)
+  end
+
+  def outers_to_maps(nil), do: nil
+
+  def outers_to_maps(outers) do
+    Enum.map(outers, fn outer ->
+      %{
+        src_ip: outer.src_ip,
+        src_port: outer.src_port,
+        dst_ip: outer.dst_ip,
+        dst_port: outer.dst_port,
+        path_activated_at: outer.path_activated_at
+      }
+    end)
+  end
+
+end

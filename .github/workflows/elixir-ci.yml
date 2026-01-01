@@ -1,0 +1,16 @@
+name: Elixir CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  elixir:
+    uses: ./.github/workflows/_elixir.yml
+    with:
+      check_openapi_breaking_changes: false
+    secrets: inherit
+    permissions:
+      checks: write
+      pull-requests: write

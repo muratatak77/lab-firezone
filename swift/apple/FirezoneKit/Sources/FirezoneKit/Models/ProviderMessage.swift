@@ -1,0 +1,106 @@
+//
+//  ProviderMessage.swift
+//  (c) 2024 Firezone, Inc.
+//  LICENSE: Apache-2.0
+//
+//  Encodes / Decodes messages to the provider service.
+
+import Foundation
+
+public enum ProviderMessage: Codable {
+  case pollUpdates(StatePollRequest)
+  case setInternetResourceEnabled(Bool)
+  case setLogFilter(String)
+  case setAdditionalHostCandidates([String])
+  case signOut
+  case clearLogs
+  case getLogFolderSize
+  case exportLogs
+  case getEncodedFirezoneId
+  case drainFlowLogs
+  case getStatus
+
+  enum CodingKeys: String, CodingKey {
+    case type
+    case value
+  }
+
+  enum MessageType: String, Codable {
+    case pollUpdates
+    case setInternetResourceEnabled
+    case setLogFilter
+    case setAdditionalHostCandidates
+    case signOut
+    case clearLogs
+    case getLogFolderSize
+    case exportLogs
+    case getEncodedFirezoneId
+    case drainFlowLogs
+    case getStatus
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let type = try container.decode(MessageType.self, forKey: .type)
+    switch type {
+    case .pollUpdates:
+      let value = try container.decode(StatePollRequest.self, forKey: .value)
+      self = .pollUpdates(value)
+    case .setInternetResourceEnabled:
+      let value = try container.decode(Bool.self, forKey: .value)
+      self = .setInternetResourceEnabled(value)
+    case .setLogFilter:
+      let value = try container.decode(String.self, forKey: .value)
+      self = .setLogFilter(value)
+    case .setAdditionalHostCandidates:
+      let value = try container.decode([String].self, forKey: .value)
+      self = .setAdditionalHostCandidates(value)
+    case .signOut:
+      self = .signOut
+    case .clearLogs:
+      self = .clearLogs
+    case .getLogFolderSize:
+      self = .getLogFolderSize
+    case .exportLogs:
+      self = .exportLogs
+    case .getEncodedFirezoneId:
+      self = .getEncodedFirezoneId
+    case .drainFlowLogs:
+      self = .drainFlowLogs
+    case .getStatus:
+      self = .getStatus
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    switch self {
+    case .pollUpdates(let value):
+      try container.encode(MessageType.pollUpdates, forKey: .type)
+      try container.encode(value, forKey: .value)
+    case .setInternetResourceEnabled(let value):
+      try container.encode(MessageType.setInternetResourceEnabled, forKey: .type)
+      try container.encode(value, forKey: .value)
+    case .setLogFilter(let value):
+      try container.encode(MessageType.setLogFilter, forKey: .type)
+      try container.encode(value, forKey: .value)
+    case .setAdditionalHostCandidates(let value):
+      try container.encode(MessageType.setAdditionalHostCandidates, forKey: .type)
+      try container.encode(value, forKey: .value)
+    case .signOut:
+      try container.encode(MessageType.signOut, forKey: .type)
+    case .clearLogs:
+      try container.encode(MessageType.clearLogs, forKey: .type)
+    case .getLogFolderSize:
+      try container.encode(MessageType.getLogFolderSize, forKey: .type)
+    case .exportLogs:
+      try container.encode(MessageType.exportLogs, forKey: .type)
+    case .getEncodedFirezoneId:
+      try container.encode(MessageType.getEncodedFirezoneId, forKey: .type)
+    case .drainFlowLogs:
+      try container.encode(MessageType.drainFlowLogs, forKey: .type)
+    case .getStatus:
+      try container.encode(MessageType.getStatus, forKey: .type)
+    }
+  }
+}

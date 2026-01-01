@@ -1,0 +1,105 @@
+defmodule PortalWeb.Format do
+  @moduledoc """
+  Lightweight date, datetime, and number formatting helpers for English locale.
+  Replaces ex_cldr for our English-only use case.
+  """
+
+  @doc """
+  Formats a date in US short format: "1/27/26"
+  """
+  def short_date(%{year: y, month: m, day: d}) do
+    year_2d = y |> rem(100) |> Integer.to_string() |> String.pad_leading(2, "0")
+    "#{m}/#{d}/#{year_2d}"
+  end
+
+  @doc """
+  Formats a datetime in US short format: "1/27/26, 3:45 PM"
+  """
+  def short_datetime(%{year: y, month: m, day: d, hour: h, minute: min}) do
+    year_2d = y |> rem(100) |> Integer.to_string() |> String.pad_leading(2, "0")
+    {hour_12, period} = to_12_hour(h)
+    minute_str = min |> Integer.to_string() |> String.pad_leading(2, "0")
+    "#{m}/#{d}/#{year_2d}, #{hour_12}:#{minute_str} #{period}"
+  end
+
+  @doc """
+  Formats a `%DateTime{}` in the given IANA timezone (e.g. "America/New_York"
+  or "Etc/UTC"). Falls back to formatting in UTC if the zone cannot be shifted.
+  Uses `Tz.TimeZoneDatabase` since Elixir's default DB only knows UTC.
+  """
+  def short_datetime(%DateTime{} = datetime, tz) when is_binary(tz) do
+    case DateTime.shift_zone(datetime, tz, Tz.TimeZoneDatabase) do
+      {:ok, shifted} -> short_datetime(shifted)
+      _ -> short_datetime(datetime)
+    end
+  end
+
+  @doc """
+  Formats a `%DateTime{}` as a full ISO 8601 string in the given IANA timezone,
+  for places where the abbreviated form is not precise enough. Falls back to
+  UTC if the zone cannot be shifted.
+  """
+  def iso_datetime(%DateTime{} = datetime, tz) when is_binary(tz) do
+    case DateTime.shift_zone(datetime, tz, Tz.TimeZoneDatabase) do
+      {:ok, shifted} -> DateTime.to_iso8601(shifted)
+      _ -> DateTime.to_iso8601(datetime)
+    end
+  end
+
+  @doc """
+  Returns a relative time string like "2 hours ago" or "in 3 days".
+  """
+  def relative_datetime(datetime, relative_to \\ nil) do
+    relative_to = relative_to || DateTime.utc_now()
+    diff = DateTime.diff(datetime, relative_to, :second)
+    abs_diff = abs(diff)
+
+    {value, unit} = pick_unit(abs_diff)
+    unit_str = if value == 1, do: unit, else: "#{unit}s"
+
+    cond do
+      abs_diff < 2 -> "now"
+      diff < 0 -> "#{value} #{unit_str} ago"
+      true -> "in #{value} #{unit_str}"
+    end
+  end
+
+  @doc """
+  Returns the appropriate plural form for a cardinal number in English.
+  Accepts a map of options with keys like :one, :other, :zero, etc.
+  """
+  def cardinal_pluralize(number, opts) do
+    if number == 1 do
+      opts[:one] || opts[:other]
+    else
+      opts[:other]
+    end
+  end
+
+  @doc """
+  Formats an integer with comma thousands separators, e.g. `101142` becomes `"101,142"`.
+  """
+  @spec number(integer()) :: String.t()
+  def number(number) when is_integer(number) and number < 0, do: "-" <> number(-number)
+
+  def number(number) when is_integer(number) do
+    number
+    |> Integer.to_string()
+    |> String.reverse()
+    |> String.replace(~r/(\d{3})(?=\d)/, "\\1,")
+    |> String.reverse()
+  end
+
+  defp pick_unit(seconds) when seconds < 60, do: {seconds, "second"}
+  defp pick_unit(seconds) when seconds < 3_600, do: {div(seconds, 60), "minute"}
+  defp pick_unit(seconds) when seconds < 86_400, do: {div(seconds, 3_600), "hour"}
+  defp pick_unit(seconds) when seconds < 604_800, do: {div(seconds, 86_400), "day"}
+  defp pick_unit(seconds) when seconds < 2_592_000, do: {div(seconds, 604_800), "week"}
+  defp pick_unit(seconds) when seconds < 31_536_000, do: {div(seconds, 2_592_000), "month"}
+  defp pick_unit(seconds), do: {div(seconds, 31_536_000), "year"}
+
+  defp to_12_hour(0), do: {12, "AM"}
+  defp to_12_hour(12), do: {12, "PM"}
+  defp to_12_hour(h) when h > 0 and h < 12, do: {h, "AM"}
+  defp to_12_hour(h) when h > 12 and h < 24, do: {h - 12, "PM"}
+end

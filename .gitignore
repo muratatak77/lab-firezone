@@ -1,0 +1,44 @@
+# macOS cruft
+.DS_Store
+
+# Ignore .fetch files in case you like to edit your project deps locally.
+/.fetch
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# If NPM crashes, it generates a log, let's ignore it too.
+npm-debug.log
+
+*.log
+*.sw?
+
+# Development environment configuration
+**/.env
+**/.envrc
+.oidc_env.json
+
+# Built packages
+/*.deb
+/*.rpm
+
+# Ignore generated credentials from google-github-actions/auth
+gha-creds-*.json
+
+# Ignore local `direnv` cache
+.direnv
+
+# Ignore personal spelling dictionary
+/cspell.json
+
+# Ignore build data for sourcekit-lsp (Swift code)
+buildServer.json
+
+# Python bytecode caches
+__pycache__/
+
+erl_crash.dump
+
+# Schemathesis run state from scripts/tests/openapi-fuzz.sh
+.schemathesis/
+schemathesis-report/

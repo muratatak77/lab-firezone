@@ -1,0 +1,932 @@
+defmodule Portal.Billing.EventHandler do
+  @moduledoc """
+  Handles Stripe webhook events for billing and subscription management.
+  """
+
+  import Ecto.Changeset
+  alias Portal.Accounts
+  alias Portal.Billing
+  alias Portal.Billing.Stripe.ProcessedEvents
+  alias __MODULE__.Database
+  require Logger
+
+  @subscription_events ["created", "resumed"]
+  # Self-serve plans. Moving between them is not a new enrollment.
+  @enrollment_plans [:team, :business]
+
+  def handle_event(%{"object" => "event"} = event) do
+    process_event_with_lock(event)
+  end
+
+  defp process_event_with_lock(event) do
+    customer_id = extract_customer_id(event)
+
+    result = Database.with_customer_lock(customer_id, fn ->
+      process_event(event, customer_id)
+    end)
+
+    # Dispatch only after the billing transaction has committed.
+    case result do
+      {:ok, {processed_event, %Portal.Account{} = account}} ->
+        Portal.Analytics.subscription_created(
+          account,
+          get_in(event, ["data", "object", "id"]),
+          event["created"]
+        )
+        {:ok, processed_event}
+
+      {:ok, {processed_event, nil}} -> {:ok, processed_event}
+      other -> other
+    end
+  end
+
+  defp process_event(event, customer_id) do
+    with :ok <- check_event_processing_eligibility(event, customer_id),
+         previous_account = Database.account_by_customer_id(customer_id),
+         :ok <- process_event_by_type(event),
+         :ok <- record_processed_event(event, customer_id) do
+      account = Database.account_by_customer_id(customer_id)
+      conversion = if plan_enrollment?(event, previous_account, account), do: account
+      {:ok, {event, conversion}}
+    else
+      {:skip, reason} ->
+        Logger.info("Skipping stripe event", reason: inspect(reason))
+        {:ok, event}
+
+      # Retrying cannot help, so the event is acknowledged to stop Stripe redelivering it.
+      {:error, :account_not_found} ->
+        Logger.warning("Skipping stripe event for an account that does not exist",
+          event_id: event["id"],
+          event_type: event["type"],
+          customer_id: customer_id
+        )
+
+        {:ok, event}
+
+      {:error, reason} ->
+        Logger.error("Failed to process stripe event",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp plan_enrollment?(event, previous_account, account) do
+    event["type"] in ["customer.subscription.created", "customer.subscription.updated"] and
+      get_in(event, ["data", "object", "status"]) == "active" and
+      is_nil(get_in(event, ["data", "object", "pause_collection"])) and
+      not is_nil(previous_account) and not is_nil(account) and
+      Billing.plan_type(account) in @enrollment_plans and
+      (Billing.plan_type(previous_account) not in @enrollment_plans or
+         not is_nil(previous_account.metadata.stripe.trial_ends_at) or
+         previous_account.metadata.stripe.subscription_status in ["trialing", "incomplete", "incomplete_expired"])
+  end
+
+  defp check_event_processing_eligibility(event, customer_id) do
+    %{
+      "id" => event_id,
+      "created" => event_created,
+      "type" => event_type
+    } = event
+
+    if ProcessedEvents.event_processed?(event_id) do
+      {:skip, :already_processed}
+    else
+      check_chronological_order(customer_id, event_created, event_type, event_id)
+    end
+  end
+
+  defp check_chronological_order(nil, _event_created, _event_type, _event_id) do
+    {:skip, :no_customer_id}
+  end
+
+  defp check_chronological_order(customer_id, event_created, event_type, event_id) do
+    case ProcessedEvents.get_latest_for_stripe_customer(customer_id, event_type) do
+      nil ->
+        :ok
+
+      latest_event ->
+        event_created_at = DateTime.from_unix!(event_created)
+
+        case DateTime.compare(event_created_at, latest_event.event_created_at) do
+          :gt ->
+            :ok
+
+          _ ->
+            Logger.info("Skipping older event",
+              event_id: event_id,
+              event_created: event_created,
+              latest_processed_created: latest_event.event_created_at,
+              customer_id: customer_id
+            )
+
+            {:skip, :old_event}
+        end
+    end
+  end
+
+  defp extract_customer_id(%{"data" => %{"object" => object}} = event) when is_map(event) do
+    case Map.get(object, "object") do
+      "customer" -> Map.get(object, "id")
+      _ -> Map.get(object, "customer")
+    end
+  end
+
+  defp process_event_by_type(event) do
+    event_type = Map.get(event, "type")
+    event_data = get_in(event, ["data", "object"])
+
+    case event_type do
+      "customer.created" ->
+        handle_customer_created(event_data)
+
+      "customer.updated" ->
+        handle_customer_updated(event_data)
+
+      "customer.subscription.deleted" ->
+        handle_subscription_deleted(event_data)
+
+      # This event only sent after a Stripe trial has ended
+      "customer.subscription.paused" ->
+        handle_subscription_paused(event_data)
+
+      "customer.subscription.updated" ->
+        handle_subscription_updated(event_data)
+
+      "customer.subscription." <> sub_event when sub_event in @subscription_events ->
+        handle_subscription_active(event_data)
+
+      _ ->
+        handle_unknown_event(event_type, event_data)
+    end
+  end
+
+  defp record_processed_event(event, customer_id) do
+    event_id = Map.get(event, "id")
+
+    attrs = %{
+      stripe_event_id: event_id,
+      event_type: Map.get(event, "type"),
+      processed_at: DateTime.utc_now(),
+      stripe_customer_id: customer_id,
+      event_created_at: DateTime.from_unix!(Map.get(event, "created")),
+      livemode: Map.get(event, "livemode", false),
+      request_id: Map.get(event, "request")
+    }
+
+    case ProcessedEvents.create_processed_event(attrs) do
+      {:ok, _processed_event} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to record processed stripe event",
+          event_id: event_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  # Customer Events
+  defp handle_customer_created(customer_data) do
+    create_account_from_stripe_customer(customer_data)
+  end
+
+  defp handle_customer_updated(customer_data) do
+    %{
+      "id" => customer_id,
+      "name" => customer_name,
+      "email" => customer_email,
+      "metadata" => customer_metadata
+    } = customer_data
+
+    attrs = build_customer_update_attrs(customer_metadata, customer_name, customer_email)
+
+    case update_account_by_stripe_customer_id(customer_id, attrs) do
+      {:ok, _account} ->
+        :ok
+
+      {:error, :customer_not_provisioned} ->
+        create_account_from_stripe_customer(customer_data)
+
+      {:error, :account_not_found} ->
+        {:error, :account_not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to sync account from Stripe",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  def handle_customer_deleted(customer_data) do
+    %{"id" => customer_id} = customer_data
+
+    disable_account_attrs = %{
+      is_disabled: true,
+      disabled_reason: "Stripe customer deleted"
+    }
+
+    update_account(customer_id, disable_account_attrs)
+  end
+
+  # Subscription Events
+  defp handle_subscription_deleted(subscription_data) do
+    customer_id = Map.get(subscription_data, "customer")
+
+    disable_account_attrs = %{
+      is_disabled: true,
+      disabled_reason: "Stripe subscription deleted"
+    }
+
+    update_account(customer_id, disable_account_attrs)
+  end
+
+  defp handle_subscription_paused(subscription_data) do
+    customer_id = Map.get(subscription_data, "customer")
+
+    disable_account_attrs = %{
+      is_disabled: true,
+      disabled_reason: "Stripe subscription paused"
+    }
+
+    update_account(customer_id, disable_account_attrs)
+  end
+
+  defp handle_subscription_updated(subscription_data) do
+    case get_in(subscription_data, ["pause_collection", "behavior"]) do
+      "void" ->
+        # paused subscription
+        handle_subscription_paused(subscription_data)
+
+      _ ->
+        # regular subscription update
+        handle_subscription_active(subscription_data)
+    end
+  end
+
+  defp handle_subscription_active(subscription_data) do
+    customer_id = Map.get(subscription_data, "customer")
+
+    with {:ok, attrs} <- build_subscription_update_attrs(subscription_data),
+         {:ok, account} <- update_account_and_return(customer_id, attrs),
+         {:ok, _account} <- Billing.evaluate_account_limits(account) do
+      :ok
+    else
+      {:error, :account_not_found} ->
+        {:error, :account_not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to build subscription update attrs",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  # We don't care about any other type of stripe events at this point
+  defp handle_unknown_event(_event_type, _event_data), do: :ok
+
+  defp build_customer_update_attrs(customer_metadata, customer_name, customer_email) do
+    %{
+      name: customer_metadata["account_name"] || customer_name,
+      legal_name: customer_name,
+      metadata: %{stripe: %{billing_email: customer_email}}
+    }
+    |> put_if_not_nil(:slug, customer_metadata["account_slug"])
+  end
+
+  defp build_subscription_update_attrs(subscription_data) do
+    %{
+      "id" => subscription_id,
+      "customer" => _customer_id,
+      "metadata" => subscription_metadata,
+      "trial_end" => trial_end,
+      "status" => status,
+      "items" => %{"data" => items}
+    } = subscription_data
+
+    plan_ids = Billing.plan_product_ids()
+
+    {plan_items, add_on_items} =
+      Enum.split_with(items, &(get_in(&1, ["price", "product"]) in plan_ids))
+
+    with {:ok, product_info, quantity} <- find_plan_product(plan_items),
+         {:ok, add_ons} <- fetch_add_ons(add_on_items) do
+      %{"name" => product_name, "metadata" => product_metadata} = product_info
+
+      subscription_trialing? = not is_nil(trial_end) and status in ["trialing", "paused"]
+
+      stripe_metadata = %{
+        "subscription_id" => subscription_id,
+        "subscription_status" => status,
+        "product_name" => product_name,
+        "trial_ends_at" => if(subscription_trialing?, do: DateTime.from_unix!(trial_end)),
+        "add_ons" => add_ons
+      }
+
+      attrs =
+        account_update_attrs(
+          quantity,
+          product_metadata,
+          subscription_metadata,
+          stripe_metadata,
+          add_ons
+        )
+        |> Map.put(:is_disabled, false)
+        |> Map.put(:disabled_reason, nil)
+
+      {:ok, attrs}
+    end
+  end
+
+  defp find_plan_product(plan_items) do
+    case plan_items do
+      [%{"price" => %{"product" => product_id}, "quantity" => quantity}] ->
+        with {:ok, info} <- Billing.fetch_product(product_id), do: {:ok, info, quantity}
+
+      [] ->
+        {:error, :no_plan_product}
+
+      multiple ->
+        ids = Enum.map(multiple, &get_in(&1, ["price", "product"]))
+        Logger.error("Multiple plan products found in subscription", product_ids: inspect(ids))
+        {:error, :multiple_plan_products}
+    end
+  end
+
+  # Add-on products name the limit their quantity adds to in `adds_to_limit` metadata.
+  defp fetch_add_ons(items) do
+    result =
+      Enum.reduce_while(items, {:ok, []}, fn item, {:ok, add_ons} ->
+        case Billing.fetch_product(get_in(item, ["price", "product"])) do
+          {:ok, product} -> {:cont, {:ok, put_add_on(add_ons, product, item)}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+
+    with {:ok, add_ons} <- result, do: {:ok, Enum.reverse(add_ons)}
+  end
+
+  defp put_add_on(
+         add_ons,
+         %{"name" => name, "metadata" => %{"adds_to_limit" => limit}},
+         %{"quantity" => quantity}
+       ),
+       do: [%{"name" => name, "limit" => limit, "quantity" => quantity} | add_ons]
+
+  defp put_add_on(add_ons, product, item) do
+    Logger.warning("Ignoring unrecognized product in subscription",
+      product_id: product["id"],
+      item_id: item["id"]
+    )
+
+    add_ons
+  end
+
+  defp update_account(customer_id, attrs) do
+    case update_account_by_stripe_customer_id(customer_id, attrs) do
+      {:ok, _account} ->
+        :ok
+
+      {:error, :account_not_found} ->
+        {:error, :account_not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to update account on Stripe subscription event",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp update_account_and_return(customer_id, attrs) do
+    case update_account_by_stripe_customer_id(customer_id, attrs) do
+      {:ok, account} ->
+        {:ok, account}
+
+      {:error, :account_not_found} ->
+        {:error, :account_not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to update account on Stripe subscription event",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  # Account Creation
+
+  defp create_account_from_stripe_customer(%{"metadata" => %{"account_id" => _account_id}}) do
+    :ok
+  end
+
+  defp create_account_from_stripe_customer(%{
+         "id" => customer_id,
+         "name" => customer_name,
+         "email" => account_email,
+         "metadata" => metadata
+       })
+       when is_map_key(metadata, "company_website") and
+              is_map_key(metadata, "account_owner_first_name") and
+              is_map_key(metadata, "account_owner_last_name") do
+    account_slug = generate_account_slug(metadata)
+
+    attrs = %{
+      id: Ecto.UUID.generate(),
+      name: metadata["account_name"] || customer_name,
+      legal_name: customer_name,
+      slug: account_slug,
+      metadata: %{
+        stripe: %{
+          customer_id: customer_id,
+          billing_email: account_email
+        }
+      }
+    }
+
+    case create_account_with_defaults(attrs, metadata, account_email) do
+      :ok ->
+        :ok
+
+      {:error, %Ecto.Changeset{errors: [{:slug, {"has already been taken", _}} | _]}} ->
+        {:error, :slug_taken}
+
+      {:error, reason} ->
+        Logger.error("Failed to create account from Stripe",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, :failed_account_creation}
+    end
+  end
+
+  defp create_account_from_stripe_customer(%{
+         "id" => customer_id,
+         "name" => customer_name,
+         "metadata" => customer_metadata
+       }) do
+    Logger.error("Failed to create account from Stripe",
+      customer_id: customer_id,
+      customer_metadata: inspect(customer_metadata),
+      customer_name: customer_name,
+      reason: "missing custom metadata keys"
+    )
+
+    {:error, :missing_custom_metadata}
+  end
+
+  defp generate_account_slug(metadata) do
+    cond do
+      not is_nil(metadata["account_slug"]) ->
+        metadata["account_slug"]
+
+      company_website = metadata["company_website"] ->
+        extract_slug_from_uri(company_website)
+
+      true ->
+        generate_unique_slug()
+    end
+  end
+
+  defp extract_slug_from_uri(company_website) do
+    uri = URI.parse(company_website)
+
+    cond do
+      uri.host ->
+        uri.host
+        |> String.split(".")
+        |> List.delete_at(-1)
+        |> Enum.join("_")
+        |> String.replace("-", "_")
+
+      uri.path ->
+        uri.path
+        |> String.split(".")
+        |> List.delete_at(-1)
+        |> Enum.join("_")
+        |> String.replace("-", "_")
+
+      true ->
+        generate_unique_slug()
+    end
+  end
+
+  defp generate_unique_slug do
+    slug_candidate = Portal.NameGenerator.generate_slug()
+
+    if Database.slug_exists?(slug_candidate) do
+      generate_unique_slug()
+    else
+      slug_candidate
+    end
+  end
+
+  # TODO: BILLING OVERHAUL
+  # The DB operations should be wrapped in a transaction to ensure atomicity
+  defp create_account_with_defaults(attrs, metadata, account_email) do
+    with {:ok, account} <-
+           Database.insert_account_with_key_retry(fn -> create_account_changeset(attrs) end),
+         {:ok, account} <- Billing.update_stripe_customer(account),
+         {:ok, account} <- Portal.Billing.create_subscription(account),
+         :ok <- setup_account_defaults(account, metadata, account_email) do
+      :ok
+    end
+  end
+
+  defp setup_account_defaults(account, metadata, account_email) do
+    # Create default groups and resources
+    changeset = create_everyone_group_changeset(account)
+    {:ok, _everyone_group} = Database.insert(changeset)
+    changeset = create_site_changeset(account, %{name: "Default Site"})
+    {:ok, _site} = Database.insert_site(changeset)
+    changeset = create_internet_site_changeset(account)
+    {:ok, internet_site} = Database.insert_site(changeset)
+    changeset = create_internet_resource_changeset(account, internet_site)
+    {:ok, _resource} = Database.insert(changeset)
+    changeset = create_account_owner_group_changeset(account)
+    {:ok, account_owner_group} = Database.insert(changeset)
+    changeset = create_self_device_pool_changeset(account)
+    {:ok, self_device_pool} = Database.insert(changeset)
+    changeset = create_self_device_pool_policy_changeset(account_owner_group, self_device_pool)
+    {:ok, _policy} = Database.insert(changeset)
+
+    # Create email provider
+    {:ok, _email_provider} = Database.create_email_provider(account)
+    {:ok, _x509_provider} = Database.create_x509_provider(account)
+
+    # Create admin user
+    email = metadata["account_admin_email"] || account_email
+    given_name = metadata["account_owner_first_name"]
+    family_name = metadata["account_owner_last_name"]
+    name = "#{given_name} #{family_name}"
+    changeset = create_admin_changeset(account, email, name)
+    {:ok, actor} = Database.insert(changeset)
+
+    changeset = create_account_owner_membership_changeset(account_owner_group, actor)
+    {:ok, _membership} = Database.insert(changeset)
+
+    :ok
+  end
+
+  defp create_everyone_group_changeset(account) do
+    import Ecto.Changeset
+    attrs = %{account_id: account.id, name: "Everyone", type: :managed}
+    cast(%Portal.Group{}, attrs, ~w[account_id name type]a)
+  end
+
+  defp create_account_owner_group_changeset(account) do
+    import Ecto.Changeset
+
+    %Portal.Group{account_id: account.id}
+    |> cast(Portal.Group.account_owner_attrs(), [:name, :type])
+    |> Portal.Group.changeset()
+  end
+
+  defp create_account_owner_membership_changeset(account_owner_group, actor) do
+    import Ecto.Changeset
+
+    %Portal.Membership{account_id: account_owner_group.account_id}
+    |> cast(%{group_id: account_owner_group.id, actor_id: actor.id}, [:group_id, :actor_id])
+    |> Portal.Membership.changeset()
+  end
+
+  defp create_admin_changeset(account, email, name) do
+    import Ecto.Changeset
+
+    attrs = %{
+      account_id: account.id,
+      email: email,
+      name: name,
+      type: :account_admin_user,
+      allow_email_otp_sign_in: true
+    }
+
+    cast(%Portal.Actor{}, attrs, ~w[account_id email name type allow_email_otp_sign_in]a)
+  end
+
+  defp create_site_changeset(account, attrs) do
+    import Ecto.Changeset
+
+    %Portal.Site{
+      account_id: account.id,
+      managed_by: :account,
+      gateway_tokens: []
+    }
+    |> cast(attrs, [:name])
+    |> validate_required([:name])
+    |> validate_length(:name, min: 1, max: 255)
+    |> unique_constraint(:name, name: :sites_account_id_name_index)
+  end
+
+  defp create_internet_site_changeset(account) do
+    import Ecto.Changeset
+
+    %Portal.Site{
+      account_id: account.id,
+      managed_by: :system
+    }
+    |> cast(%{name: "Internet", managed_by: :system}, [:name, :managed_by])
+    |> validate_required([:name, :managed_by])
+    |> validate_length(:name, min: 1, max: 255)
+    |> unique_constraint(:name, name: :sites_account_id_name_index)
+  end
+
+  defp create_internet_resource_changeset(account, site) do
+    import Ecto.Changeset
+
+    attrs = %{
+      type: :internet,
+      name: "Internet"
+    }
+
+    %Portal.Resource{site_id: site.id, account_id: account.id}
+    |> cast(attrs, [:type, :name])
+    |> validate_required([:name, :type])
+  end
+
+  defp create_self_device_pool_changeset(account) do
+    %Portal.Resource{account_id: account.id}
+    |> cast(Portal.Resource.self_device_pool_attrs(), [:type, :device_membership_criteria, :name])
+    |> validate_required([:type, :device_membership_criteria, :name])
+    |> Portal.Resource.changeset()
+  end
+
+  defp create_self_device_pool_policy_changeset(account_owner_group, self_device_pool) do
+    %Portal.Policy{account_id: account_owner_group.account_id}
+    |> cast(
+      %{
+        group_id: account_owner_group.id,
+        resource_id: self_device_pool.id,
+        description: "Lets the account owner reach their own devices."
+      },
+      [:group_id, :resource_id, :description]
+    )
+    |> validate_required([:group_id, :resource_id])
+    |> Portal.Policy.changeset()
+  end
+
+  # Account Updates
+  defp update_account_by_stripe_customer_id(customer_id, attrs) do
+    with {:ok, account_id} <- Billing.fetch_customer_account_id(customer_id) do
+      Database.update_account_by_id(account_id, attrs)
+    end
+  end
+
+  defp account_update_attrs(
+         seats,
+         product_metadata,
+         subscription_metadata,
+         stripe_metadata,
+         add_ons
+       ) do
+    limit_fields = Accounts.Limits.__schema__(:fields) |> Enum.map(&to_string/1)
+    feature_fields = Accounts.Features.__schema__(:fields) |> Enum.map(&to_string/1)
+    metadata_fields = ["support_type"]
+
+    params =
+      Map.merge(product_metadata, subscription_metadata)
+      |> parse_metadata_params(limit_fields, metadata_fields)
+
+    {users_count, params} = Map.pop(params, "users_count", seats)
+    {metadata, params} = Map.split(params, metadata_fields)
+    {limits, params} = Map.split(params, limit_fields)
+    {features, _} = Map.split(params, feature_fields)
+
+    limits =
+      limits
+      |> Map.put("users_count", users_count)
+      |> put_seat_limit(Billing.plan_type(stripe_metadata["product_name"]), seats)
+      |> add_to_limits(add_ons)
+
+    %{
+      features: features,
+      limits: limits,
+      metadata: %{stripe: Map.merge(metadata, stripe_metadata)}
+    }
+  end
+
+  # Enterprise and Business seats are sold as monthly active users, so the limit
+  # comes from the subscription quantity and never from the Stripe metadata.
+  defp put_seat_limit(limits, plan_type, seats) when plan_type in [:enterprise, :business],
+    do: Map.put(limits, "monthly_active_users_count", seats)
+
+  defp put_seat_limit(limits, _plan_type, _seats),
+    do: Map.delete(limits, "monthly_active_users_count")
+
+  defp add_to_limits(limits, add_ons) do
+    defaults = Map.new(Map.from_struct(%Accounts.Limits{}), fn {k, v} -> {to_string(k), v} end)
+
+    Enum.reduce(add_ons, limits, fn %{"limit" => limit, "quantity" => quantity}, limits ->
+      if Map.has_key?(defaults, limit) do
+        add_to_limit(limits, limit, Map.get(limits, limit, defaults[limit]), quantity)
+      else
+        Logger.error("Ignoring add-on for unknown limit", limit: limit)
+        limits
+      end
+    end)
+  end
+
+  # A nil limit is unlimited and stays unlimited.
+  defp add_to_limit(limits, _limit, nil, _quantity), do: limits
+  defp add_to_limit(limits, limit, base, quantity), do: Map.put(limits, limit, base + quantity)
+
+  defp parse_metadata_params(metadata, limit_fields, metadata_fields) do
+    metadata
+    |> Enum.flat_map(fn
+      {feature, "true"} ->
+        [{feature, true}]
+
+      {feature, "false"} ->
+        [{feature, false}]
+
+      {feature, true} ->
+        [{feature, true}]
+
+      {feature, false} ->
+        [{feature, false}]
+
+      {key, value} ->
+        cond do
+          key in limit_fields -> [{key, cast_limit(value)}]
+          key in metadata_fields -> [{key, value}]
+          true -> []
+        end
+    end)
+    |> Enum.into(%{})
+  end
+
+  # Utility Functions
+  defp cast_limit(number) when is_number(number), do: number
+  defp cast_limit("unlimited"), do: nil
+  defp cast_limit(binary) when is_binary(binary), do: String.to_integer(binary)
+
+  defp put_if_not_nil(map, _key, nil), do: map
+  defp put_if_not_nil(map, key, value), do: Map.put(map, key, value)
+
+  # The slug registry records the account ID at claim time, so a key retry
+  # keeps the same ID.
+  defp create_account_changeset(attrs) do
+    import Ecto.Changeset
+
+    %Portal.Account{id: attrs.id}
+    |> cast(attrs, [:name, :legal_name, :slug, :key])
+    |> put_change(:key, Portal.Account.new_key())
+    |> cast_embed(:metadata)
+    |> validate_required([:name, :legal_name, :slug, :key])
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    import Ecto.Changeset
+
+    alias Portal.{
+      Account,
+      AuthProvider,
+      EmailOTP,
+      Safe,
+      X509
+    }
+
+    def account_by_customer_id(customer_id) do
+      from(a in Account,
+        where: fragment("?->'stripe'->>'customer_id' = ?", a.metadata, ^customer_id)
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+    end
+
+    def with_customer_lock(customer_id, fun) do
+      hashed_id = :erlang.phash2(customer_id)
+
+      Safe.transact(fn ->
+        {:ok, _} = Safe.unscoped() |> Safe.query("SELECT pg_advisory_xact_lock($1)", [hashed_id])
+        fun.()
+      end)
+    end
+
+    def slug_exists?(slug) do
+      from(a in Portal.Account, where: a.slug == ^slug)
+      |> Safe.unscoped()
+      |> Safe.exists?()
+    end
+
+    def create_email_provider(account) do
+      id = Ecto.UUID.generate()
+
+      auth_provider = %AuthProvider{id: id, account_id: account.id, type: :email_otp}
+
+      email_otp_provider = %EmailOTP.AuthProvider{
+        id: id,
+        name: "Email (OTP)",
+        account_id: account.id
+      }
+
+      with {:ok, _auth_provider} <- Safe.unscoped(auth_provider) |> Safe.insert(),
+           {:ok, email_provider} <- Safe.unscoped(email_otp_provider) |> Safe.insert() do
+        {:ok, email_provider}
+      end
+    end
+
+    # OTP 28 dialyzer is stricter about opaque types (MapSet) inside Ecto.Multi
+    @dialyzer {:no_opaque, create_x509_provider: 1}
+    def create_x509_provider(account) do
+      id = Ecto.UUID.generate()
+
+      parent_changeset =
+        cast(
+          %AuthProvider{},
+          %{account_id: account.id, id: id, type: :x509},
+          ~w[id account_id type]a
+        )
+
+      x509_changeset =
+        %X509.AuthProvider{}
+        |> cast(
+          %{
+            id: id,
+            account_id: account.id,
+            name: "X.509",
+            context: :clients_only,
+            is_disabled: true
+          },
+          ~w[id account_id name context is_disabled]a
+        )
+        |> X509.AuthProvider.changeset()
+
+      Ecto.Multi.new()
+      |> Ecto.Multi.insert(:auth_provider, parent_changeset)
+      |> Ecto.Multi.insert(:x509_provider, x509_changeset)
+      |> Safe.transact()
+      |> case do
+        {:ok, %{x509_provider: provider}} -> {:ok, provider}
+        {:error, _step, changeset, _changes} -> {:error, changeset}
+      end
+    end
+
+    def insert(changeset) do
+      Safe.unscoped(changeset)
+      |> Safe.insert()
+    end
+
+    def insert_account_with_key_retry(changeset_fn, retries \\ 5) do
+      changeset_fn.()
+      |> Safe.unscoped()
+      |> Safe.insert()
+      |> case do
+        {:ok, account} ->
+          {:ok, account}
+
+        {:error, %Ecto.Changeset{} = changeset} ->
+          if retries > 0 and key_taken?(changeset) do
+            insert_account_with_key_retry(changeset_fn, retries - 1)
+          else
+            {:error, changeset}
+          end
+      end
+    end
+
+    defp key_taken?(%Ecto.Changeset{errors: errors}) do
+      Keyword.has_key?(errors, :key) and
+        match?({"has already been taken", _}, Keyword.get(errors, :key))
+    end
+
+    def update_account_by_id(id, attrs) do
+      from(a in Account, where: a.id == ^id)
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        %Account{} = account ->
+          account
+          |> cast(attrs, [:name, :legal_name, :slug, :is_disabled, :disabled_reason])
+          |> cast_embed(:limits)
+          |> cast_embed(:features)
+          |> cast_embed(:metadata)
+          |> Safe.unscoped()
+          |> Safe.update()
+
+        nil ->
+          {:error, :account_not_found}
+      end
+    end
+
+    def insert_site(changeset) do
+      Safe.unscoped(changeset)
+      |> Safe.insert()
+    end
+  end
+end

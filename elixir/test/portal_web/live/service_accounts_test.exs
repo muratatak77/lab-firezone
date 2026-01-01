@@ -1,0 +1,1265 @@
+defmodule PortalWeb.ServiceAccountsTest do
+  use PortalWeb.ConnCase, async: true
+
+  import Phoenix.LiveViewTest, except: [live: 2]
+
+  # The table loads in an async task, so wait for it before returning.
+  defp live(conn, path) do
+    case Phoenix.LiveViewTest.live(conn, path) do
+      {:ok, lv, _html} -> {:ok, lv, render_async(lv)}
+      other -> other
+    end
+  end
+
+  alias Portal.Actor
+  alias Portal.Changes.Change
+  alias Portal.Repo
+
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.ClientSessionFixtures
+  import Portal.GroupFixtures
+  import Portal.MembershipFixtures
+  import Portal.TokenFixtures
+
+  setup do
+    account = account_fixture()
+    actor = admin_actor_fixture(account: account)
+    %{account: account, actor: actor}
+  end
+
+  describe "unauthorized" do
+    test "redirects to sign-in when not authenticated", %{conn: conn, account: account} do
+      path = ~p"/#{account}/service_accounts"
+
+      assert live(conn, path) ==
+               {:error,
+                {:redirect,
+                 %{
+                   to: ~p"/#{account}/sign_in?#{%{redirect_to: path}}",
+                   flash: %{"error" => "You must sign in to access that page."}
+                 }}}
+    end
+
+  end
+
+  describe "index (default action)" do
+    test "loads the table only after the socket connects", %{conn: conn, account: account, actor: actor} do
+      service_account_fixture(account: account)
+
+      conn = authorize_conn(conn, actor)
+
+      static = conn |> get(~p"/#{account}/service_accounts") |> html_response(200) |> Floki.parse_document!()
+      assert [_] = Floki.find(static, "#actors-skeleton")
+      assert Floki.find(static, "#actors-rows tr") == []
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/service_accounts")
+      assert has_element?(lv, "#actors-rows tr")
+      refute has_element?(lv, "#actors-skeleton")
+    end
+
+    test "renders service accounts page title", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      assert html =~ "Service Accounts"
+    end
+
+    test "lists service accounts by name", %{conn: conn, account: account, actor: actor} do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      assert html =~ service_account.name
+    end
+
+    test "does not list regular actors", %{conn: conn, account: account, actor: actor} do
+      user = actor_fixture(account: account, type: :account_user)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      refute html =~ user.name
+    end
+
+    test "shows empty state when no service accounts exist", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      assert html =~ "No service accounts yet"
+      assert html =~ "No service accounts have been created yet."
+    end
+
+    test "shows disabled badge for disabled service accounts", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      _disabled_service_account = disabled_actor_fixture(account: account, type: :service_account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      assert html =~ "Disabled"
+    end
+  end
+
+  describe ":new action" do
+    test "New Service Account button patches to /service_accounts/new", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      render_click(lv, "open_new_actor_panel")
+      assert_patch(lv, ~p"/#{account}/service_accounts/new")
+    end
+
+    test "renders create form when navigating directly to /service_accounts/new", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      assert html =~ "Create Service Account"
+    end
+
+    test "close_panel patches back to /service_accounts", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/service_accounts")
+    end
+  end
+
+  describe "create service account" do
+    test "creates service account with token and shows created token", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      expiration = Date.utc_today() |> Date.add(30) |> Date.to_iso8601()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      lv
+      |> form("form[phx-submit='create_service_account']",
+        actor: %{name: "CI Service Account"},
+        token_expiration: expiration
+      )
+      |> render_submit()
+
+      html = render(lv)
+      service_account =
+        Portal.Repo.get_by!(Portal.Actor,
+          account_id: account.id,
+          type: :service_account,
+          name: "CI Service Account"
+        )
+
+      assert Portal.Repo.get_by(Portal.ClientToken, actor_id: service_account.id)
+      assert html =~ "CI Service Account"
+      assert html =~ "Token Created"
+    end
+
+    test "creates service account without token when expiration is blank", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      lv
+      |> form("form[phx-submit='create_service_account']",
+        actor: %{name: "Tokenless SA"},
+        token_expiration: ""
+      )
+      |> render_submit()
+
+      html = render(lv)
+      service_account =
+        Portal.Repo.get_by!(Portal.Actor,
+          account_id: account.id,
+          type: :service_account,
+          name: "Tokenless SA"
+        )
+
+      refute Portal.Repo.get_by(Portal.ClientToken, actor_id: service_account.id)
+      assert html =~ "Tokenless SA"
+      refute html =~ "Token Created"
+    end
+
+    test "shows validation error when name exceeds 255 characters", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      invalid_name = String.duplicate("a", 256)
+      expiration = Date.utc_today() |> Date.add(30) |> Date.to_iso8601()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      html =
+        lv
+        |> form("form[phx-submit='create_service_account']",
+          actor: %{name: invalid_name},
+          token_expiration: expiration
+        )
+        |> render_submit()
+
+      assert html =~ "should be at most 255 character(s)"
+    end
+
+    test "shows flash error when token expiration is unparsable", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      html =
+        lv
+        |> form("form[phx-submit='create_service_account']",
+          actor: %{name: "Bad Date SA"},
+          token_expiration: "not-a-date"
+        )
+        |> render_submit()
+
+      assert html =~ "A temporary error occurred"
+      assert html =~ "Please try again"
+    end
+
+    test "shows flash and does not create service account when billing limit is reached", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account = update_account(account, %{limits: %{service_accounts_count: 0}})
+      expiration = Date.utc_today() |> Date.add(30) |> Date.to_iso8601()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      html =
+        lv
+        |> form("form[phx-submit='create_service_account']",
+          actor: %{name: "Over Limit SA"},
+          token_expiration: expiration
+        )
+        |> render_submit()
+
+      assert html =~ "Service account limit reached for your account"
+      refute Portal.Repo.get_by(Portal.Actor, name: "Over Limit SA", account_id: account.id)
+    end
+
+    test "applies pending group additions on create", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account, name: "Ops Group")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/new")
+
+      html =
+        lv
+        |> element("input[placeholder='Search to add groups...']")
+        |> render_change(%{"value" => group.name})
+
+      assert html =~ group.name
+
+      render_click(lv, "add_pending_group", %{"group_id" => group.id})
+
+      lv
+      |> form("form[phx-submit='create_service_account']",
+        actor: %{name: "Grouped SA"},
+        token_expiration: ""
+      )
+      |> render_submit()
+
+      service_account =
+        Portal.Repo.get_by!(Portal.Actor,
+          account_id: account.id,
+          type: :service_account,
+          name: "Grouped SA"
+        )
+
+      assert Portal.Repo.get_by(Portal.Membership, actor_id: service_account.id, group_id: group.id)
+    end
+  end
+
+  describe ":show action" do
+    test "renders service account name in detail panel", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      assert html =~ service_account.name
+    end
+
+    test "ignores a tab change queued while the service account panel is closing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/service_accounts")
+
+      render_click(lv, "change_tab", %{"tab" => "groups"})
+
+      refute has_element?(lv, "#actor-panel > div")
+    end
+
+    test "redirects to service accounts list when ID not found", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      fake_id = Ecto.UUID.generate()
+
+      assert {:error, {:live_redirect, %{to: path, flash: flash}}} =
+               conn
+               |> authorize_conn(actor)
+               |> live(~p"/#{account}/service_accounts/#{fake_id}")
+
+      assert path == ~p"/#{account}/service_accounts"
+      assert flash["error"] =~ "not found"
+    end
+
+    test "redirects when service account belongs to a different account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      other_account = account_fixture()
+      other_service_account = service_account_fixture(account: other_account)
+
+      assert {:error, {:live_redirect, %{to: path}}} =
+               conn
+               |> authorize_conn(actor)
+               |> live(~p"/#{account}/service_accounts/#{other_service_account}")
+
+      assert path == ~p"/#{account}/service_accounts"
+    end
+
+    test "change_tab event patches URL with tab param", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "change_tab", %{"tab" => "groups"})
+      assert_patch(lv, ~p"/#{account}/service_accounts/#{service_account}?tab=groups")
+    end
+
+    test "shows existing tokens in the tokens tab", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      _token = client_token_fixture(account: account, actor: service_account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      assert html =~ "Last used:"
+      refute html =~ "No tokens. Add one to authenticate this service account."
+    end
+
+    test "shows token session details in the tokens tab", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      token = client_token_fixture(account: account, actor: service_account)
+
+      client_session_fixture(
+        account: account,
+        actor: service_account,
+        token: token,
+        remote_ip: {198, 51, 100, 42},
+        remote_ip_location_city: "Tokyo",
+        remote_ip_location_region: "JP",
+        user_agent: "Linux/6.0 headless-client/1.4.0",
+        version: "1.4.0"
+      )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      assert html =~ "IP Address"
+      assert html =~ "198.51.100.42"
+      assert html =~ "User Agent"
+      assert html =~ "Linux/6.0 headless-client/1.4.0"
+      assert html =~ "Client Version"
+      assert html =~ "Tokyo, JP"
+      assert html =~ "Token ID"
+      assert html =~ token.id
+    end
+
+    test "shows empty token state when no tokens", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      assert html =~ "No tokens."
+    end
+  end
+
+  describe "token lifecycle" do
+    test "open_add_token_form shows new token form", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      html = render_click(lv, "open_add_token_form")
+      assert html =~ "New Token"
+    end
+
+    test "cancel_add_token_form hides new token form", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "open_add_token_form")
+      html = render_click(lv, "cancel_add_token_form")
+      refute html =~ "New Token"
+    end
+
+    test "create_token creates token and shows encoded token", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      expiration = Date.utc_today() |> Date.add(30) |> Date.to_iso8601()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "open_add_token_form")
+
+      html =
+        render_submit(element(lv, "form[phx-submit='create_token']"), %{
+          "token_expiration" => expiration
+        })
+
+      assert html =~ "Token Created"
+      assert html =~ "Save this token"
+      assert html =~ "tab-token-copy-code"
+    end
+
+    test "create_token tells the headless Client where this deployment is", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      Portal.Config.put_env_override(:api_url_override, nil)
+      Portal.Config.put_env_override(:api_external_url, "https://eu.api.firezone.dev/")
+      service_account = service_account_fixture(account: account)
+      expiration = Date.utc_today() |> Date.add(30) |> Date.to_iso8601()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "open_add_token_form")
+
+      render_submit(element(lv, "form[phx-submit='create_token']"), %{
+        "token_expiration" => expiration
+      })
+
+      assert has_element?(lv, "#tab-token-api-url", "FIREZONE_API_URL=https://eu.api.firezone.dev/")
+    end
+
+    test "dismiss_created_token hides token value", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      expiration = Date.utc_today() |> Date.add(30) |> Date.to_iso8601()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "open_add_token_form")
+
+      render_submit(element(lv, "form[phx-submit='create_token']"), %{
+        "token_expiration" => expiration
+      })
+
+      html = render_click(lv, "dismiss_created_token")
+      refute html =~ "Token Created"
+    end
+
+    test "confirm and cancel delete token", %{conn: conn, account: account, actor: actor} do
+      service_account = service_account_fixture(account: account)
+      token = client_token_fixture(account: account, actor: service_account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      html = render_click(lv, "confirm_delete_token", %{"id" => token.id})
+      assert html =~ "Delete this token?"
+
+      html = render_click(lv, "cancel_delete_token")
+      refute html =~ "Delete this token?"
+    end
+
+    test "delete_token removes token from list", %{conn: conn, account: account, actor: actor} do
+      service_account = service_account_fixture(account: account)
+      token = client_token_fixture(account: account, actor: service_account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "confirm_delete_token", %{"id" => token.id})
+      render_click(lv, "delete_token", %{"id" => token.id})
+
+      html = render(lv)
+      refute Portal.Repo.get_by(Portal.ClientToken, id: token.id)
+      assert html =~ "No tokens."
+    end
+  end
+
+  describe "disable / enable / delete" do
+    test "confirm and cancel disable service account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      html = render_click(lv, "confirm_disable_actor")
+      assert html =~ "Disable"
+
+      html = render_click(lv, "cancel_disable_actor")
+      refute html =~ "Service account disabled successfully"
+      refute Portal.Repo.get_by!(Portal.Actor, id: service_account.id, account_id: account.id).is_disabled
+    end
+
+    test "disable sets is_disabled", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "confirm_disable_actor")
+
+      render_click(lv, "disable", %{"id" => service_account.id})
+
+      assert Portal.Repo.get_by!(Portal.Actor, id: service_account.id, account_id: account.id).is_disabled
+    end
+
+    test "enable clears is_disabled", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = disabled_actor_fixture(account: account, type: :service_account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "enable", %{"id" => service_account.id})
+
+      refute Portal.Repo.get_by!(Portal.Actor, id: service_account.id, account_id: account.id).is_disabled
+    end
+
+    test "does not enable when the service account limit is reached", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account = update_account(account, %{limits: %{service_accounts_count: 0}})
+      service_account = disabled_actor_fixture(account: account, type: :service_account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      html = render_click(lv, "enable", %{"id" => service_account.id})
+
+      assert html =~ "Service account limit reached for your account"
+      assert Repo.get_by!(Actor, id: service_account.id, account_id: account.id).is_disabled
+    end
+
+    test "confirm and cancel delete service account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      html = render_click(lv, "confirm_delete_actor")
+      assert html =~ "Delete"
+
+      html = render_click(lv, "cancel_delete_actor")
+      refute html =~ "Service account deleted successfully"
+      assert html =~ service_account.name
+      assert Portal.Repo.get_by(Portal.Actor, id: service_account.id, account_id: account.id)
+    end
+
+    test "delete removes service account and patches back to list", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}")
+
+      render_click(lv, "confirm_delete_actor")
+      render_click(lv, "delete", %{"id" => service_account.id})
+
+      assert_patch(lv, ~p"/#{account}/service_accounts")
+      refute Portal.Repo.get_by(Portal.Actor, id: service_account.id, account_id: account.id)
+    end
+  end
+
+  describe ":edit action" do
+    test "renders edit form pre-populated with service account name", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      assert html =~ "Save Changes"
+      assert html =~ service_account.name
+    end
+
+    test "cancel_actor_edit_form patches back to show panel", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      render_click(lv, "cancel_actor_edit_form")
+      assert_patch(lv, ~p"/#{account}/service_accounts/#{service_account}")
+    end
+
+    test "save with valid name updates service account and shows success flash", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: "Updated SA Name"})
+      |> render_submit()
+
+      html = render_async(lv)
+
+      updated_service_account =
+        Portal.Repo.get_by!(Portal.Actor, id: service_account.id, account_id: account.id)
+
+      assert updated_service_account.name == "Updated SA Name"
+      assert html =~ "Updated SA Name"
+      assert html =~ "updated successfully"
+    end
+
+    test "save with invalid name shows validation error", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      invalid_name = String.duplicate("a", 256)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      html =
+        lv
+        |> form("form[phx-submit='save']", actor: %{name: invalid_name})
+        |> render_submit()
+
+      assert html =~ "should be at most 255 character(s)"
+    end
+
+    test "searches groups and adds pending group addition", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Ops Group")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      html =
+        lv
+        |> element("input[placeholder='Search to add groups...']")
+        |> render_change(%{"value" => group.name})
+
+      assert html =~ group.name
+
+      html = render_click(lv, "add_pending_group", %{"group_id" => group.id})
+      assert html =~ "To Add"
+    end
+
+    test "remove_pending_group_addition removes pending add", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Ops Group")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      lv
+      |> element("input[placeholder='Search to add groups...']")
+      |> render_change(%{"value" => group.name})
+
+      render_click(lv, "add_pending_group", %{"group_id" => group.id})
+      html = render_click(lv, "remove_pending_group_addition", %{"group_id" => group.id})
+      refute html =~ group.name
+
+      refute has_element?(
+               lv,
+               "button[phx-click='remove_pending_group_addition'][phx-value-group_id='#{group.id}']"
+             )
+    end
+
+    test "add_pending_group_removal and undo_pending_group_removal toggle group_id in state", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Existing Group")
+      membership_fixture(actor: service_account, group: group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      assert has_element?(lv, "div", "No pending removals.")
+      refute has_element?(
+               lv,
+               "button[phx-click='undo_pending_group_removal'][phx-value-group_id='#{group.id}']"
+             )
+
+      render_click(lv, "add_pending_group_removal", %{"group_id" => group.id})
+
+      refute has_element?(lv, "div", "No pending removals.")
+      assert has_element?(
+               lv,
+               "button[phx-click='undo_pending_group_removal'][phx-value-group_id='#{group.id}']"
+             )
+
+      render_click(lv, "undo_pending_group_removal", %{"group_id" => group.id})
+
+      assert has_element?(lv, "div", "No pending removals.")
+      refute has_element?(
+               lv,
+               "button[phx-click='undo_pending_group_removal'][phx-value-group_id='#{group.id}']"
+             )
+      assert Portal.Repo.get_by(Portal.Membership, actor_id: service_account.id, group_id: group.id)
+    end
+
+    test "saving with pending group additions creates memberships in DB", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "New Group")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      lv
+      |> element("input[placeholder='Search to add groups...']")
+      |> render_change(%{"value" => group.name})
+
+      render_click(lv, "add_pending_group", %{"group_id" => group.id})
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: service_account.name})
+      |> render_submit()
+
+      assert Portal.Repo.get_by(Portal.Membership, actor_id: service_account.id, group_id: group.id)
+    end
+
+    test "saving with pending group removals deletes memberships from DB", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Existing Group")
+      membership_fixture(actor: service_account, group: group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      render_click(lv, "add_pending_group_removal", %{"group_id" => group.id})
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: service_account.name})
+      |> render_submit()
+
+      refute Portal.Repo.get_by(Portal.Membership, actor_id: service_account.id, group_id: group.id)
+    end
+
+    test "shows current groups for a service account in the current column", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      current_group = group_fixture(account: account, name: "Current Group")
+      membership_fixture(actor: service_account, group: current_group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      assert render(lv) =~ current_group.name
+
+      assert has_element?(
+               lv,
+               "button[phx-click='add_pending_group_removal'][phx-value-group_id='#{current_group.id}']"
+             )
+    end
+
+    test "saving with pending group additions shows the group in the groups tab", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Visible Group")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      lv
+      |> element("input[placeholder='Search to add groups...']")
+      |> render_change(%{"value" => group.name})
+
+      render_click(lv, "add_pending_group", %{"group_id" => group.id})
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: service_account.name})
+      |> render_submit()
+
+      render_click(lv, "change_tab", %{"tab" => "groups"})
+      assert render(lv) =~ group.name
+    end
+
+    test "saves successfully when a pending group removal was already deleted in another tab",
+         %{conn: conn, account: account, actor: actor} do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Current Group")
+      membership = membership_fixture(actor: service_account, group: group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      render_click(lv, "add_pending_group_removal", %{"group_id" => group.id})
+
+      Portal.Repo.delete!(membership)
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: service_account.name})
+      |> render_submit()
+
+      html = render(lv)
+      refute html =~ "Failed to update some group memberships."
+
+      refute Portal.Repo.get_by(Portal.Membership,
+               actor_id: service_account.id,
+               group_id: group.id
+             )
+    end
+
+    test "shows error flash when adding a group membership to a service account fails", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+      group = group_fixture(account: account, name: "Target Group")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{service_account}/edit")
+
+      lv
+      |> element("input[placeholder='Search to add groups...']")
+      |> render_change(%{"value" => group.name})
+
+      render_click(lv, "add_pending_group", %{"group_id" => group.id})
+
+      membership_fixture(actor: service_account, group: group)
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: service_account.name})
+      |> render_submit()
+
+      assert render(lv) =~ "Failed to update some group memberships."
+    end
+  end
+
+  describe "count badge" do
+    test "shows total service account count after async load", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      _service_account = service_account_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> Phoenix.LiveViewTest.live(~p"/#{account}/service_accounts")
+
+      assert html =~ "Loading..."
+
+      html = render_async(lv)
+
+      assert html =~ "1"
+      assert html =~ "Total"
+      refute html =~ "Loading..."
+    end
+
+    test "increments count on service account insert change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :insert, struct: %Actor{type: :service_account}})
+
+      html = render(lv)
+      assert html =~ "1"
+      assert html =~ "Total"
+    end
+
+    test "decrements count on service account delete change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      _service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :delete, old_struct: %Actor{type: :service_account}})
+
+      html = render(lv)
+      assert html =~ "0"
+      assert html =~ "Total"
+    end
+
+    test "quietly ignores other actor types on the shared topic", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :insert, struct: %Actor{type: :account_user}})
+      send(lv.pid, %Change{op: :update, struct: %Actor{type: :api_client}})
+      send(lv.pid, %Change{op: :delete, old_struct: %Actor{type: :account_admin_user}})
+      render(lv)
+
+      html = render(lv)
+      assert html =~ "0"
+      assert html =~ "Total"
+      refute has_element?(lv, "#actors-reload-btn")
+    end
+
+    test "marks the table stale on service account update change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      service_account = service_account_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts")
+
+      render_async(lv)
+      refute has_element?(lv, "#actors-reload-btn")
+
+      {:ok, _updated} =
+        service_account
+        |> Ecto.Changeset.change(name: "Renamed Service Account")
+        |> Repo.update()
+
+      send(lv.pid, %Change{
+        op: :update,
+        struct: %Actor{type: :service_account, id: service_account.id}
+      })
+
+      assert has_element?(lv, "#actors-reload-btn")
+
+      render_click(lv, "reload", %{"table_id" => "actors"})
+      assert render_async(lv) =~ "Renamed Service Account"
+    end
+  end
+  describe "live table filters across panel operations" do
+    setup %{account: account} do
+      matching = service_account_fixture(account: account, name: "ci-runner")
+      other = service_account_fixture(account: account, name: "backup-bot")
+      filter = %{"actors_filter[name_or_email]" => "ci-"}
+      %{matching: matching, other: other, filter: filter}
+    end
+
+    test "are kept when creating a service account", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      other: other,
+      filter: filter
+    } do
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts?#{filter}")
+
+      refute html =~ other.name
+
+      render_click(lv, "open_new_actor_panel")
+      assert_patch(lv, ~p"/#{account}/service_accounts/new?#{filter}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/service_accounts?#{filter}")
+
+      render_click(lv, "open_new_actor_panel")
+
+      lv
+      |> form("form[phx-submit='create_service_account']",
+        actor: %{name: "ci-deployer"},
+        token_expiration: ""
+      )
+      |> render_submit()
+
+      created =
+        Repo.get_by!(Actor, account_id: account.id, type: :service_account, name: "ci-deployer")
+
+      assert_patch(lv, ~p"/#{account}/service_accounts/#{created.id}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "ci-deployer"
+      refute html =~ other.name
+    end
+
+    test "are kept when editing a service account", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      matching: matching,
+      other: other,
+      filter: filter
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/service_accounts/#{matching}?#{filter}")
+
+      render_click(lv, "open_actor_edit_form")
+      assert_patch(lv, ~p"/#{account}/service_accounts/#{matching}/edit?#{filter}")
+
+      render_click(lv, "cancel_actor_edit_form")
+      assert_patch(lv, ~p"/#{account}/service_accounts/#{matching}?#{filter}")
+
+      render_click(lv, "open_actor_edit_form")
+
+      lv
+      |> form("form[phx-submit='save']", actor: %{name: "ci-renamed"})
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/service_accounts/#{matching}?#{filter}")
+
+      html = render_async(lv)
+      assert html =~ "ci-renamed"
+      refute html =~ other.name
+    end
+  end
+end

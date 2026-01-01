@@ -1,0 +1,957 @@
+defmodule PortalWeb.GroupsTest do
+  use PortalWeb.ConnCase, async: true
+
+  import Phoenix.LiveViewTest, except: [live: 2]
+
+  # The table loads in an async task, so wait for it before returning.
+  defp live(conn, path) do
+    case Phoenix.LiveViewTest.live(conn, path) do
+      {:ok, lv, _html} -> {:ok, lv, render_async(lv)}
+      other -> other
+    end
+  end
+
+  alias Portal.{Group, Membership, Policy, Repo}
+  alias Portal.Changes.Change
+
+  import Portal.AccountFixtures
+  import Portal.DevicePostureFixtures
+  import Portal.ActorFixtures
+  import Portal.GroupFixtures
+  import Portal.MembershipFixtures
+  import Portal.PolicyFixtures
+  import Portal.ResourceFixtures
+
+  setup do
+    account = account_fixture()
+    actor = admin_actor_fixture(account: account)
+    %{account: account, actor: actor}
+  end
+
+  describe "unauthorized" do
+    test "redirects to sign-in when not authenticated", %{conn: conn, account: account} do
+      path = ~p"/#{account}/groups"
+
+      assert live(conn, path) ==
+               {:error,
+                {:redirect,
+                 %{
+                   to: ~p"/#{account}/sign_in?#{%{redirect_to: path}}",
+                   flash: %{"error" => "You must sign in to access that page."}
+                 }}}
+    end
+  end
+
+  describe "index (default action)" do
+    test "loads the table only after the socket connects", %{conn: conn, account: account, actor: actor} do
+      group_fixture(account: account)
+
+      conn = authorize_conn(conn, actor)
+
+      static = conn |> get(~p"/#{account}/groups") |> html_response(200) |> Floki.parse_document!()
+      assert [_] = Floki.find(static, "#groups-skeleton")
+      assert Floki.find(static, "#groups-rows tr") == []
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/groups")
+      assert has_element?(lv, "#groups-rows tr")
+      refute has_element?(lv, "#groups-skeleton")
+    end
+
+    test "renders groups page", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups")
+
+      assert html =~ "Groups"
+    end
+
+    test "renders existing groups in the list", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups")
+
+      assert html =~ group.name
+    end
+  end
+
+  describe ":new action" do
+    test "renders create group form", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/new")
+
+      assert html =~ "Group Name"
+    end
+
+    test "shows validation error for empty group name", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/new")
+
+      html =
+        lv
+        |> form("#group-form", group: %{name: ""})
+        |> render_submit()
+
+      assert html =~ "can&#39;t be blank"
+    end
+
+    test "creates group and navigates away on valid submit", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/new")
+
+      lv
+      |> form("#group-form", group: %{name: "Test Group"})
+      |> render_submit()
+
+      html = render(lv)
+      assert html =~ "Test Group"
+    end
+
+    test "adds members before create and closes panel", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      other_actor = actor_fixture(account: account, name: "Member Search Actor")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/new")
+
+      assert render_focus(element(lv, "input[name='group[member_search]']")) =~
+               "Search to add members"
+
+      html =
+        lv
+        |> form("#group-form", group: %{name: "Ops Team", member_search: "Member Search"})
+        |> render_change()
+
+      assert html =~ other_actor.name
+
+      html = render_click(lv, "add_member", %{"actor_id" => other_actor.id})
+      assert html =~ "To Add"
+      assert html =~ other_actor.name
+
+      html = render_click(lv, "remove_member", %{"actor_id" => other_actor.id})
+      refute html =~ "Member Search Actor"
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/groups")
+    end
+  end
+
+  describe ":show action" do
+    test "renders group detail panel with group name", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      assert html =~ group.name
+    end
+
+    test "ignores a tab switch queued while the group panel is closing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/groups")
+
+      render_click(lv, "switch_group_tab", %{"tab" => "resources"})
+
+      refute has_element?(lv, "#group-panel > div")
+    end
+
+    test "shows group member list", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      other_actor = actor_fixture(account: account)
+      _membership = membership_fixture(actor: other_actor, group: group)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      assert html =~ other_actor.name
+    end
+
+    test "switches to resources tab and grants access", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Private API")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      render_click(lv, "switch_group_tab", %{"tab" => "resources"})
+      assert_patch(lv, ~p"/#{account}/groups/#{group.id}?tab=resources")
+
+      html = render_click(lv, "open_grant_resource_form")
+      assert html =~ "Grant access"
+      assert html =~ resource.name
+
+      html = render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+      assert html =~ resource.name
+
+      html =
+        lv
+        |> form("#grant-resource-form")
+        |> render_submit()
+
+      assert html =~ resource.name
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      assert policy
+
+      html = render_click(lv, "open_grant_resource_form")
+      assert html =~ "Grant access"
+      assert render_click(lv, "close_grant_resource_form") =~ resource.name
+    end
+
+    test "grants access with device postures", %{conn: conn} do
+      account = device_posture_account_fixture()
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      render_click(lv, "switch_group_tab", %{"tab" => "resources"})
+      html = render_click(lv, "open_grant_resource_form")
+      assert html =~ "Device posture"
+
+      render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+      html = render_click(lv, "postures_toggle_check", %{"name" => "client_up_to_date"})
+      assert html =~ ~s(&quot;field&quot;:&quot;firezone.last_seen_version&quot;)
+
+      lv
+      |> form("#grant-resource-form")
+      |> render_submit()
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      {:ok, check} = PortalWeb.Policies.Postures.Checks.fetch(:client_up_to_date)
+      assert Portal.Policies.Postures.to_map(policy.postures) == check.expansion
+    end
+
+    test "grants access with flow log reporting disabled", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      html = render_click(lv, "open_grant_resource_form")
+      assert html =~ "Flow log reporting"
+
+      render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+
+      lv
+      |> form("#grant-resource-form", policy: %{flow_log_uploads_enabled: false})
+      |> render_submit()
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      assert policy.flow_log_uploads_enabled == false
+    end
+
+    test "defaults flow log reporting off when granting access to the Internet Resource",
+         %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      render_click(lv, "open_grant_resource_form")
+
+      html = render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+      assert html =~ "Flow log reporting"
+
+      assert html =~
+               "Enabling flow log collection for the internet resource can result in substantial log volume."
+
+      lv
+      |> form("#grant-resource-form")
+      |> render_submit()
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      assert policy.flow_log_uploads_enabled == false
+    end
+
+    test "grants access to multiple resources at once", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource1 = resource_fixture(account: account, name: "Resource Alpha")
+      resource2 = resource_fixture(account: account, name: "Resource Beta")
+      resource3 = resource_fixture(account: account, name: "Resource Gamma")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      render_click(lv, "open_grant_resource_form")
+      render_click(lv, "toggle_grant_resource", %{"resource_id" => resource1.id})
+      render_click(lv, "toggle_grant_resource", %{"resource_id" => resource2.id})
+      render_click(lv, "toggle_grant_resource", %{"resource_id" => resource3.id})
+
+      lv |> form("#grant-resource-form") |> render_submit()
+
+      assert Repo.get_by!(Policy, group_id: group.id, resource_id: resource1.id)
+      assert Repo.get_by!(Policy, group_id: group.id, resource_id: resource2.id)
+      assert Repo.get_by!(Policy, group_id: group.id, resource_id: resource3.id)
+    end
+
+    test "toggling a selected resource deselects it", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Toggled Resource")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      render_click(lv, "open_grant_resource_form")
+
+      html = render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+      refute html =~ "No resources selected."
+
+      html = render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+      assert html =~ "No resources selected."
+    end
+
+    test "already-granted resources are not shown in available list", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Already Granted Resource")
+      _policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      html = render_click(lv, "open_grant_resource_form")
+
+      refute html =~ "Already Granted Resource"
+    end
+
+    test "resource row links to the granting policy and menu links to the resource", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Internal DB")
+      policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      html = render_click(lv, "toggle_resource_access_actions", %{"resource_id" => resource.id})
+
+      assert html =~ ~p"/#{account}/policies/#{policy.id}"
+      assert html =~ "Go to Resource"
+      assert html =~ ~p"/#{account}/resources/#{resource.id}"
+    end
+
+    test "disables, enables, and removes resource access", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Internal DB")
+      _policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      assert render_click(lv, "toggle_resource_access_actions", %{"resource_id" => resource.id}) =~
+               "Disable"
+
+      render_click(lv, "disable_resource_access", %{"resource_id" => resource.id})
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      assert policy.is_disabled
+
+      assert render_click(lv, "toggle_resource_access_actions", %{"resource_id" => resource.id}) =~
+               "Enable"
+
+      render_click(lv, "enable_resource_access", %{"resource_id" => resource.id})
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      refute policy.is_disabled
+
+      assert render_click(lv, "toggle_resource_access_actions", %{"resource_id" => resource.id}) =~
+               "Remove access"
+
+      html = render_click(lv, "confirm_remove_resource_access", %{"resource_id" => resource.id})
+      assert html =~ "All group members will immediately lose access."
+
+      render_click(lv, "remove_resource_access", %{"resource_id" => resource.id})
+      assert is_nil(Repo.get_by(Policy, group_id: group.id, resource_id: resource.id))
+      assert render(lv) =~ "No resource access"
+    end
+
+    test "shows flash when remove_resource_access loses race", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Internal DB")
+      policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      Repo.delete!(policy)
+
+      render_click(lv, "confirm_remove_resource_access", %{"resource_id" => resource.id})
+      html = render_click(lv, "remove_resource_access", %{"resource_id" => resource.id})
+
+      assert html =~ "Resource access no longer exists."
+    end
+
+    test "shows flash when disable_resource_access loses race", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Internal DB")
+      policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      Repo.delete!(policy)
+
+      html = render_click(lv, "disable_resource_access", %{"resource_id" => resource.id})
+
+      assert html =~ "Resource access state has changed."
+    end
+
+    test "shows flash when enable_resource_access loses race", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Internal DB")
+
+      policy =
+        policy_fixture(
+          account: account,
+          group: group,
+          resource: resource,
+          is_disabled: true
+        )
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}?tab=resources")
+
+      Repo.delete!(policy)
+
+      html = render_click(lv, "enable_resource_access", %{"resource_id" => resource.id})
+
+      assert html =~ "Resource access state has changed."
+    end
+
+    test "filters and paginates members", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+
+      actors =
+        Enum.map(1..10, fn idx ->
+          actor_fixture(account: account, name: "Paginated Member #{idx}")
+        end) ++ [actor_fixture(account: account, name: "Unique Target Member")]
+
+      Enum.each(actors, fn member ->
+        membership_fixture(account: account, actor: member, group: group)
+      end)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      assert render(lv) =~ "Page 1 of 2"
+
+      html = render_click(lv, "next_member_page")
+      assert html =~ "Page 2 of 2"
+
+      html =
+        render_change(element(lv, "form[phx-change='filter_show_members']"), %{
+          "filter" => "Unique Target"
+        })
+
+      assert html =~ "Unique Target Member"
+      refute html =~ "Paginated Member 1"
+
+      html = render_click(lv, "prev_member_page")
+      assert html =~ "Unique Target Member"
+    end
+
+    test "managed everyone group cannot be edited", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = managed_group_fixture(account: account, name: "Everyone", idp_id: nil)
+      conn = authorize_conn(conn, actor)
+
+      {:ok, _lv, html} = live(conn, ~p"/#{account}/groups/#{group}")
+
+      refute html =~ "Delete group"
+      refute html =~ " Edit"
+
+      assert live(conn, ~p"/#{account}/groups/#{group}/edit") ==
+               {:error,
+                {:live_redirect,
+                 %{
+                   to: ~p"/#{account}/groups/#{group.id}",
+                   flash: %{"error" => "This group cannot be edited"}
+                 }}}
+    end
+
+    test "patches to groups index with flash when group does not exist", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      missing_id = Ecto.UUID.generate()
+
+      assert {:error, {:live_redirect, %{to: to, flash: flash}}} =
+               conn
+               |> authorize_conn(actor)
+               |> live(~p"/#{account}/groups/#{missing_id}")
+
+      assert to == ~p"/#{account}/groups"
+      assert flash["error"] =~ "Group does not exist"
+    end
+  end
+
+  describe ":edit action" do
+    test "renders edit form with group name pre-populated", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}/edit")
+
+      assert html =~ group.name
+      assert html =~ "Group Name"
+    end
+
+    test "adds and removes memberships on save", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      current_member = actor_fixture(account: account, name: "Current Member")
+      added_member = actor_fixture(account: account, name: "Added Member")
+      membership_fixture(account: account, actor: current_member, group: group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}/edit")
+
+      html =
+        lv
+        |> form("#group-form", group: %{name: group.name, member_search: "Added Member"})
+        |> render_change()
+
+      assert html =~ added_member.name
+
+      html = render_click(lv, "add_member", %{"actor_id" => added_member.id})
+      assert html =~ "To Add"
+
+      html = render_click(lv, "remove_member", %{"actor_id" => current_member.id})
+      assert html =~ "To Remove"
+
+      lv
+      |> form("#group-form", group: %{name: "Updated Group Name", member_search: ""})
+      |> render_submit()
+
+      group = Repo.get_by!(Group, id: group.id, account_id: account.id)
+      assert group.name == "Updated Group Name"
+
+      assert Repo.get_by!(Membership, group_id: group.id, actor_id: added_member.id)
+      assert is_nil(Repo.get_by(Membership, group_id: group.id, actor_id: current_member.id))
+    end
+
+    test "shows updated members without full refresh after saving edits", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      current_member = actor_fixture(account: account, name: "Current Member")
+      added_member = actor_fixture(account: account, name: "Added Member")
+      membership_fixture(account: account, actor: current_member, group: group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      assert render(lv) =~ current_member.name
+
+      lv
+      |> element("a[href='#{~p"/#{account}/groups/#{group}/edit"}']")
+      |> render_click()
+
+      assert_patch(lv, ~p"/#{account}/groups/#{group}/edit")
+
+      render_click(lv, "remove_member", %{"actor_id" => current_member.id})
+
+      html =
+        lv
+        |> form("#group-form", group: %{name: group.name, member_search: added_member.name})
+        |> render_change()
+
+      assert html =~ added_member.name
+      render_click(lv, "add_member", %{"actor_id" => added_member.id})
+
+      lv
+      |> form("#group-form", group: %{name: group.name, member_search: ""})
+      |> render_submit()
+
+      html = render(lv)
+      assert html =~ added_member.name
+      refute html =~ current_member.name
+    end
+  end
+
+  describe "confirm_delete_group event" do
+    test "shows delete confirmation and cancel dismisses it", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      html = render_click(lv, "confirm_delete_group")
+      assert html =~ "Delete"
+
+      html = render_click(lv, "cancel_delete_group")
+      refute html =~ "Delete this group?"
+    end
+  end
+
+  describe "undo_member_removal event" do
+    test "undoes pending member removal and preserves membership on save", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      member = actor_fixture(account: account, name: "Member To Keep")
+      membership_fixture(account: account, actor: member, group: group)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}/edit")
+
+      html = render_click(lv, "remove_member", %{"actor_id" => member.id})
+      assert html =~ "To Remove"
+
+      render_click(lv, "undo_member_removal", %{"actor_id" => member.id})
+
+      refute has_element?(
+               lv,
+               "button[phx-click='undo_member_removal'][phx-value-actor_id='#{member.id}']"
+             )
+
+      assert has_element?(
+               lv,
+               "button[phx-click='remove_member'][phx-value-actor_id='#{member.id}']"
+             )
+
+      lv
+      |> form("#group-form", group: %{name: group.name, member_search: ""})
+      |> render_submit()
+
+      assert Repo.get_by!(Membership, group_id: group.id, actor_id: member.id)
+    end
+  end
+
+  describe "delete event" do
+    test "deletes group and removes from list", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{group}")
+
+      render_click(lv, "delete", %{"id" => group.id})
+
+      html = render_async(lv)
+      refute html =~ group.name
+    end
+  end
+
+  describe "count badge" do
+    test "shows total group count after async load", %{conn: conn, account: account, actor: actor} do
+      _group = group_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> Phoenix.LiveViewTest.live(~p"/#{account}/groups")
+
+      assert html =~ "Loading..."
+
+      html = render_async(lv)
+
+      assert html =~ "1"
+      assert html =~ "Total"
+      refute html =~ "Loading..."
+    end
+
+    test "increments count on group insert change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :insert, struct: %Group{type: :static}})
+
+      html = render(lv)
+      assert html =~ "1"
+      assert html =~ "Total"
+    end
+
+    test "decrements count on group delete change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      _group = group_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :delete, old_struct: %Group{type: :static}})
+
+      html = render(lv)
+      assert html =~ "0"
+      assert html =~ "Total"
+    end
+
+    test "ignores managed Everyone group changes", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :insert, struct: %Group{type: :managed, idp_id: nil, name: "Everyone"}})
+
+      html = render(lv)
+      assert html =~ "0"
+      assert html =~ "Total"
+    end
+  end
+  describe "live table filters across panel operations" do
+    setup %{account: account} do
+      matching = group_fixture(account: account, name: "Engineering Team")
+      other = group_fixture(account: account, name: "Marketing Team")
+      filter = %{"groups_filter[name]" => "Engineering"}
+      %{matching: matching, other: other, filter: filter}
+    end
+
+    test "are kept when creating a group", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      other: other,
+      filter: filter
+    } do
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups?#{filter}")
+
+      refute html =~ other.name
+
+      new_link = "a[href='#{~p"/#{account}/groups/new?#{filter}"}']"
+
+      lv |> element(new_link) |> render_click()
+      assert_patch(lv, ~p"/#{account}/groups/new?#{filter}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/groups?#{filter}")
+
+      lv |> element(new_link) |> render_click()
+
+      lv
+      |> form("#group-form", group: %{name: "Engineering Ops", member_search: ""})
+      |> render_submit()
+
+      group = Portal.Repo.get_by!(Group, account_id: account.id, name: "Engineering Ops")
+      assert_patch(lv, ~p"/#{account}/groups/#{group.id}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "Engineering Ops"
+      refute html =~ other.name
+    end
+
+    test "are kept when editing a group", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      matching: matching,
+      other: other,
+      filter: filter
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{matching}?#{filter}")
+
+      lv
+      |> element("a[href='#{~p"/#{account}/groups/#{matching}/edit?#{filter}"}']")
+      |> render_click()
+
+      assert_patch(lv, ~p"/#{account}/groups/#{matching}/edit?#{filter}")
+
+      lv
+      |> form("#group-form", group: %{name: "Engineering Renamed", member_search: ""})
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/groups/#{matching}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "Engineering Renamed"
+      refute html =~ other.name
+    end
+
+    test "are kept when granting access to a resource", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      matching: matching,
+      other: other,
+      filter: filter
+    } do
+      resource = resource_fixture(account: account, name: "Private API")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/groups/#{matching}?#{filter}")
+
+      render_click(lv, "switch_group_tab", %{"tab" => "resources"})
+      assert_patch(lv, ~p"/#{account}/groups/#{matching}?#{Map.put(filter, "tab", "resources")}")
+
+      render_click(lv, "open_grant_resource_form")
+      render_click(lv, "toggle_grant_resource", %{"resource_id" => resource.id})
+
+      html =
+        lv
+        |> form("#grant-resource-form")
+        |> render_submit()
+
+      assert Portal.Repo.get_by!(Policy, group_id: matching.id, resource_id: resource.id)
+      assert html =~ resource.name
+      refute html =~ other.name
+      assert has_element?(lv, "input[name='groups[name]'][value='Engineering']")
+    end
+  end
+end

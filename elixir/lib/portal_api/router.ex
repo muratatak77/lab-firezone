@@ -1,0 +1,287 @@
+defmodule PortalAPI.Router do
+  use PortalAPI, :router
+  require Logger
+
+  # Router pipelines run only after a route matches; sockets are handled by the endpoint.
+  pipeline :canonical_host do
+    plug :redirect_to_rest_api_url
+  end
+
+  pipe_through :canonical_host
+
+  pipeline :api do
+    plug :accepts, ["json"]
+    plug PortalAPI.Plugs.Auth
+    plug PortalAPI.Plugs.RateLimit
+    plug PortalAPI.Plugs.RequestLog
+    plug PortalAPI.Plugs.Scope
+    plug PortalAPI.Plugs.ValidateUUIDParams
+    plug OpenApiSpex.Plug.PutApiSpec, module: PortalAPI.ApiSpec
+
+    # The plugs above use only request metadata, so a rejected request never
+    # buffers an attacker-controlled body. The parser is also last because
+    # Phoenix renders a pipeline error with the conn from before the body read.
+    plug PortalAPI.Plugs.ParseBody,
+      parsers: [Portal.Parsers.JSON],
+      pass: ["*/*"],
+      json_decoder: Phoenix.json_library()
+  end
+
+  pipeline :public do
+    plug :accepts, ["html", "xml", "json"]
+    plug OpenApiSpex.Plug.PutApiSpec, module: PortalAPI.ApiSpec
+  end
+
+  scope "/openapi" do
+    pipe_through :public
+
+    get "/", PortalAPI.OpenAPIController, :index
+  end
+
+  scope "/openapi.json" do
+    pipe_through :public
+
+    get "/", OpenApiSpex.Plug.RenderSpec, []
+  end
+
+  scope "/swaggerui" do
+    pipe_through :public
+
+    get "/", OpenApiSpex.Plug.SwaggerUI, path: "/openapi.json"
+  end
+
+  # The IP bucket precedes all attacker-controlled work. Once a
+  # token is authenticated, every request is charged to its account and logged
+  # before controller dispatch. Synthetic REST requests carry private skip
+  # markers so this outer metering is never duplicated; only write tools are
+  # charged again, to the write bucket.
+  pipeline :mcp do
+    plug PortalAPI.Plugs.MCPRateLimit
+    plug :accepts, ["json"]
+    plug PortalAPI.Plugs.MCPAuth
+    plug PortalAPI.Plugs.RateLimit, mcp: true
+    # Insert the load-bearing audit row before parsing. Tool attempts and
+    # dispatch outcomes are separate metadata on the original /mcp request.
+    plug PortalAPI.Plugs.RequestLog, mcp: true
+
+    plug PortalAPI.Plugs.MCPParseBody,
+      parsers: [Portal.Parsers.JSON],
+      pass: ["*/*"],
+      json_decoder: Phoenix.json_library(),
+      length: 1_000_000
+
+  end
+
+  # Read before the client holds any credential, so it cannot be authenticated.
+  # Both paths are served: a client tries the one scoped to the MCP endpoint's
+  # path first and falls back to the root.
+  scope "/.well-known", PortalAPI do
+    pipe_through :public
+
+    get "/oauth-protected-resource/mcp", OAuthMetadataController, :show
+    get "/oauth-protected-resource", OAuthMetadataController, :show
+  end
+
+  scope "/mcp", PortalAPI do
+    pipe_through :mcp
+
+    post "/", MCPController, :handle
+    get "/", MCPController, :method_not_allowed
+    delete "/", MCPController, :method_not_allowed
+  end
+
+  pipeline :ingestion do
+    plug :accepts, ["json"]
+    # Rate limiting is keyed on the source IP and runs before token
+    # verification and parsing. The ingest token is entirely in the
+    # Authorization header, so it can also be authenticated before reading the
+    # body.
+    plug PortalAPI.Plugs.IngestionRateLimit
+    plug PortalAPI.Plugs.FlowLogAuth
+
+    # Preserve the post-read conn when malformed or oversized JSON raises so
+    # RescueRouterErrors can send the error without reusing stale adapter state.
+    plug Plug.Parsers,
+      parsers: [Portal.Parsers.JSON],
+      pass: ["*/*"],
+      json_decoder: Phoenix.json_library(),
+      length: 10_000_000
+  end
+
+  scope "/ingestion", PortalAPI do
+    pipe_through :ingestion
+
+    post "/flow_logs", FlowLogController, :create
+  end
+
+  # URL versioning was tried (a /v1 prefix scope duplicating every route
+  # below) and rolled back before ever shipping as the documented surface -
+  # see git history if reviving it. Versioning strategy is deliberately
+  # undecided until an actual breaking change forces the question.
+  scope "/", PortalAPI do
+    pipe_through :api
+
+    resources "/account", AccountController, only: [:show], singleton: true
+
+    resources "/clients", ClientController, except: [:new, :edit, :create]
+    put "/clients/:id/verify", ClientController, :verify
+    put "/clients/:id/unverify", ClientController, :unverify
+
+    get "/logs", LogController, :index
+    get "/logs/:log_id", LogController, :show
+
+    resources "/resources", ResourceController, except: [:new, :edit] do
+      get "/pool_members", PoolMemberController, :index
+      put "/pool_members", PoolMemberController, :update_put
+      patch "/pool_members", PoolMemberController, :update_patch
+    end
+    resources "/policies", PolicyController, except: [:new, :edit]
+    get "/posture_fields", PostureFieldController, :index
+
+    resources "/sites", SiteController, except: [:new, :edit] do
+      post "/gateway_tokens", GatewayTokenController, :create
+      delete "/gateway_tokens", GatewayTokenController, :delete_all
+      delete "/gateway_tokens/:id", GatewayTokenController, :delete
+      resources "/gateways", GatewayController, except: [:new, :edit] do
+        post "/token", GatewayTokenController, :create_for_gateway
+        post "/token/rotate", GatewayTokenController, :rotate
+      end
+    end
+
+    resources "/actors", ActorController, except: [:new, :edit] do
+      resources "/external_identities", ExternalIdentityController, only: [:index, :show, :delete]
+      get "/client_tokens", ClientTokenController, :index
+      get "/client_tokens/:id", ClientTokenController, :show
+      post "/client_tokens", ClientTokenController, :create
+      delete "/client_tokens", ClientTokenController, :delete_all
+      delete "/client_tokens/:id", ClientTokenController, :delete
+    end
+
+    resources "/groups", GroupController, except: [:new, :edit] do
+      get "/memberships", MembershipController, :index
+      put "/memberships", MembershipController, :update_put
+      patch "/memberships", MembershipController, :update_patch
+    end
+
+    resources "/email_otp_auth_providers", EmailOTPAuthProviderController, only: [:index, :show]
+    get "/x509_auth_provider", X509AuthProviderController, :show
+    resources "/oidc_auth_providers", OIDCAuthProviderController, only: [:index, :show]
+    resources "/google_auth_providers", GoogleAuthProviderController, only: [:index, :show]
+    resources "/github_auth_providers", GitHubAuthProviderController, only: [:index, :show]
+    resources "/entra_auth_providers", EntraAuthProviderController, only: [:index, :show]
+    resources "/okta_auth_providers", OktaAuthProviderController, only: [:index, :show]
+    resources "/google_directories", GoogleDirectoryController, only: [:index, :show]
+    resources "/entra_directories", EntraDirectoryController, only: [:index, :show]
+    resources "/okta_directories", OktaDirectoryController, only: [:index, :show]
+    resources "/intune_posture_providers", IntunePostureProviderController,
+      only: [:index, :show, :update, :delete]
+
+    resources "/intune_devices", IntuneDeviceController, only: [:index, :show]
+
+    resources "/iru_posture_providers", IruPostureProviderController,
+      only: [:index, :show, :update, :delete]
+
+    resources "/iru_devices", IruDeviceController, only: [:index, :show]
+
+    resources "/defender_posture_providers", DefenderPostureProviderController,
+      only: [:index, :show, :update, :delete]
+
+    resources "/defender_devices", DefenderDeviceController, only: [:index, :show]
+
+    resources "/santa_posture_providers", SantaPostureProviderController,
+      only: [:index, :show, :update, :delete]
+
+    resources "/santa_devices", SantaDeviceController, only: [:index, :show]
+
+    resources "/sentinelone_posture_providers", SentinelOnePostureProviderController,
+      only: [:index, :show, :update, :delete]
+
+    resources "/sentinelone_devices", SentinelOneDeviceController, only: [:index]
+    get "/sentinelone_devices/:sentinelone_agent", SentinelOneDeviceController, :show
+
+    resources "/sophos_posture_providers", SophosPostureProviderController,
+      only: [:index, :show, :update, :delete]
+
+    resources "/sophos_devices", SophosDeviceController, only: [:index, :show]
+  end
+
+  pipeline :integrations do
+    plug :put_remote_ip_metadata
+  end
+
+  scope "/integrations", PortalAPI.Integrations do
+    pipe_through :integrations
+
+    scope "/azure_communication_services", AzureCommunicationServices do
+      post "/webhooks", WebhookController, :handle_webhook
+    end
+
+    scope "/entra", Entra do
+      post "/webhooks", WebhookController, :handle_webhook
+    end
+
+    scope "/google", Google do
+      post "/webhooks", WebhookController, :handle_webhook
+    end
+
+    scope "/okta", Okta do
+      get "/webhooks", WebhookController, :verify
+      post "/webhooks", WebhookController, :handle_webhook
+    end
+
+    scope "/stripe", Stripe do
+      post "/webhooks", WebhookController, :handle_webhook
+    end
+  end
+
+  # Webhook auth failures log a warning from code that has no conn, so the
+  # client IP rides along as logger metadata. Bandit serves every request of a
+  # keep-alive connection from one process, so the metadata is cleared again.
+  def put_remote_ip_metadata(%Plug.Conn{} = conn, _opts) do
+    Logger.metadata(remote_ip: conn.remote_ip |> :inet.ntoa() |> to_string())
+
+    register_before_send(conn, fn conn ->
+      Logger.metadata(remote_ip: nil)
+      conn
+    end)
+  end
+
+  # Ingestion has its own configured hostname and is not part of the REST API.
+  def redirect_to_rest_api_url(%Plug.Conn{path_info: ["ingestion" | _]} = conn, _opts), do: conn
+
+  def redirect_to_rest_api_url(%Plug.Conn{} = conn, _opts) do
+    rest_api_url = Portal.Config.get_env(:portal, :rest_api_url)
+    flow_api_host = URI.parse(Portal.Config.get_env(:portal, :flow_logs_api_url)).host
+
+    if rest_api_url && conn.host != flow_api_host do
+      redirect_to_canonical_host(conn, URI.parse(rest_api_url))
+    else
+      conn
+    end
+  end
+
+  defp redirect_to_canonical_host(%Plug.Conn{host: host} = conn, %URI{host: host}), do: conn
+
+  defp redirect_to_canonical_host(conn, %URI{scheme: scheme, host: host, port: port}) do
+    query =
+      if conn.query_string == "" do
+        nil
+      else
+        conn.query_string
+      end
+
+    location =
+      URI.to_string(%URI{
+        scheme: scheme,
+        host: host,
+        port: port,
+        path: conn.request_path,
+        query: query
+      })
+
+    conn
+    |> put_resp_header("location", location)
+    |> send_resp(308, "")
+    |> halt()
+  end
+end

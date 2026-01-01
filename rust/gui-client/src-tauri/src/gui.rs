@@ -1,0 +1,694 @@
+//! The Tauri-based GUI Client for Windows and Linux
+//!
+//! Most of this Client is stubbed out with panics on macOS.
+//! The real macOS Client is in `swift/apple`
+
+use crate::{
+    controller::{Controller, ControllerRequest, Failure, GuiIntegration},
+    deep_link,
+    launch_lock::{self, FirstInstance, LaunchLock},
+    logging::FileCount,
+    settings::{
+        self, AdvancedSettings, GeneralSettings, GeneralSettingsViewModel, LogFilterViewModel,
+        MdmSettings, SignInSettings,
+    },
+    updates,
+    view::{
+        GeneralSettingsChanged, LogFilterChanged, LogsRecounted, SessionChanged, SessionViewModel,
+        X509CertificateChanged,
+    },
+};
+use anyhow::{Context, Result, bail};
+use client_ipc::{self as ipc, ClientRead, ClientWrite, SocketId};
+use futures::SinkExt as _;
+use gui_ipc::{ClientMsg, ServerMsg};
+use logging::err_with_src;
+use std::time::Duration;
+use tauri::Manager;
+use tauri_specta::Event;
+use tokio::{runtime::Runtime, sync::mpsc};
+use tokio_stream::StreamExt;
+use tracing::instrument;
+
+pub mod system_tray;
+
+#[cfg(target_os = "linux")]
+#[path = "gui/os_linux.rs"]
+mod os;
+
+#[cfg(target_os = "macos")]
+#[path = "gui/os_macos.rs"]
+mod os;
+
+#[cfg(target_os = "windows")]
+#[path = "gui/os_windows.rs"]
+mod os;
+
+pub use os::set_autostart;
+
+/// All managed state that we might need to access from odd places like Tauri commands.
+///
+/// Note that this never gets Dropped because of
+/// <https://github.com/tauri-apps/tauri/issues/8631>
+#[derive(Clone)]
+pub(crate) struct Managed {
+    req_tx: mpsc::Sender<ControllerRequest>,
+    pub inject_faults: bool,
+}
+
+impl Managed {
+    pub async fn send_request(&self, msg: ControllerRequest) -> Result<()> {
+        let msg_name = msg.to_string();
+
+        self.req_tx
+            .send(msg)
+            .await
+            .with_context(|| format!("Failed to send `{msg_name}`"))
+    }
+
+    pub fn blocking_send_request(&self, msg: ControllerRequest) -> Result<()> {
+        let msg_name = msg.to_string();
+
+        self.req_tx
+            .blocking_send(msg)
+            .with_context(|| format!("Failed to send `{msg_name}`"))
+    }
+}
+
+pub(crate) struct TauriIntegration {
+    app: tauri::AppHandle,
+    tray: system_tray::Tray,
+}
+
+impl TauriIntegration {
+    fn main_window(&self) -> Result<tauri::WebviewWindow> {
+        self.app
+            .get_webview_window("main")
+            .context("Couldn't get handle to window")
+    }
+
+    fn navigate(&self, path: &str) -> Result<()> {
+        let window = self.main_window()?;
+
+        let mut url = window.url()?;
+        url.set_path(path);
+
+        window.navigate(url)?;
+
+        Ok(())
+    }
+}
+
+impl Drop for TauriIntegration {
+    fn drop(&mut self) {
+        tracing::debug!("Instructing Tauri to exit");
+
+        self.app.exit(0);
+    }
+}
+
+impl GuiIntegration for TauriIntegration {
+    fn notify_session_changed(&self, session: &SessionViewModel) -> Result<()> {
+        SessionChanged(session.clone())
+            .emit(&self.app)
+            .context("Failed to emit `session_changed` event")
+    }
+
+    fn notify_settings_changed(
+        &self,
+        mdm_settings: MdmSettings,
+        general_settings: GeneralSettings,
+        advanced_settings: AdvancedSettings,
+        signed_in_with: Option<SignInSettings>,
+    ) -> Result<()> {
+        GeneralSettingsChanged(GeneralSettingsViewModel::new(
+            mdm_settings.clone(),
+            general_settings,
+            advanced_settings.clone(),
+            signed_in_with,
+        ))
+        .emit(&self.app)
+        .context("Failed to emit `general_settings_changed` event")?;
+
+        LogFilterChanged(LogFilterViewModel::new(mdm_settings, advanced_settings))
+            .emit(&self.app)
+            .context("Failed to emit `log_filter_changed` event")?;
+
+        Ok(())
+    }
+
+    fn notify_logs_recounted(&self, file_count: &FileCount) -> Result<()> {
+        LogsRecounted(file_count.clone())
+            .emit(&self.app)
+            .context("Failed to emit `logs_recounted` event")?;
+
+        Ok(())
+    }
+
+    fn notify_device_trust_changed(
+        &self,
+        certificate: Option<&x509_keystore::ParsedCertificate>,
+    ) -> Result<()> {
+        X509CertificateChanged::from(certificate)
+            .emit(&self.app)
+            .context("Failed to emit `x509_certificate_changed` event")?;
+
+        Ok(())
+    }
+
+    fn open_url<P: AsRef<str>>(&self, url: P) -> Result<()> {
+        tauri_plugin_opener::open_url(url, Option::<&str>::None)?;
+
+        Ok(())
+    }
+
+    fn set_tray_icon(&mut self, icon: system_tray::Icon) {
+        self.tray.set_icon(icon);
+    }
+
+    fn set_tray_menu(&mut self, app_state: system_tray::AppState) {
+        self.tray.update(app_state)
+    }
+
+    fn open_tray_menu(&self) -> Result<()> {
+        self.tray.open_menu()
+    }
+
+    fn close_tray_menu(&self) -> Result<()> {
+        self.tray.close_menu()
+    }
+
+    fn show_notification(&self, title: impl Into<String>, body: impl Into<String>) -> Result<()> {
+        spawn_notification(title.into(), body.into(), None);
+
+        Ok(())
+    }
+
+    fn show_update_notification(&self, release: updates::Release) -> Result<()> {
+        spawn_notification(
+            format!("Firezone {} available for download", release.version),
+            "Click here to download the new version".to_owned(),
+            Some(release.download_url),
+        );
+
+        Ok(())
+    }
+
+    fn set_window_visible(&self, visible: bool) -> Result<()> {
+        let win = self.main_window()?;
+
+        if visible {
+            // Needed to bring shown windows to the front
+            // `request_user_attention` and `set_focus` don't work, at least on Linux
+            win.hide()?;
+            // Needed to show windows that are completely hidden
+            win.show()?;
+        } else {
+            win.hide().context("Couldn't hide window")?;
+        }
+
+        Ok(())
+    }
+
+    fn show_overview_page(&self, session: &SessionViewModel) -> Result<()> {
+        // Ensure state in frontend is up-to-date.
+        self.notify_session_changed(session)?;
+        self.navigate("overview")?;
+        self.set_window_visible(true)?;
+
+        Ok(())
+    }
+
+    fn show_settings_page(
+        &self,
+        mdm_settings: MdmSettings,
+        general_settings: GeneralSettings,
+        advanced_settings: AdvancedSettings,
+        signed_in_with: Option<SignInSettings>,
+    ) -> Result<()> {
+        self.notify_settings_changed(
+            mdm_settings,
+            general_settings,
+            advanced_settings,
+            signed_in_with,
+        )?; // Ensure settings are up to date in GUI.
+        self.navigate("general-settings")?;
+        self.set_window_visible(true)?;
+
+        Ok(())
+    }
+
+    fn show_about_page(&self) -> Result<()> {
+        self.navigate("about")?;
+        self.set_window_visible(true)?;
+
+        Ok(())
+    }
+
+    async fn save_general_settings(&self, settings: &GeneralSettings) -> Result<()> {
+        settings::save_general(settings).await?;
+
+        Ok(())
+    }
+}
+
+pub struct RunConfig {
+    pub inject_faults: bool,
+    pub debug_update_check: bool,
+    pub smoke_test: bool,
+    pub no_deep_links: bool,
+    pub telemetry_allowed: bool,
+    pub quit_after: Option<u64>,
+    pub fail_with: Option<Failure>,
+}
+
+/// Shows a notification without blocking the caller.
+///
+/// Notifications are fire-and-forget: failures are only logged because
+/// there is nothing the caller could do about them.
+fn spawn_notification(title: String, body: String, open_url: Option<url::Url>) {
+    let app_id = os::notification_app_id();
+
+    tokio::spawn(async move {
+        match desktop_notifications::show(&app_id, &title, &body, open_url.as_ref()).await {
+            Ok(()) => tracing::debug!(%title, %body, "Showed notification"),
+            Err(e) => tracing::debug!(%title, "Failed to show notification: {e:#}"),
+        }
+    });
+}
+
+/// Runs the Tauri GUI and returns on exit or unrecoverable error
+#[instrument(skip_all)]
+pub fn run(rt: &Runtime, config: RunConfig, reloader: logging::FilterReloadHandle) -> Result<()> {
+    tauri::async_runtime::set(rt.handle().clone());
+
+    #[cfg(not(debug_assertions))]
+    crate::package_identity::ensure_package_identity()?;
+
+    let (gui_ipc, _launch_lock) = match rt.block_on(establish_single_instance())? {
+        SingleInstance::First { server, lock } => (server, lock),
+        SingleInstance::SecondHandedOff => bail!(AlreadyRunning),
+    };
+
+    let general_settings = settings::load_general_settings().unwrap_or_default();
+
+    let (ctlr_tx, ctlr_rx) = mpsc::channel(5);
+    let req_tx = ctlr_tx.clone();
+    let (ready_tx, mut ready_rx) = mpsc::channel::<tauri::AppHandle>(1);
+
+    // Spawn the setup task.
+    // Everything we need to do once Tauri is fully initialised goes in here.
+    let setup_task = rt.spawn(async move {
+        // Block until Tauri is ready.
+        let app_handle = ready_rx
+            .recv()
+            .await
+            .context("Never received ready event from Tauri")?;
+
+        let (updates_tx, updates_rx) = mpsc::channel(1);
+
+        // The checker always runs; the controller enforces the `checkForUpdates`
+        // MDM policy once it receives the authoritative settings over IPC.
+        tokio::spawn(async move {
+            if let Err(error) = updates::checker_task(updates_tx, config.debug_update_check).await {
+                tracing::error!("Error in updates::checker_task: {error:#}");
+            }
+        });
+
+        if config.smoke_test {
+            let ctlr_tx = ctlr_tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = smoke_test(ctlr_tx).await {
+                    tracing::error!(
+                        "Error during smoke test, crashing on purpose so a dev can see our stacktraces: {error:#}"
+                    );
+                    unsafe { sadness_generator::raise_segfault() }
+                }
+            });
+        }
+
+        tracing::debug!(config.no_deep_links);
+        if !config.no_deep_links {
+            // The single-instance check is done, so register our exe
+            // to handle deep links
+            let exe =
+                tauri_utils::platform::current_exe().context("Can't find our own exe path")?;
+            deep_link::register(exe).context("Failed to register deep link handler")?;
+        }
+
+        if let Some(failure) = config.fail_with {
+            let ctlr_tx = ctlr_tx.clone();
+            tokio::spawn(async move {
+                let delay = 5;
+                tracing::warn!(
+                    "Will crash / error / panic on purpose in {delay} seconds to test error handling."
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                tracing::warn!("Crashing / erroring / panicking on purpose");
+                ctlr_tx.send(ControllerRequest::Fail(failure)).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+
+        if let Some(delay) = config.quit_after {
+            let ctlr_tx = ctlr_tx.clone();
+            tokio::spawn(async move {
+                tracing::warn!("Will quit gracefully in {delay} seconds.");
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                tracing::warn!("Quitting gracefully due to `--quit-after`");
+                ctlr_tx
+                    .send(ControllerRequest::SystemTrayMenu(system_tray::Event::Quit))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+
+        assert_eq!(
+            crate::BUNDLE_ID,
+            app_handle.config().identifier,
+            "BUNDLE_ID should match bundle ID in tauri.conf.json"
+        );
+
+        let tray = system_tray::Tray::new(
+            tokio::runtime::Handle::current(),
+            app_handle.clone(),
+            |app, event| match handle_system_tray_event(app, event) {
+                Ok(_) => {}
+                Err(e) => tracing::error!("{e}"),
+            },
+        )?;
+        let integration = TauriIntegration {
+            app: app_handle,
+            tray,
+        };
+
+        let legacy_advanced_settings_path = known_dirs::settings()
+            .context("`known_dirs::settings` failed")?
+            .join("advanced_settings.json");
+
+        let ctrl_task = tokio::spawn(Controller::start(
+            SocketId::Tunnel,
+            integration,
+            ctlr_rx,
+            general_settings,
+            legacy_advanced_settings_path,
+            reloader,
+            config.telemetry_allowed,
+            updates_rx,
+            gui_ipc,
+        ));
+
+        anyhow::Ok(ctrl_task)
+    });
+
+    let tauri_specta_builder = crate::view::specta_builder();
+
+    #[cfg(debug_assertions)]
+    {
+        tracing::debug!(path = %crate::view::bindings_path().display(), "Exporting TypeScript bindings");
+
+        crate::view::export_bindings()?;
+    }
+
+    tauri::Builder::default()
+        .manage(Managed {
+            req_tx,
+            inject_faults: config.inject_faults,
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Keep the frontend running but just hide this webview
+                // Per https://tauri.app/v1/guides/features/system-tray/#preventing-the-app-from-closing
+                // Closing the window fully seems to deallocate it or something.
+
+                if let Err(e) = window.hide() {
+                    tracing::warn!("Failed to hide window: {}", err_with_src(&e))
+                };
+                api.prevent_close();
+            }
+        })
+        .invoke_handler(tauri_specta_builder.invoke_handler())
+        .setup(move |app| {
+            tauri_specta_builder.mount_events(app);
+
+            Ok(())
+        })
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .build(tauri::generate_context!())
+        .context("Failed to build Tauri app instance")?
+        .run_return(move |app_handle, event| {
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "We only care about these two events from Tauri"
+            )]
+            match event {
+                tauri::RunEvent::ExitRequested {
+                        api, code: None, .. // `code: None` means the user closed the last window.
+                    } => {
+                    api.prevent_exit();
+                }
+                tauri::RunEvent::Ready => {
+                    // Notify our setup task that we are ready!
+                    let _ = ready_tx.try_send(app_handle.clone());
+                }
+                _ => (),
+            }
+        });
+
+    // Wait until the controller task finishes.
+    rt.block_on(async move {
+        let ctrl_task = setup_task.await.context("Failed to complete app setup")??;
+        let ctrl_or_timeout = tokio::time::timeout(Duration::from_secs(5), ctrl_task);
+
+        ctrl_or_timeout
+            .await
+            .context("Controller failed to exit within 5s after OS-eventloop finished")?
+            .context("Controller panicked")?
+            .context("Controller failed")?;
+
+        anyhow::Ok(())
+    })?;
+
+    tracing::info!("Controller exited gracefully");
+
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+async fn smoke_test(_: mpsc::Sender<ControllerRequest>) -> Result<()> {
+    bail!("Smoke test is not built for release binaries.");
+}
+
+/// Runs a smoke test and then asks Controller to exit gracefully
+///
+/// You can purposely fail this test by deleting the exported zip file during
+/// the 10-second sleep.
+#[cfg(debug_assertions)]
+async fn smoke_test(ctrl_tx: mpsc::Sender<ControllerRequest>) -> Result<()> {
+    let delay = 10;
+    tracing::info!("Will quit on purpose in {delay} seconds as part of the smoke test.");
+    let quit_time = tokio::time::Instant::now() + Duration::from_secs(delay);
+
+    // Test log exporting
+    let path = std::path::PathBuf::from("smoke_test_log_export.zip");
+
+    let stem = "connlib-smoke-test".into();
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                bail!("Error while removing old zip file")
+            }
+        }
+    }
+    ctrl_tx
+        .send(ControllerRequest::ExportLogs {
+            path: path.clone(),
+            stem,
+        })
+        .await
+        .context("Failed to send `ExportLogs` request")?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    ctrl_tx
+        .send(ControllerRequest::ClearLogs(tx))
+        .await
+        .context("Failed to send `ClearLogs` request")?;
+    rx.await
+        .context("Failed to await `ClearLogs` result")?
+        .map_err(|s| anyhow::anyhow!(s))
+        .context("`ClearLogs` failed")?;
+
+    // Round-trip a settings save through the Tunnel service so we exercise
+    // the protected-storage IPC path. The reply lands in the controller's
+    // `AdvancedSettingsApplied` arm; we just need to give it time to land.
+    ctrl_tx
+        .send(ControllerRequest::ApplyLogFilter(
+            AdvancedSettings::default().log_filter,
+        ))
+        .await
+        .context("Failed to send `ApplyLogFilter` request")?;
+
+    // Give the app some time to export the zip and reach steady state
+    tokio::time::sleep_until(quit_time).await;
+
+    // Check results of tests
+    let zip_len = tokio::fs::metadata(&path)
+        .await
+        .context("Failed to get zip file metadata")?
+        .len();
+    if zip_len <= 22 {
+        bail!("Exported log zip just has the file header");
+    }
+    tokio::fs::remove_file(&path)
+        .await
+        .context("Failed to remove zip file")?;
+    tracing::info!(?path, ?zip_len, "Exported log zip looks okay");
+
+    // Check that the protected settings file was written by the Tunnel service.
+    anyhow::ensure!(tokio::fs::try_exists(crate::settings::advanced_settings_path()?).await?);
+
+    tracing::info!("Quitting on purpose because of `smoke-test` subcommand");
+    ctrl_tx
+        .send(ControllerRequest::SystemTrayMenu(system_tray::Event::Quit))
+        .await
+        .context("Failed to send Quit request")?;
+
+    Ok::<_, anyhow::Error>(())
+}
+
+fn handle_system_tray_event(app: &tauri::AppHandle, event: system_tray::Event) -> Result<()> {
+    // `try_send` rather than `blocking_send`: on Linux this runs inside the
+    // ksni service's async task, where a blocking send would panic. Tray
+    // clicks are human-paced, so the bounded channel won't realistically fill.
+    app.try_state::<Managed>()
+        .context("can't get Managed struct from Tauri")?
+        .req_tx
+        .try_send(ControllerRequest::SystemTrayMenu(event))?;
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Another instance of Firezone is already running")]
+pub struct AlreadyRunning;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to communicate with existing Firezone instance")]
+pub struct NewInstanceHandshakeFailed(anyhow::Error);
+
+/// Outcome of [`establish_single_instance`].
+pub enum SingleInstance {
+    /// We acquired the launch lock and now own the GUI IPC pipe
+    /// server. The caller proceeds with normal startup; the
+    /// `LaunchLock` must outlive the IPC server.
+    First {
+        server: ipc::Server,
+        lock: LaunchLock,
+    },
+    /// Another instance was already running. We connected to its GUI
+    /// IPC pipe, sent `ClientMsg::NewInstance`, awaited the `Ack`,
+    /// and closed our end. Production callers bail with
+    /// [`AlreadyRunning`] here; the `single-instance` subcommand uses
+    /// it as a successful end state for the second-instance side of
+    /// the smoke test.
+    SecondHandedOff,
+}
+
+/// Acquire the launch lock and produce a [`SingleInstance`] describing
+/// which role this process plays.
+/// First instance: opens the GUI IPC pipe server. Second instance:
+/// connects to the running instance, drives the `NewInstance` -> `Ack`
+/// handshake to completion, and reports `SecondHandedOff`.
+pub async fn establish_single_instance() -> Result<SingleInstance> {
+    match launch_lock::acquire()? {
+        FirstInstance::Yes(lock) => {
+            tracing::debug!("Acquired launch lock, we are the first GUI instance");
+
+            let server =
+                ipc::Server::new(SocketId::Gui).context("Failed to create GUI IPC socket")?;
+            Ok(SingleInstance::First { server, lock })
+        }
+        FirstInstance::No => {
+            tracing::debug!("Encountered existing launch lock, we are not the first GUI instance");
+
+            // Hand off to the running instance.
+            let (read, write) = ipc::connect::<ServerMsg, ClientMsg>(
+                SocketId::Gui,
+                ipc::ConnectOptions { num_attempts: 3 },
+            )
+            .await
+            .context("Failed to connect to running Firezone instance")
+            .map_err(NewInstanceHandshakeFailed)?;
+
+            tokio::time::timeout(Duration::from_secs(5), new_instance_handshake(read, write))
+                .await
+                .context("Failed to handshake with existing instance in 5s")
+                .map_err(NewInstanceHandshakeFailed)?
+                .map_err(NewInstanceHandshakeFailed)?;
+
+            Ok(SingleInstance::SecondHandedOff)
+        }
+    }
+}
+
+/// Accept exactly one client on `server`, read its first
+/// [`ClientMsg`], send a `ServerMsg::Ack`, and return the message
+/// so the caller can log / assert on it.
+///
+/// Used by the `single-instance` subcommand to exercise the
+/// pipe-server side of the launch-lock hand-off without standing up
+/// the controller or any other normal-runtime machinery. Production
+/// code uses the same `ipc::Server` + framed reader/writer types
+/// through `Controller`, but iterating over many clients in an
+/// accept loop, not one-shot.
+pub async fn accept_one_for_debug(server: &mut ipc::Server) -> Result<ClientMsg> {
+    let (mut read, mut write, _pid) = server
+        .next_client_split::<ClientMsg, ServerMsg>()
+        .await
+        .context("Failed to accept GUI IPC client")?;
+    let msg = read
+        .next()
+        .await
+        .context("No frame received from second instance")?
+        .context("Failed to read frame from second instance")?;
+    write
+        .send(&ServerMsg::Ack)
+        .await
+        .context("Failed to ack second instance")?;
+    Ok(msg)
+}
+
+async fn new_instance_handshake(
+    mut read: ClientRead<ServerMsg>,
+    mut write: ClientWrite<ClientMsg>,
+) -> Result<()> {
+    write.send(&ClientMsg::NewInstance).await?;
+    let response = read
+        .next()
+        .await
+        .context("No response received")?
+        .context("Failed to receive response")?;
+
+    anyhow::ensure!(response == ServerMsg::Ack);
+
+    Ok(())
+}
+
+pub async fn send_and_await_ack(msg: ClientMsg) -> Result<()> {
+    let (mut read, mut write) =
+        ipc::connect::<ServerMsg, ClientMsg>(SocketId::Gui, ipc::ConnectOptions::default()).await?;
+
+    write.send(&msg).await.context("Failed to send request")?;
+
+    let response = read
+        .next()
+        .await
+        .context("No response received")?
+        .context("Failed to receive response")?;
+
+    anyhow::ensure!(response == ServerMsg::Ack);
+
+    tracing::info!("Running instance acknowledged the request, goodbye!");
+
+    Ok(())
+}

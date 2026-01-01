@@ -1,0 +1,634 @@
+defmodule Portal.RepoTest.ActorQuery do
+  import Ecto.Query
+
+  def all, do: from(a in Portal.Actor, as: :actors)
+
+  def cursor_fields do
+    [{:actors, :asc, :inserted_at}, {:actors, :asc, :id}]
+  end
+end
+
+defmodule Portal.RepoTest.AccountQuery do
+  import Ecto.Query
+  alias Portal.Repo.Filter
+
+  def all, do: from(a in Portal.Account, as: :accounts)
+
+  def cursor_fields do
+    [{:accounts, :asc, :inserted_at}, {:accounts, :asc, :id}]
+  end
+
+  def filters do
+    [
+      %Filter{
+        name: :slug,
+        title: "Slug",
+        type: :string,
+        fun: fn queryable, value ->
+          {queryable, dynamic([accounts: a], a.slug == ^value)}
+        end
+      },
+      %Filter{
+        name: :name,
+        title: "Name",
+        type: :string,
+        fun: fn queryable, value ->
+          {queryable, dynamic([accounts: a], ilike(a.name, ^"%#{value}%"))}
+        end
+      }
+    ]
+  end
+end
+
+defmodule Portal.RepoTest do
+  import Ecto.Query
+  use Portal.DataCase, async: true
+  import Portal.Repo
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+
+  describe "list_offset/2" do
+    setup do
+      account = account_fixture()
+      query_module = Portal.RepoTest.ActorQuery
+      queryable = query_module.all()
+
+      %{account: account, query_module: query_module, queryable: queryable}
+    end
+
+    test "returns empty list when there are no results", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      empty_metadata = %Portal.Repo.OffsetPaginator.Metadata{
+        limit: 50,
+        offset: 0,
+        count: 0,
+        previous_offset: nil,
+        next_offset: nil,
+        has_previous_page: false,
+        has_next_page: false
+      }
+
+      assert list_offset(queryable, query_module) == {:ok, [], empty_metadata}
+
+      assert list_offset(queryable, query_module, page: [limit: 1000]) ==
+               {:ok, [], %{empty_metadata | limit: 100}}
+
+      assert list_offset(queryable, query_module, page: [limit: -1]) ==
+               {:ok, [], %{empty_metadata | limit: 1}}
+    end
+
+    test "caps counts without restricting pagination and preserves filters", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      for _ <- 1..5, do: actor_fixture(account: account)
+      actor_fixture(account: account_fixture())
+      queryable = where(queryable, [actors: actor], actor.account_id == ^account.id)
+
+      for {cap, expected_count, limited?} <- [{3, 3, true}, {5, 5, true}, {6, 5, false}] do
+        assert {:ok, rows, metadata} =
+                 list_offset(queryable, query_module,
+                   count_limit: cap,
+                   page: [limit: 2, offset: 4]
+                 )
+
+        assert length(rows) == 1
+        assert metadata.count == expected_count
+        assert metadata.count_limited == limited?
+        refute metadata.has_next_page
+        assert metadata.previous_offset == 2
+      end
+
+      assert {:ok, [], metadata} =
+               list_offset(where(queryable, false), query_module, count_limit: 3)
+
+      assert metadata.count == 0
+      refute metadata.count_limited
+    end
+
+    test "cancels the query and returns :query_timeout when the statement budget is used up", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      actor_fixture(account: account)
+
+      slow =
+        where(
+          queryable,
+          [actors: actor],
+          actor.account_id == ^account.id and fragment("pg_sleep(0.5)::text IS NOT NULL")
+        )
+
+      assert list_offset(slow, query_module, statement_timeout: 50, timeout: 5_000) ==
+               {:error, :query_timeout}
+
+      # The connection survives the cancelled statement.
+      assert {:ok, [_actor], _metadata} =
+               list_offset(
+                 where(queryable, [actors: actor], actor.account_id == ^account.id),
+                 query_module,
+                 statement_timeout: 5_000,
+                 timeout: 10_000
+               )
+    end
+
+    test "returns paged results with offset metadata", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      actors = for _ <- 1..5, do: actor_fixture(account: account)
+
+      assert {:ok, first_page, metadata1} = list_offset(queryable, query_module, page: [limit: 2])
+      assert length(first_page) == 2
+      assert metadata1.limit == 2
+      assert metadata1.offset == 0
+      assert metadata1.previous_offset == nil
+      assert metadata1.next_offset == 2
+      assert metadata1.has_previous_page == false
+      assert metadata1.has_next_page == true
+      assert metadata1.count == 5
+
+      assert {:ok, second_page, metadata2} =
+               list_offset(queryable, query_module, page: [limit: 2, offset: 2])
+
+      assert length(second_page) == 2
+      assert metadata2.offset == 2
+      assert metadata2.previous_offset == 0
+      assert metadata2.next_offset == 4
+      assert metadata2.has_previous_page == true
+      assert metadata2.has_next_page == true
+      assert metadata2.count == 5
+
+      assert {:ok, last_page, metadata3} =
+               list_offset(queryable, query_module, page: [limit: 2, offset: 4])
+
+      assert Enum.map(first_page ++ second_page ++ last_page, & &1.id) |> Enum.sort() ==
+               Enum.map(actors, & &1.id) |> Enum.sort()
+
+      assert length(last_page) == 1
+      assert metadata3.offset == 4
+      assert metadata3.previous_offset == 2
+      assert metadata3.next_offset == nil
+      assert metadata3.has_previous_page == true
+      assert metadata3.has_next_page == false
+      assert metadata3.count == 5
+    end
+  end
+
+  describe "list/2" do
+    setup do
+      account = account_fixture()
+      query_module = Portal.RepoTest.ActorQuery
+      queryable = query_module.all()
+
+      %{account: account, query_module: query_module, queryable: queryable}
+    end
+
+    test "returns empty list when there are no results", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      empty_metadata = %Portal.Repo.Paginator.Metadata{limit: 50, count: 0}
+
+      assert list(queryable, query_module) == {:ok, [], empty_metadata}
+      assert list(queryable, query_module, limit: 1000) == {:ok, [], %{empty_metadata | limit: 100}}
+      assert list(queryable, query_module, limit: 1) == {:ok, [], %{empty_metadata | limit: 1}}
+      assert list(queryable, query_module, limit: -1) == {:ok, [], %{empty_metadata | limit: 1}}
+    end
+
+    test "returns single result if only one record exists", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      actor = actor_fixture(account: account)
+
+      assert {:ok, [returned_actor], _metadata} = list(queryable, query_module)
+      assert returned_actor.id == actor.id
+    end
+
+    test "allows to preload deeply nested fields" do
+      account = account_fixture()
+      actor_fixture(account: account)
+
+      query_module = Portal.RepoTest.AccountQuery
+      queryable = query_module.all()
+
+      assert {:ok, accounts, _metadata} =
+               list(queryable, query_module,
+                 preload: [
+                   actors: []
+                 ]
+               )
+
+      for account <- accounts do
+        assert Ecto.assoc_loaded?(account.actors)
+      end
+    end
+
+    test "allows to set custom order", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      t1 = ~U[2000-01-01 00:00:00.000000Z]
+      t2 = ~U[2000-01-02 00:00:00.000000Z]
+
+      actor_fixture(account: account)
+      |> Portal.Fixture.update!(updated_at: t1)
+
+      actor_fixture(account: account)
+      |> Portal.Fixture.update!(updated_at: t2)
+
+      assert {:ok, [%{updated_at: ^t1}, %{updated_at: ^t2}], _metadata} =
+               list(queryable, query_module, order_by: [{:actors, :asc, :updated_at}])
+
+      assert {:ok, [%{updated_at: ^t2}, %{updated_at: ^t1}], _metadata} =
+               list(queryable, query_module, order_by: [{:actors, :desc, :updated_at}])
+    end
+
+    test "allows to filter results" do
+      query_module = Portal.RepoTest.AccountQuery
+      queryable = query_module.all()
+
+      account1 = account_fixture(name: "Josh Account")
+      account2 = account_fixture(name: "Jon's Account")
+      account3 = account_fixture(name: "Somebody Else Account")
+
+      assert {:ok, [^account1], _metadata} =
+               list(queryable, query_module, filter: [slug: account1.slug])
+
+      assert {:ok, [^account3], _metadata} =
+               list(queryable, query_module, filter: [name: "Some"])
+
+      assert {:ok, [^account2], _metadata} =
+               list(queryable, query_module, filter: [name: "jon"])
+
+      assert {:ok, accounts, _metadata} =
+               list(queryable, query_module,
+                 filter: [
+                   {:or,
+                    [
+                      [name: "Some"],
+                      [name: "jon"]
+                    ]}
+                 ]
+               )
+
+      account_ids = Enum.map(accounts, & &1.id)
+      assert length(accounts) == 2
+      assert account2.id in account_ids
+      assert account3.id in account_ids
+
+      assert {:ok, [^account1], _metadata} =
+               list(queryable, query_module,
+                 filter: [
+                   {:and,
+                    [
+                      [name: "Josh"],
+                      [name: "Acc"]
+                    ]}
+                 ]
+               )
+    end
+
+    test "returns error on unknown filter", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      assert list(queryable, query_module, filter: [unknown: "foo"]) ==
+               {:error, {:unknown_filter, name: :unknown}}
+    end
+
+    test "returns error on invalid filter type" do
+      query_module = Portal.RepoTest.AccountQuery
+      queryable = query_module.all()
+
+      assert list(queryable, query_module, filter: [name: 1]) ==
+               {:error, {:invalid_type, type: :string, value: 1}}
+    end
+
+    test "returns up to 50 items by default", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      for _ <- 1..60, do: actor_fixture(account: account)
+
+      assert {:ok, actors, metadata} = list(queryable, query_module)
+      assert length(actors) == 50
+      assert metadata.limit == 50
+    end
+
+    test "accept page size limit that is smaller than the results set", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      actor_fixture(account: account)
+      actor_fixture(account: account)
+      actor_fixture(account: account)
+
+      for limit <- [1, 2] do
+        assert {:ok, actors, metadata} = list(queryable, query_module, page: [limit: limit])
+        assert length(actors) == limit
+        assert metadata.limit == limit
+        assert metadata.next_page_cursor
+        refute metadata.previous_page_cursor
+      end
+    end
+
+    test "accept page size limit that is greater than the results set", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      actor_fixture(account: account)
+      actor_fixture(account: account)
+      actor_fixture(account: account)
+
+      assert {:ok, actors, metadata} = list(queryable, query_module, page: [limit: 5])
+
+      assert length(actors) == 3
+      assert metadata.limit == 5
+      refute metadata.next_page_cursor
+      refute metadata.previous_page_cursor
+    end
+
+    test "page size cannot be bigger than 100", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      assert {:ok, [], metadata} = list(queryable, query_module, page: [limit: 200])
+
+      assert metadata.limit == 100
+    end
+
+    test "page size cannot be less than 1", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      assert {:ok, [], metadata} = list(queryable, query_module, page: [limit: -1])
+      assert metadata.limit == 1
+
+      assert {:ok, [], metadata} = list(queryable, query_module, page: [limit: 0])
+      assert metadata.limit == 1
+    end
+
+    test "cursor can be used to load the next and previous pages", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      fixed_datetime = ~U[2000-01-01 00:00:00.000000Z]
+
+      actors =
+        for i <- 1..10 do
+          add_seconds = if rem(i, 2) == 0, do: i, else: i - 1
+          inserted_at = DateTime.add(fixed_datetime, add_seconds, :second)
+
+          actor_fixture(account: account)
+          |> Portal.Fixture.update!(inserted_at: inserted_at)
+        end
+
+      actors = Enum.sort_by(actors, &{&1.inserted_at, &1.id})
+
+      ids = Enum.map(actors, & &1.id)
+      {first_page_ids, rest_ids} = Enum.split(ids, 4)
+      {second_page_ids, rest_ids} = Enum.split(rest_ids, 4)
+      {third_page_ids, []} = Enum.split(rest_ids, 2)
+
+      assert {:ok, actors1, metadata1} = list(queryable, query_module, page: [limit: 4])
+
+      assert Enum.map(actors1, & &1.id) == first_page_ids
+      assert metadata1.limit == 4
+      assert metadata1.next_page_cursor
+      refute metadata1.previous_page_cursor
+
+      assert {:ok, actors2, metadata2} =
+               list(queryable, query_module, page: [limit: 4, cursor: metadata1.next_page_cursor])
+
+      assert Enum.map(actors2, & &1.id) == second_page_ids
+      assert metadata2.limit == 4
+      assert metadata2.next_page_cursor
+      assert metadata2.previous_page_cursor
+
+      assert {:ok, actors3, metadata3} =
+               list(queryable, query_module, page: [limit: 4, cursor: metadata2.next_page_cursor])
+
+      assert Enum.map(actors3, & &1.id) == third_page_ids
+      assert metadata3.limit == 4
+      refute metadata3.next_page_cursor
+      assert metadata3.previous_page_cursor
+
+      assert {:ok, actors4, metadata4} =
+               list(queryable, query_module,
+                 page: [limit: 4, cursor: metadata3.previous_page_cursor]
+               )
+
+      assert Enum.map(actors4, & &1.id) == second_page_ids
+      assert metadata4.limit == 4
+      assert metadata4.next_page_cursor
+      assert metadata4.previous_page_cursor
+
+      assert {:ok, actors4, metadata4} =
+               list(queryable, query_module,
+                 page: [limit: 4, cursor: metadata4.previous_page_cursor]
+               )
+
+      assert Enum.map(actors4, & &1.id) == first_page_ids
+      assert metadata4.limit == 4
+      assert metadata4.next_page_cursor
+      refute metadata4.previous_page_cursor
+    end
+
+    test "cursors work with the custom ordering", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      fixed_datetime = ~U[2000-01-01 00:00:00.000000Z]
+
+      actors =
+        for i <- 1..10 do
+          inserted_at = DateTime.add(fixed_datetime, i, :second)
+
+          actor_fixture(account: account)
+          |> Portal.Fixture.update!(inserted_at: inserted_at)
+        end
+
+      actors = actors |> Enum.sort_by(&{&1.inserted_at, &1.id}) |> Enum.reverse()
+
+      ids = Enum.map(actors, & &1.id)
+      {first_page_ids, rest_ids} = Enum.split(ids, 4)
+      {second_page_ids, rest_ids} = Enum.split(rest_ids, 4)
+      {third_page_ids, []} = Enum.split(rest_ids, 2)
+
+      assert {:ok, actors1, metadata1} =
+               list(queryable, query_module,
+                 order_by: [{:actors, :desc, :inserted_at}],
+                 page: [limit: 4]
+               )
+
+      assert Enum.map(actors1, & &1.id) == first_page_ids
+      assert metadata1.limit == 4
+      assert metadata1.next_page_cursor
+      refute metadata1.previous_page_cursor
+
+      assert {:ok, actors2, metadata2} =
+               list(queryable, query_module,
+                 order_by: [{:actors, :desc, :inserted_at}],
+                 page: [limit: 4, cursor: metadata1.next_page_cursor]
+               )
+
+      assert Enum.map(actors2, & &1.id) == second_page_ids
+      assert metadata2.limit == 4
+      assert metadata2.next_page_cursor
+      assert metadata2.previous_page_cursor
+
+      assert {:ok, actors3, metadata3} =
+               list(queryable, query_module,
+                 order_by: [{:actors, :desc, :inserted_at}],
+                 page: [limit: 4, cursor: metadata2.next_page_cursor]
+               )
+
+      assert Enum.map(actors3, & &1.id) == third_page_ids
+      assert metadata3.limit == 4
+      refute metadata3.next_page_cursor
+      assert metadata3.previous_page_cursor
+
+      assert {:ok, actors4, metadata4} =
+               list(queryable, query_module,
+                 order_by: [{:actors, :desc, :inserted_at}],
+                 page: [limit: 4, cursor: metadata3.previous_page_cursor]
+               )
+
+      assert Enum.map(actors4, & &1.id) == second_page_ids
+      assert metadata4.limit == 4
+      assert metadata4.next_page_cursor
+      assert metadata4.previous_page_cursor
+
+      assert {:ok, actors4, metadata4} =
+               list(queryable, query_module,
+                 order_by: [{:actors, :desc, :inserted_at}],
+                 page: [limit: 4, cursor: metadata4.previous_page_cursor]
+               )
+
+      assert Enum.map(actors4, & &1.id) == first_page_ids
+      assert metadata4.limit == 4
+      assert metadata4.next_page_cursor
+      refute metadata4.previous_page_cursor
+    end
+
+    test "cursor paging works when all entries are returned on the first page", %{
+      account: account,
+      query_module: query_module,
+      queryable: queryable
+    } do
+      fixed_datetime = ~U[2000-01-01 00:00:00.000000Z]
+
+      ids =
+        for i <- 1..10 do
+          inserted_at = DateTime.add(fixed_datetime, i, :second)
+
+          actor =
+            actor_fixture(account: account)
+            |> Portal.Fixture.update!(inserted_at: inserted_at)
+
+          actor.id
+        end
+
+      assert {:ok, actors, metadata} = list(queryable, query_module, page: [limit: 10])
+
+      assert Enum.map(actors, & &1.id) == ids
+      assert metadata.limit == 10
+      refute metadata.next_page_cursor
+      refute metadata.previous_page_cursor
+    end
+
+    test "cursor paging works when there are no results", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      cursor_fields = query_module.cursor_fields()
+
+      cursor =
+        Portal.Repo.Paginator.encode_cursor(:after, cursor_fields, %{
+          id: Ecto.UUID.generate(),
+          inserted_at: ~U[2000-01-01 00:00:00.000000Z]
+        })
+
+      assert {:ok, [], metadata} = list(queryable, query_module, page: [cursor: cursor])
+
+      refute metadata.next_page_cursor
+      refute metadata.previous_page_cursor
+    end
+
+    test "returns error on invalid cursor", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      cursor_fields = query_module.cursor_fields()
+
+      cursor =
+        Portal.Repo.Paginator.encode_cursor(:after, cursor_fields, %{
+          id: Ecto.UUID.generate(),
+          inserted_at: nil
+        })
+
+      assert list(queryable, query_module, page: [cursor: cursor]) ==
+               {:error, :invalid_cursor}
+
+      assert list(queryable, query_module, page: [cursor: "foo"]) ==
+               {:error, :invalid_cursor}
+
+      assert list(queryable, query_module, page: [cursor: 1]) ==
+               {:error, :invalid_cursor}
+    end
+
+    test "rejects compressed ETF cursors without decoding them", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      compressed_etf =
+        :erlang.term_to_binary(
+          {:after,
+           [
+             {:t, String.duplicate("A", 1_000_000)}
+           ]},
+          compressed: 9
+        )
+
+      assert <<131, 80, _::binary>> = compressed_etf
+
+      cursor = Base.url_encode64(compressed_etf, padding: false)
+      assert byte_size(cursor) <= Portal.Repo.Paginator.max_encoded_cursor_bytes()
+
+      assert list(queryable, query_module, page: [cursor: cursor]) ==
+               {:error, :invalid_cursor}
+    end
+
+    test "rejects a cursor whose signature was modified", %{
+      query_module: query_module,
+      queryable: queryable
+    } do
+      cursor =
+        Portal.Repo.Paginator.encode_cursor(:after, query_module.cursor_fields(), %{
+          id: Ecto.UUID.generate(),
+          inserted_at: ~U[2000-01-01 00:00:00.000000Z]
+        })
+
+      [payload, signature] = String.split(cursor, ".", parts: 2)
+      replacement = if binary_part(signature, 0, 1) == "A", do: "B", else: "A"
+      modified_cursor = payload <> "." <> replacement <> binary_part(signature, 1, byte_size(signature) - 1)
+
+      assert list(queryable, query_module, page: [cursor: modified_cursor]) ==
+               {:error, :invalid_cursor}
+    end
+  end
+end

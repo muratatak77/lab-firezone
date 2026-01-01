@@ -1,0 +1,18 @@
+# Elixir
+assets/node_modules
+priv/static/dist
+priv/cert
+_build
+**/cover
+
+# Documentation
+docs
+
+# MacOS
+.DS_Store
+
+# Git
+.git
+.gitignore
+.gitmodules
+.github

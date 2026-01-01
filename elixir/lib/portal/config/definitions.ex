@@ -1,0 +1,1282 @@
+defmodule Portal.Config.Definitions do
+  @moduledoc """
+  Most day-to-day config of Firezone can be done via the Firezone Web UI,
+  but for zero-touch deployments we allow to override most of configuration options
+  using environment variables.
+
+  Read more about configuring Firezone in our [configure guide](/docs/deploy/configure).
+
+  ## Errors
+
+  Firezone will not boot if the configuration is invalid, providing a detailed error message
+  and a link to the documentation for the configuration key with samples how to set it.
+
+  ## Naming
+
+  If environment variables are used, the configuration key must be in uppercase.
+  The database variables are the same as the configuration keys.
+
+  ## Precedence
+
+  The configuration precedence is as follows:
+
+  1. Environment variables
+  2. Database values
+  3. Default values
+
+  It means that if environment variable is set, it will be used, regardless of the database value,
+  and UI to edit database value will be disabled.
+  """
+  use Portal.Config.Definition
+  alias Portal.Config.Dumper
+  alias Portal.Types
+
+  @entra_sync_client_id ""
+  @intune_sync_client_id ""
+  @windows_updates_client_id ""
+  @defender_sync_client_id ""
+  @sentinel_sync_client_id ""
+  @google_oidc_client_id "689429116054-72vkp65pqrntsq3bksj9bt4pft15if4v.apps.googleusercontent.com"
+  @entra_oidc_client_id "d0b74799-63b8-4c10-8255-1c03c48a3029"
+
+  if Mix.env() in [:test, :dev] do
+    @local_development_adapters [Swoosh.Adapters.Local]
+  else
+    @local_development_adapters []
+  end
+
+  ##############################################
+  ## Background Jobs
+  ##############################################
+
+  @doc """
+  Region identifier used to target direct_broadcast! to web/api nodes.
+
+  In a multi-region deployment, this ensures change events are only sent to
+  web and api nodes in the same region. Maps to the `REGION` env var.
+  """
+  defconfig(:region, :string, default: "")
+
+  @doc """
+  Enable or disable starting the Oban supervisor on application boot.
+
+  Set to `false` for tasks that only need the application to boot but cannot reach
+  Postgres (e.g. CI generating the OpenAPI spec). Oban 2.22+ verifies migrations
+  at supervisor start, which requires a live database.
+  """
+  defconfig(:oban_enabled, :boolean, default: true)
+
+  @doc """
+  Enable or disable the Changes (CDC) replication consumer for this app instance.
+  """
+  defconfig(:changes_replication_enabled, :boolean, default: false)
+
+  @doc """
+  Enable or disable the ChangeLogs replication consumer for this app instance.
+  """
+  defconfig(:change_logs_replication_enabled, :boolean, default: false)
+
+  ##############################################
+  ## Web Server
+  ##############################################
+
+  @doc """
+  Additional origins allowed for WebSocket connections.
+
+  By default, origins are derived from `WEB_EXTERNAL_URL`. Use this setting to allow
+  WebSocket connections from additional origins, for example when the application is
+  accessed via multiple domains or a CDN.
+
+  Accepts a comma-separated list of origins (e.g. `https://app.example.com,https://cdn.example.com`).
+  """
+  defconfig(:websocket_additional_origins, {:array, ",", :string},
+    default: [],
+    changeset: fn changeset, key ->
+      Portal.Changeset.validate_uri(changeset, key)
+    end
+  )
+
+  @doc """
+  The external URL the UI will be accessible at.
+
+  Plain HTTP URLs are served directly by the Web endpoint for local development.
+  HTTPS URLs are served by the public endpoint and dispatched by hostname.
+  """
+  defconfig(:web_external_url, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.validate_uri(key, require_trailing_slash: true)
+      |> Portal.Changeset.normalize_url(key)
+    end
+  )
+
+  @doc """
+  The external URL the API will be accessible at.
+
+  Plain HTTP URLs are served directly by the API endpoint for local development.
+  HTTPS URLs are served by the public endpoint and dispatched by hostname.
+  """
+
+  defconfig(:api_external_url, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.validate_uri(key, require_trailing_slash: true)
+      |> Portal.Changeset.normalize_url(key)
+    end
+  )
+
+  @doc """
+  The Firezone Cloud region this deployment keeps its customer data in, shown to
+  users on the sign in pages and in account settings. On-prem deployments keep
+  the default and show nothing.
+  """
+  defconfig(
+    :data_residency_region,
+    Ecto.ParameterizedType.init(Ecto.Enum, values: [:us, :eu, :on_prem]),
+    default: :on_prem
+  )
+
+  @doc """
+  The external URL the REST API will be accessible at.
+
+  Advertised as the server URL in the OpenAPI spec and SwaggerUI, and used to
+  permanent-redirect REST API requests that arrive on any other host. If not
+  set, it falls back to `api_external_url`.
+  """
+
+  defconfig(:rest_api_url, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.validate_uri(key, require_trailing_slash: true)
+      |> Portal.Changeset.normalize_url(key)
+    end
+  )
+
+  @doc """
+  The external URL clients use to connect with a device certificate, for
+  example `https://mtls.firezone.dev/`.
+
+  The public Phoenix endpoint requests a client certificate during the TLS
+  handshake on this host. The application validates the presented certificate
+  against the account's configured trust anchors.
+
+  When this is not set, certificate-based device trust is disabled and the
+  peer certificate is ignored.
+  """
+
+  defconfig(:mtls_external_url, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.validate_uri(key, require_trailing_slash: true)
+      |> Portal.Changeset.normalize_url(key)
+    end
+  )
+
+  @doc """
+  The API rate limiter uses a token bucket algorithm. This field sets the rate the bucket is refilled.
+  """
+  defconfig(:api_refill_rate, :integer, default: 10)
+
+  @doc """
+  The API rate limiter uses a token bucket algorithm. This field sets the capacity of the bucket.
+  """
+  defconfig(:api_capacity, :integer, default: 200)
+
+  @doc """
+  The API rate limiter keeps a separate token bucket for REST API read (GET) requests. This field sets the rate the read bucket is refilled.
+  """
+  defconfig(:api_read_refill_rate, :integer, default: 10)
+
+  @doc """
+  The API rate limiter keeps a separate token bucket for REST API read (GET) requests. This field sets the capacity of the read bucket.
+  """
+  defconfig(:api_read_capacity, :integer, default: 200)
+
+  @doc """
+  The API socket rate limiter uses a token bucket algorithm. This field sets the rate the bucket is refilled.
+  """
+  defconfig(:api_socket_refill_rate, :integer, default: 1)
+
+  @doc """
+  The API socket rate limiter uses a token bucket algorithm. This field sets the capacity of the bucket.
+  """
+  defconfig(:api_socket_capacity, :integer, default: 1)
+
+  @doc """
+  The flow-log ingestion rate limiter uses a token bucket algorithm. This field sets the rate the bucket is refilled.
+  """
+  defconfig(:api_ingestion_refill_rate, :integer, default: 1)
+
+  @doc """
+  The flow-log ingestion rate limiter uses a token bucket algorithm. This field sets the capacity of the bucket.
+  """
+  defconfig(:api_ingestion_capacity, :integer, default: 1)
+
+  @doc """
+  How often, in seconds, clients and gateways upload batched flow logs to the ingest API.
+
+  The trade-off is request load on the API against how quickly flow logs become visible.
+  Set to `0` to disable flow log uploads entirely.
+  """
+  defconfig(:flow_logs_upload_interval_secs, :integer, default: 60)
+
+  @doc """
+  Maximum number of flow log records clients and gateways send per upload request.
+
+  Capped at 10,000 (the ingest API's per-request limit) by the data plane.
+  """
+  defconfig(:flow_logs_upload_batch_size, :integer, default: 1_000)
+
+  @doc """
+  The base URL clients and gateways POST flow logs to.
+  """
+  defconfig(:flow_logs_api_url, :string,
+    default: "https://flow-api.firezone.dev/",
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.validate_uri(key, require_trailing_slash: true)
+      |> Portal.Changeset.normalize_url(key)
+    end
+  )
+
+  @doc """
+  Access key ID for Firezone's AWS account, used to assume customer IAM roles
+  for Amazon S3 log sinks.
+  """
+  defconfig(:log_sinks_aws_access_key_id, :string, default: nil, sensitive: true)
+
+  @doc """
+  Secret access key for Firezone's AWS account, used to assume customer IAM
+  roles for Amazon S3 log sinks.
+  """
+  defconfig(:log_sinks_aws_secret_access_key, :string, default: nil, sensitive: true)
+
+  @doc """
+  Firezone's AWS account ID, shown to customers in the IAM trust policy their
+  S3 log sink role must attach.
+  """
+  defconfig(:log_sinks_aws_account_id, :string, default: "000000000000")
+
+  @doc """
+  The Web rate limiter uses a token bucket algorithm. This field sets the rate the bucket is refilled.
+  """
+  defconfig(:web_refill_rate, :integer, default: 10)
+
+  @doc """
+  The Web rate limiter uses a token bucket algorithm. This field sets the capacity of the bucket.
+  """
+  defconfig(:web_capacity, :integer, default: 200)
+
+  @doc """
+  Enable or disable requiring secure cookies. Required for HTTPS.
+  """
+  defconfig(:phoenix_secure_cookies, :boolean, default: true)
+
+  defconfig(:phoenix_listen_address, Types.IP, default: "0.0.0.0")
+
+  @doc """
+  Internal HTTP port for the public endpoint. Leave unset to disable the listener.
+
+  Requests other than readiness checks are redirected to HTTPS while
+  `PHOENIX_HTTPS_PUBLIC_PORT` is set. Without it this listener serves the
+  requests, which is what a reverse proxy that terminates TLS connects to.
+  """
+  defconfig(:phoenix_http_public_port, :integer,
+    default: nil,
+    changeset: fn changeset, key ->
+      Ecto.Changeset.validate_number(changeset, key,
+        greater_than: 0,
+        less_than_or_equal_to: 65_535
+      )
+    end
+  )
+
+  @doc """
+  Internal HTTPS port for the public endpoint. Leave unset to disable the
+  listener and let a reverse proxy in front of Firezone terminate TLS.
+  """
+  defconfig(:phoenix_https_public_port, :integer,
+    default: nil,
+    changeset: fn changeset, key ->
+      Ecto.Changeset.validate_number(changeset, key,
+        greater_than: 0,
+        less_than_or_equal_to: 65_535
+      )
+    end
+  )
+
+  @doc """
+  JSON object mapping public hostnames to their TLS certificate and key files.
+
+  Each value must contain `certfile` and `keyfile` paths. The hostname from
+  `MTLS_EXTERNAL_URL` additionally requires a client certificate during the
+  TLS handshake.
+  """
+  defconfig(:phoenix_https_sni_hosts, :map, default: %{})
+
+  @doc """
+  Internal port to listen on for the Phoenix server for the `ops` application.
+  """
+  defconfig(:phoenix_http_ops_port, :integer,
+    default: 13_002,
+    changeset: fn changeset, key ->
+      Ecto.Changeset.validate_number(changeset, key,
+        greater_than: 0,
+        less_than_or_equal_to: 65_535
+      )
+    end
+  )
+
+  @doc """
+  The IP address or hostname allowed as the WebSocket origin for the ops endpoint.
+
+  Maps to the `OPS_WEBSOCKET_ORIGIN` environment variable.
+  """
+  defconfig(:ops_websocket_origin, :string, default: "localhost")
+
+  @doc """
+  The external port used in WebSocket origin checks for the ops endpoint.
+
+  This should be the stable ingress port (e.g. 1080) rather than the internal
+  blue/green listen port, so that `check_origin` passes when traffic is
+  redirected via iptables.
+
+  Maps to the `OPS_WEBSOCKET_PORT` environment variable.
+  """
+  defconfig(:ops_websocket_port, :integer,
+    default: 13_002,
+    changeset: fn changeset, key ->
+      Ecto.Changeset.validate_number(changeset, key,
+        greater_than: 0,
+        less_than_or_equal_to: 65_535
+      )
+    end
+  )
+
+  @doc """
+  Allows to override Bandit HTTP/1.1 server options.
+
+  These options are passed to Bandit's `http_1_options`. Keep in mind that changing
+  these limits can pose a security risk. Browsers and proxies along the way may have
+  equally strict limits, which means the request will still fail or the URL will be pruned.
+
+  You can see all supported options at https://hexdocs.pm/bandit/Bandit.html#t:http_1_options/0.
+
+  Note: Bandit's default max_header_length (combined key & value per header) is 10000 bytes,
+  compared to Cowboy's max_header_value_length which was 4096 bytes (value only).
+  """
+  defconfig(:phoenix_http_protocol_options, :map,
+    default: %{},
+    dump: &Dumper.keyword/1
+  )
+
+  @doc """
+  List of trusted reverse proxies.
+
+  This is used to determine the correct IP address of the client when the
+  application is behind a reverse proxy by skipping a trusted proxy IP
+  from a list of possible source IPs.
+
+  The public endpoint keeps the `X-Forwarded-*` headers only on requests that
+  arrive from one of these addresses. Every other request has them removed and
+  its client IP address read from the connection itself.
+
+  Your proxy must append the client address to `X-Forwarded-For` rather than
+  pass on what the client sent. Also list your own private ranges in
+  `PHOENIX_PRIVATE_CLIENTS` when your clients have private addresses, because
+  private addresses in the header are read as further proxy hops.
+  """
+  defconfig(:phoenix_external_trusted_proxies, {:json_array, {:one_of, [Types.IP, Types.CIDR]}},
+    default: []
+  )
+
+  @doc """
+  List of trusted clients.
+
+  This is used to determine the correct IP address of the client when the
+  application is behind a reverse proxy by picking a trusted client IP
+  from a list of possible source IPs.
+  """
+  defconfig(:phoenix_private_clients, {:json_array, {:one_of, [Types.IP, Types.CIDR]}},
+    default: []
+  )
+
+  ##############################################
+  ## Database
+  ##############################################
+
+  @doc """
+  Whether to run migrations in the priv/repo/manual_migrations directory.
+  If set to false, these migrations must be manually run from an IEx shell.
+  """
+  defconfig(:run_manual_migrations, :boolean, default: false)
+
+  @doc """
+  PostgreSQL host.
+  """
+  defconfig(:database_host, :string, default: "postgres")
+
+  @doc """
+  PostgreSQL socket directory (takes precedence over hostname).
+  """
+  defconfig(:database_socket_dir, :string, default: nil)
+
+  @doc """
+  Direct PostgreSQL port used by migrations, cluster discovery, and replication polling.
+  """
+  defconfig(:database_port, :integer, default: 5432)
+
+  @doc """
+  PgBouncer port used by the Web, API, and background job connection pools.
+
+  When unset, these pools use `DATABASE_PORT` to preserve compatibility with
+  deployments that don't run PgBouncer.
+  """
+  defconfig(:database_pgbouncer_port, :integer, default: nil)
+
+  @doc """
+  Name of the PostgreSQL database.
+  """
+  defconfig(:database_name, :string, default: "firezone")
+
+  @doc """
+  User that will be used to access the PostgreSQL database.
+  """
+  defconfig(:database_user, :string, default: "postgres", sensitive: true)
+
+  @doc """
+  Password that will be used to access the PostgreSQL database.
+  """
+  defconfig(:database_password, :string, default: nil, sensitive: true)
+
+  @doc """
+  Authenticate database connections using Microsoft Entra instead of a password.
+
+  When enabled, DATABASE_PASSWORD is ignored and every connection attempt uses
+  a Microsoft Entra access token fetched from the Azure Instance Metadata
+  Service for the managed identity selected by AZURE_CLIENT_ID.
+  """
+  defconfig(:database_entra_auth, :boolean, default: false)
+
+  @doc """
+  Client ID of the Azure user-assigned managed identity used to fetch Microsoft
+  Entra access tokens when DATABASE_ENTRA_AUTH is enabled.
+  """
+  defconfig(:azure_client_id, :string, default: nil)
+
+  @doc """
+  Table service endpoint of the Azure Storage account that holds the shared
+  slug registry of Firezone Cloud, for example
+  https://firezoneslugs.table.core.windows.net. When set, the portal reserves
+  every account slug there before it writes it to its own database. Unset, the
+  default for on-prem, keeps slugs in this portal's database only.
+  """
+  defconfig(:slug_registry_table_url, :string, default: nil)
+
+  @doc """
+  Size of the connection pool to the PostgreSQL database.
+  """
+  defconfig(:database_pool_size, :integer,
+    default: fn -> :erlang.system_info(:logical_processors_available) * 2 end
+  )
+
+  @doc """
+  Size of the connection pool for PortalWeb (HTTP + LiveView) queries.
+  """
+  defconfig(:database_pool_size_web, :integer, default: 4)
+
+  @doc """
+  Size of the connection pool for PortalAPI (REST + Sockets) queries.
+  """
+  defconfig(:database_pool_size_api, :integer, default: 10)
+
+  @doc """
+  Size of the connection pool for Oban and background job queries.
+  """
+  defconfig(:database_pool_size_job, :integer, default: 4)
+
+  @doc """
+  The target threshold for the length of time in milliseconds that a query should wait in the queue
+  """
+  defconfig(:database_queue_target, :integer, default: 500)
+
+  @doc """
+  How often to check for queries that exceeded 2 * `database_queue_target` milliseconds
+  """
+  defconfig(:database_queue_interval, :integer, default: 1000)
+
+  @doc """
+  TCP socket options for database connections, tuning how quickly dead connections are
+  detected so queries fail over instead of hanging until the checkout timeout.
+
+  Accepts a JSON object with any of: `keepalive` (boolean), `tcp_keepidle`,
+  `tcp_keepintvl`, `tcp_keepcnt` (seconds/count), `tcp_user_timeout` (ms). `keepalive`
+  alone uses Linux's 2-hour idle default, so the `tcp_keep*` options are needed to detect
+  dead connections in seconds.
+
+  Example: `{"keepalive": true, "tcp_keepidle": 10, "tcp_keepintvl": 5, "tcp_keepcnt": 3, "tcp_user_timeout": 10000}`.
+  """
+  defconfig(:database_socket_options, :map,
+    default: %{},
+    dump: &Dumper.dump_socket_opts/1
+  )
+
+  @doc """
+  Name of the replication slot used by Firezone.
+  """
+  defconfig(:database_changes_replication_slot_name, :string, default: "changes_slot")
+
+  @doc """
+  Name of the publication used by Firezone.
+  """
+  defconfig(:database_changes_publication_name, :string, default: "changes")
+
+  @doc """
+  Name of the replication slot used by Firezone.
+  """
+  defconfig(:database_change_logs_replication_slot_name, :string, default: "change_logs_slot")
+
+  @doc """
+  Name of the publication used by Firezone.
+  """
+  defconfig(:database_change_logs_publication_name, :string, default: "change_logs")
+
+  @doc """
+  SSL configuration for database connections.
+
+  Accepts:
+  - `false` - SSL disabled
+  - `true` - SSL enabled with default options
+  - A JSON object with SSL options (e.g. `{"cacertfile": "/path/to/cert", "verify": "verify_peer"}`)
+
+  When a JSON object is provided, the options are passed directly to Postgrex's `:ssl` option.
+  Supported SSL options: `cacertfile`, `verify`, `depth`, `versions`, `server_name_indication`.
+  """
+  defconfig(:database_ssl, :boolean_or_map,
+    default: false,
+    dump: fn
+      false -> false
+      true -> true
+      %{} = opts when map_size(opts) == 0 -> false
+      %{} = opts -> Dumper.dump_ssl_opts(opts)
+    end
+  )
+
+  defconfig(:database_parameters, :map,
+    default: %{application_name: "firezone-#{Application.spec(:portal, :vsn)}"},
+    dump: &Dumper.keyword/1
+  )
+
+  ##############################################
+  ## Erlang Cluster
+  ##############################################
+
+  @doc """
+  An adapter that will be used to discover and connect nodes to the Erlang cluster.
+  """
+  defconfig(
+    :erlang_cluster_adapter,
+    Ecto.ParameterizedType.init(Ecto.Enum,
+      values: [
+        Elixir.Cluster.Strategy.LocalEpmd,
+        Elixir.Cluster.Strategy.Epmd,
+        Elixir.Cluster.Strategy.Gossip,
+        Elixir.Cluster.Strategy.Kubernetes,
+        Elixir.Cluster.Strategy.DNSPoll,
+        Elixir.Portal.Cluster.PostgresStrategy
+      ]
+    ),
+    default: nil
+  )
+
+  @doc """
+  Config for the Erlang cluster adapter.
+  """
+  defconfig(:erlang_cluster_adapter_config, :map,
+    default: %{},
+    dump: fn map ->
+      dump_cluster_adapter_config(map, env_var_to_config!(:erlang_cluster_adapter))
+    end
+  )
+
+  @doc """
+  A secondary adapter for cluster discovery, useful during rolling deploys when migrating
+  between clustering strategies. Both adapters run simultaneously and nodes discovered
+  by either mechanism will be connected.
+  """
+  defconfig(
+    :erlang_cluster_adapter_secondary,
+    Ecto.ParameterizedType.init(Ecto.Enum,
+      values: [
+        Elixir.Cluster.Strategy.LocalEpmd,
+        Elixir.Cluster.Strategy.Epmd,
+        Elixir.Cluster.Strategy.Gossip,
+        Elixir.Cluster.Strategy.Kubernetes,
+        Elixir.Cluster.Strategy.DNSPoll,
+        Elixir.Portal.Cluster.PostgresStrategy
+      ]
+    ),
+    default: nil
+  )
+
+  @doc """
+  Config for the secondary Erlang cluster adapter.
+  """
+  defconfig(:erlang_cluster_adapter_secondary_config, :map,
+    default: %{},
+    dump: fn map ->
+      dump_cluster_adapter_config(map, env_var_to_config!(:erlang_cluster_adapter_secondary))
+    end
+  )
+
+  # sobelow_skip ["DOS.StringToAtom"]
+  defp dump_cluster_adapter_config(map, adapter) do
+    keyword = Dumper.keyword(map)
+
+    cond do
+      adapter == Elixir.Cluster.Strategy.Epmd ->
+        Keyword.update!(keyword, :hosts, fn hosts -> Enum.map(hosts, &String.to_atom/1) end)
+
+      adapter == Elixir.Cluster.Strategy.Kubernetes ->
+        Keyword.new(keyword, fn
+          {k, v} when k in [:mode, :kubernetes_ip_lookup_mode] -> {k, String.to_atom(v)}
+          {k, v} -> {k, v}
+        end)
+
+      adapter == Elixir.Portal.Cluster.PostgresStrategy ->
+        Keyword.new(keyword, fn
+          {:repo, v} -> {:repo, Module.concat([v])}
+          {k, v} -> {k, v}
+        end)
+
+      true ->
+        keyword
+    end
+  end
+
+  ##############################################
+  ## Secrets
+  ##############################################
+
+  @doc """
+  Secret which is used to encode and sign tokens.
+  """
+  defconfig(:tokens_key_base, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Salt which is used to encode and sign tokens.
+  """
+  defconfig(:tokens_salt, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Primary secret key base for the Phoenix application.
+  """
+  defconfig(:secret_key_base, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Signing salt for Phoenix LiveView connection tokens.
+  """
+  defconfig(:live_view_signing_salt, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Signing salt for cookies issued by the Phoenix web application.
+  """
+  defconfig(:cookie_signing_salt, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Encryption salt for cookies issued by the Phoenix web application.
+  """
+  defconfig(:cookie_encryption_salt, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Secret key base for the ops Phoenix endpoint. Must be different from `secret_key_base`.
+  """
+  defconfig(:ops_secret_key_base, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Signing salt for Phoenix LiveView connection tokens on the ops endpoint.
+  Must be different from `live_view_signing_salt`.
+  """
+  defconfig(:ops_live_view_signing_salt, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Signing salt for cookies issued by the ops Phoenix endpoint.
+  Must be different from `cookie_signing_salt`.
+  """
+  defconfig(:ops_cookie_signing_salt, :string,
+    sensitive: true,
+    changeset: &Portal.Changeset.validate_base64/2
+  )
+
+  @doc """
+  Username for HTTP basic authentication on the ops endpoint.
+  Maps to the `OPS_ADMIN_USERNAME` environment variable.
+  """
+  defconfig(:ops_admin_username, :string)
+
+  @doc """
+  Password for HTTP basic authentication on the ops endpoint.
+  Maps to the `OPS_ADMIN_PASSWORD` environment variable.
+  """
+  defconfig(:ops_admin_password, :string, sensitive: true)
+
+  ##############################################
+  ## Userpass / SAML / OIDC / Email authentication
+  ##############################################
+
+  @doc """
+  Enable or disable the authentication methods for all users.
+
+  It will affect on which auth providers can be created per an account but will not disable
+  already active providers when setting is changed.
+  """
+  # TODO: IdP refactor
+  # Remove google / okta / entra / jumpcloud
+  defconfig(
+    :auth_provider_adapters,
+    {:array, ",", Ecto.ParameterizedType.init(Ecto.Enum, values: ~w[
+      email
+      openid_connect
+      google_workspace
+      microsoft_entra
+      okta
+      jumpcloud
+      mock
+      userpass
+      token
+    ]a)},
+    default: ~w[
+      email
+      openid_connect
+      google_workspace
+      microsoft_entra
+      okta
+      jumpcloud
+      mock
+      token
+    ]a
+  )
+
+  ##############################################
+  ## Directory Sync
+  ##############################################
+
+  defconfig(:google_service_account_key, :string, default: nil, sensitive: true)
+  defconfig(:google_workload_identity_provider, :string, default: nil)
+  defconfig(:google_workload_identity_audience, :string, default: nil)
+  defconfig(:google_service_account_email, :string, default: nil)
+  defconfig(:google_sync_authz_client_id, :string, default: nil)
+  defconfig(:google_sync_authz_client_secret, :string, default: nil, sensitive: true)
+
+  ##############################################
+  ## Google / GitHub / Entra / Okta authentication
+  ##############################################
+
+  defconfig(:google_oidc_client_id, :string, default: @google_oidc_client_id)
+  defconfig(:google_oidc_client_secret, :string, default: nil, sensitive: true)
+
+  defconfig(:github_oauth_client_id, :string, default: nil)
+  defconfig(:github_oauth_client_secret, :string, default: nil, sensitive: true)
+
+  defconfig(:entra_sync_client_id, :string, default: @entra_sync_client_id)
+  defconfig(:intune_sync_client_id, :string, default: @intune_sync_client_id)
+  defconfig(:windows_updates_client_id, :string, default: @windows_updates_client_id)
+  defconfig(:defender_sync_client_id, :string, default: @defender_sync_client_id)
+
+  defconfig(:entra_oidc_client_id, :string, default: @entra_oidc_client_id)
+  defconfig(:entra_oidc_client_secret, :string, default: nil, sensitive: true)
+
+  # Okta uses a per-tenant client_id/secret
+
+  ##############################################
+  ## Microsoft Sentinel log sinks
+  ##############################################
+
+  defconfig(:sentinel_sync_client_id, :string, default: @sentinel_sync_client_id)
+
+  ##############################################
+  ## Health
+  ##############################################
+
+  @doc """
+  Path to the file that signals the service is draining.
+
+  When this file exists, the `/readyz` endpoint will return 503 with status "draining".
+  """
+  defconfig(:draining_file_path, :string, default: "/var/run/firezone/draining")
+
+  ##############################################
+  ## Telemetry
+  ##############################################
+
+  @doc """
+  DSN used to report errors to Sentry.
+
+  Sentry reporting is disabled when this is unset or blank.
+  """
+  defconfig(:sentry_dsn, :string,
+    default: nil,
+    dump: fn
+      dsn when is_binary(dsn) ->
+        case String.trim(dsn) do
+          "" -> nil
+          dsn -> dsn
+        end
+
+      dsn ->
+        dsn
+    end
+  )
+
+  @doc "Google Ads customer ID receiving account conversions, without hyphens."
+  defconfig(:google_ads_customer_id, :string, default: nil)
+
+  @doc "Optional Google Ads manager customer ID used to access the receiving account."
+  defconfig(:google_ads_login_customer_id, :string, default: nil)
+
+  @doc "Google Ads import conversion action ID for completed registrations."
+  defconfig(:google_ads_registration_conversion_action_id, :string, default: nil)
+
+  @doc "Google Ads import conversion action ID for active Team and Business enrollments."
+  defconfig(:google_ads_subscription_conversion_action_id, :string, default: nil)
+
+  @doc "Dedicated Google service account used for Ads conversions."
+  defconfig(:google_ads_service_account_email, :string, default: nil)
+
+  @doc "Canonical workload identity provider used for Ads conversions."
+  defconfig(:google_ads_workload_identity_provider, :string, default: nil)
+
+  @doc "Azure managed identity audience used for Ads federation."
+  defconfig(:google_ads_workload_identity_audience, :string, default: nil)
+
+  @doc "Cloudflare Turnstile site key rendered on the sign-up forms. Challenges are disabled unless the secret key is also set."
+  defconfig(:turnstile_site_key, :string, default: nil)
+
+  @doc "Cloudflare Turnstile secret key used to verify sign-up challenges."
+  defconfig(:turnstile_secret_key, :string,
+    default: nil,
+    sensitive: true,
+    dump: fn
+      value when is_binary(value) -> if String.trim(value) == "", do: nil, else: String.trim(value)
+      value -> value
+    end
+  )
+
+  @doc "OpenAI Ads pixel receiving portal conversions."
+  defconfig(:openai_conversions_pixel_id, :string, default: nil)
+
+  @doc """
+  OpenAI Ads Conversions API key. Conversion delivery is disabled when unset or blank.
+  """
+  defconfig(:openai_conversions_api_key, :string,
+    default: nil,
+    sensitive: true,
+    dump: fn
+      value when is_binary(value) -> if String.trim(value) == "", do: nil, else: String.trim(value)
+      value -> value
+    end
+  )
+
+  @doc """
+  PostHog project API key used to attribute consented website visitors after authentication.
+
+  PostHog analytics are disabled unless both this and `POSTHOG_HOST` are set.
+  """
+  defconfig(:posthog_project_api_key, :string,
+    default: nil,
+    dump: fn
+      project_api_key when is_binary(project_api_key) ->
+        case String.trim(project_api_key) do
+          "" -> nil
+          project_api_key -> project_api_key
+        end
+
+      project_api_key ->
+        project_api_key
+    end
+  )
+
+  @doc """
+  Base URL of the PostHog instance (or a reverse proxy in front of it) that receives
+  analytics events, e.g. `https://us.i.posthog.com`.
+
+  PostHog analytics are disabled unless both this and `POSTHOG_PROJECT_API_KEY` are set.
+  """
+  defconfig(:posthog_host, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Ecto.Changeset.update_change(key, fn host ->
+        case String.trim(host) do
+          "" -> nil
+          host -> host
+        end
+      end)
+      |> Portal.Changeset.validate_uri(key, schemes: ["https"])
+    end
+  )
+
+  @doc """
+  Sender address of the founder follow-up emails sent 15 minutes and 3 days after a web sign-up.
+
+  The follow-up email is disabled when this is unset or blank. The address must be
+  allowed as a sender on the outbound email adapter.
+  """
+  defconfig(:sign_up_follow_up_from_email, :string,
+    default: nil,
+    dump: fn
+      value when is_binary(value) -> if String.trim(value) == "", do: nil, else: String.trim(value)
+      value -> value
+    end
+  )
+
+  @doc """
+  BCC address for the founder follow-up email, such as the HubSpot BCC logging address.
+  """
+  defconfig(:sign_up_follow_up_bcc_email, :string,
+    default: nil,
+    dump: fn
+      value when is_binary(value) -> if String.trim(value) == "", do: nil, else: String.trim(value)
+      value -> value
+    end
+  )
+
+  @doc """
+  Enable or disable the Firezone telemetry collection.
+  """
+  defconfig(:instrumentation_client_logs_enabled, :boolean, default: true)
+
+  @doc """
+  Name of the bucket to store client-, relay- and gateway-submitted instrumentation logs in.
+  """
+  defconfig(:instrumentation_client_logs_bucket, :string, default: "logs")
+
+  @doc """
+  Reporter to use for sending metrics to the telemetry backend.
+  """
+  defconfig(
+    :telemetry_metrics_reporter,
+    Ecto.ParameterizedType.init(Ecto.Enum,
+      values: [
+        Telemetry.Metrics.ConsoleReporter
+      ]
+    ),
+    default: nil
+  )
+
+  @doc """
+  Configuration for the telemetry metrics reporter.
+  """
+  defconfig(:telemetry_metrics_reporter_opts, :map,
+    default: %{},
+    dump: &Dumper.keyword/1
+  )
+
+  @doc """
+  Base URL of an OpenTelemetry Collector receiving the portal's traces and metrics over
+  OTLP/HTTP, e.g. `http://10.0.0.1:4318`.
+  """
+  defconfig(:otlp_endpoint, :string,
+    default: nil,
+    changeset: &Portal.Changeset.validate_uri/2
+  )
+
+  @doc """
+  OTLP/HTTP endpoint receiving the portal's metrics, e.g. `https://otlp.example.com/v1/metrics`.
+  """
+  defconfig(:otlp_metrics_endpoint, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      Portal.Changeset.validate_uri(changeset, key, schemes: ["https"])
+    end
+  )
+
+  @doc """
+  OTLP/HTTP endpoint receiving the portal's traces, e.g. `https://otlp.example.com/v1/traces`.
+  """
+  defconfig(:otlp_traces_endpoint, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      Portal.Changeset.validate_uri(changeset, key, schemes: ["https"])
+    end
+  )
+
+  @doc """
+  How the OTLP/HTTP exporters authenticate. When unset, requests carry the
+  `OTEL_EXPORTER_OTLP_HEADERS`.
+
+  Set to `azure-managed-identity` to send a managed identity token for Azure Monitor instead.
+  """
+  defconfig(
+    :otlp_auth,
+    Ecto.ParameterizedType.init(Ecto.Enum,
+      values: [azure_managed_identity: "azure-managed-identity"]
+    ),
+    default: nil
+  )
+
+  @doc """
+  Headers the OTLP/HTTP exporters send when `OTLP_AUTH` is unset, as a comma-separated list
+  of `key=value` pairs with percent-encoded values, e.g. `api-key=secret,x-tenant=1`.
+  """
+  defconfig(:otel_exporter_otlp_headers, {:array, ",", :string},
+    default: [],
+    sensitive: true,
+    changeset: fn changeset, key ->
+      Ecto.Changeset.validate_format(changeset, key, ~r/^[^=]*[^=\s][^=]*=([^%]|%[[:xdigit:]]{2})*$/,
+        message: "must be a key=value pair with a percent-encoded value"
+      )
+    end,
+    dump: fn headers ->
+      for header <- headers do
+        [key, value] = String.split(header, "=", parts: 2)
+        {String.trim(key), value |> String.trim() |> URI.decode()}
+      end
+    end
+  )
+
+  ##############################################
+  ## HTTP Client Settings
+  ##############################################
+
+  defconfig(:http_client_ssl_opts, :map,
+    default: %{},
+    dump: &Dumper.dump_ssl_opts/1
+  )
+
+  @doc """
+  Enable or disable blocking outbound HTTP requests to private or reserved IP addresses.
+
+  Enabled by default to protect against SSRF attacks when the portal sends requests to
+  user-configured HTTP endpoints. Disable this only if the portal must be able to reach
+  services on a private network, for example in self-hosted deployments.
+  """
+  defconfig(:http_client_ssrf_protection_enabled, :boolean, default: true)
+
+  ##############################################
+  ## Geolocation
+  ##############################################
+
+  @doc """
+  Path to the MaxMind GeoLite2-City database file (MMDB format).
+
+  Used for IP geolocation lookups. Download from https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+  (requires free account).
+  """
+  defconfig(:maxmind_city_db_path, :string, default: nil)
+
+  @doc """
+  Comma-separated list of ISO 3166-1 alpha-2 country codes to block at the endpoint.
+
+  Requests are denied with HTTP 403 when the resolved remote IP country matches one of these codes.
+  """
+  defconfig(:country_code_blocklist, {:array, ",", :string}, default: [])
+
+  ##############################################
+  ## Outbound Email Settings
+  ##############################################
+
+  @doc """
+  Recipient address for emails to the Firezone team: portal feedback, sign-up
+  questionnaires, account deletion feedback and Enterprise seat overage reports.
+  They are not sent when unset or blank.
+  """
+  defconfig(:feedback_email_recipient, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.trim_change(key)
+      |> Ecto.Changeset.update_change(key, fn value -> if value == "", do: nil, else: value end)
+      |> Portal.Changeset.validate_email(key)
+    end
+  )
+
+  @doc """
+  Recipient address for posture provider interest and feedback emails.
+  Interest registration and feedback are disabled when unset or blank.
+  """
+  defconfig(:posture_provider_interest_email_recipient, :string,
+    default: nil,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.trim_change(key)
+      |> Ecto.Changeset.update_change(key, fn value -> if value == "", do: nil, else: value end)
+      |> Portal.Changeset.validate_email(key)
+    end
+  )
+
+  @doc """
+  From address to use for sending outbound emails. If not set, sending email will be disabled (default).
+  """
+  defconfig(:outbound_email_from, :string,
+    default: fn ->
+      external_uri = URI.parse(env_var_to_config!(:web_external_url))
+      "firezone@#{external_uri.host}"
+    end,
+    sensitive: true,
+    changeset: fn changeset, key ->
+      changeset
+      |> Portal.Changeset.trim_change(key)
+      |> Portal.Changeset.validate_email(key)
+    end
+  )
+
+  @doc """
+  Method to use for sending outbound email. If not set, sending emails will be disabled (default).
+  """
+  defconfig(
+    :outbound_email_adapter,
+    Ecto.ParameterizedType.init(Ecto.Enum,
+      values:
+        [
+          Swoosh.Adapters.AmazonSES,
+          Swoosh.Adapters.AzureCommunicationServices,
+          Swoosh.Adapters.CustomerIO,
+          Swoosh.Adapters.Dyn,
+          Swoosh.Adapters.ExAwsAmazonSES,
+          Swoosh.Adapters.Gmail,
+          Swoosh.Adapters.MailPace,
+          Swoosh.Adapters.Mailgun,
+          Swoosh.Adapters.Mailjet,
+          Swoosh.Adapters.Mandrill,
+          Swoosh.Adapters.Postmark,
+          Swoosh.Adapters.ProtonBridge,
+          Swoosh.Adapters.SMTP,
+          Swoosh.Adapters.SMTP2GO,
+          Swoosh.Adapters.Sendgrid,
+          Swoosh.Adapters.Sendinblue,
+          Swoosh.Adapters.Sendmail,
+          Swoosh.Adapters.SocketLabs,
+          Swoosh.Adapters.SparkPost
+        ] ++ @local_development_adapters
+    ),
+    default: nil
+  )
+
+  @doc """
+  Adapter configuration, for list of options see [Swoosh Adapters](https://github.com/swoosh/swoosh#adapters).
+  """
+  defconfig(:outbound_email_adapter_opts, :map,
+    default: %{},
+    sensitive: true,
+    dump: fn map ->
+      Dumper.keyword(map)
+      |> Keyword.update(:tls_options, nil, &Dumper.dump_ssl_opts/1)
+      |> Keyword.update(:sockopts, [], &Dumper.dump_ssl_opts/1)
+    end
+  )
+
+  @doc """
+  Method to use for sending queued outbound email.
+  If not set, queued emails will use the default no-op behaviour.
+  """
+  defconfig(
+    :secondary_outbound_email_adapter,
+    Ecto.ParameterizedType.init(Ecto.Enum,
+      values:
+        [
+          Swoosh.Adapters.AmazonSES,
+          Swoosh.Adapters.AzureCommunicationServices,
+          Swoosh.Adapters.CustomerIO,
+          Swoosh.Adapters.Dyn,
+          Swoosh.Adapters.ExAwsAmazonSES,
+          Swoosh.Adapters.Gmail,
+          Swoosh.Adapters.MailPace,
+          Swoosh.Adapters.Mailgun,
+          Swoosh.Adapters.Mailjet,
+          Swoosh.Adapters.Mandrill,
+          Swoosh.Adapters.Postmark,
+          Swoosh.Adapters.ProtonBridge,
+          Swoosh.Adapters.SMTP,
+          Swoosh.Adapters.SMTP2GO,
+          Swoosh.Adapters.Sendgrid,
+          Swoosh.Adapters.Sendinblue,
+          Swoosh.Adapters.Sendmail,
+          Swoosh.Adapters.SocketLabs,
+          Swoosh.Adapters.SparkPost
+        ] ++ @local_development_adapters
+    ),
+    default: nil
+  )
+
+  @doc """
+  Queued email adapter configuration.
+  """
+  defconfig(:secondary_outbound_email_adapter_opts, :map,
+    default: %{},
+    sensitive: true,
+    dump: fn map ->
+      Dumper.keyword(map)
+      |> Keyword.update(:tls_options, nil, &Dumper.dump_ssl_opts/1)
+      |> Keyword.update(:sockopts, [], &Dumper.dump_ssl_opts/1)
+    end
+  )
+
+  ##############################################
+  ## Outbound Email
+  ##############################################
+
+  @doc """
+  Shared secret expected on ACS Event Grid webhook notification requests.
+  Configure the webhook URL with `?secret=...` using this value.
+  """
+  defconfig(:acs_event_grid_webhook_signing_secret, :string, sensitive: true, default: nil)
+
+  ##############################################
+  ## Billing flags
+  ##############################################
+
+  defconfig(:billing_enabled, :boolean, default: false)
+  defconfig(:stripe_secret_key, :string, sensitive: true, default: nil)
+  defconfig(:stripe_webhook_signing_secret, :string, sensitive: true, default: nil)
+  defconfig(:stripe_default_price_id, :string, default: nil)
+  defconfig(:stripe_plan_product_ids, {:json_array, :string}, default: [])
+
+  ##############################################
+  ## Local development and Staging Helpers
+  ##############################################
+
+  defconfig(:docker_registry, :string, default: "ghcr.io/firezone")
+  defconfig(:api_url_override, :string, default: nil)
+
+  @doc """
+  List of email domains allowed to signup from. Leave empty to allow signing up from any domain.
+  """
+  defconfig(:sign_up_whitelisted_domains, {:array, ",", :string},
+    default: [],
+    changeset: fn changeset, key ->
+      changeset
+      |> Ecto.Changeset.validate_required(key)
+      |> Portal.Changeset.validate_fqdn(key)
+    end
+  )
+
+end

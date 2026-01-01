@@ -1,0 +1,1877 @@
+defmodule PortalWeb.LiveTable do
+  @moduledoc """
+  This module implements a live table component and it's helper function that are built
+  on top of `Portal.Repo.list/3` and allows to render a table with sorting, filtering and pagination.
+  """
+  use Phoenix.LiveView
+  alias PortalWeb.Components.Table
+  alias PortalWeb.Components.Core
+  alias PortalWeb.Components.Form
+
+  @page_size_values ["10", "25", "50"]
+
+  @default_time_preset "24h"
+  @time_presets [
+    {"1h", "Last hour", 3_600},
+    {"12h", "Last 12 hours", 43_200},
+    {"24h", "Last 24 hours", 86_400},
+    {"3d", "Last 3 days", 259_200},
+    {"7d", "Last 7 days", 604_800},
+    {"30d", "Last 30 days", 2_592_000},
+    {"custom", "Custom", nil}
+  ]
+
+  @doc """
+  A drop-in replacement of `PortalWeb.Components.Table.table/1` component that adds sorting, filtering and pagination.
+  """
+  attr :id, :string, required: true, doc: "the id of the table"
+  attr :ordered_by, :any, required: true, doc: "the current order for the table"
+  attr :filters, :list, required: true, doc: "the query filters enabled for the table"
+  attr :filter, :map, required: true, doc: "the filter form for the table"
+  attr :stale, :boolean, default: false, doc: "hint to the UI that the table data is stale"
+
+  attr :loading, :boolean,
+    default: false,
+    doc: "true while an async loader is running the table query"
+
+  attr :filtered_empty_hint, :string,
+    default: "Try adjusting your search or filters.",
+    doc: "the hint shown when filters are active and no rows match"
+
+  attr :query_error, :atom,
+    default: nil,
+    doc: "set to :query_timeout when the table query was cancelled for taking too long"
+
+  attr :class, :string, default: nil, doc: "additional classes for the live_table wrapper div"
+
+  attr :metadata, :map,
+    required: true,
+    doc: "the metadata for the table pagination as returned by Repo.list/3"
+
+  attr :rows, :list, required: true
+  attr :row_id, :any, default: nil, doc: "the function for generating the row id"
+  attr :row_patch, :any, default: nil, doc: "the function for generating patch path for each row"
+  attr :row_click, :any, default: nil, doc: "fn(row) -> patch path for row click"
+  attr :row_selected, :any, default: nil, doc: "fn(row) -> boolean indicating if row is selected"
+  attr :row_class, :any, default: nil, doc: "fn(row) -> additional classes for the table row"
+
+  attr :row_item, :any,
+    default: &Function.identity/1,
+    doc: "the function for mapping each row before calling the :col and :action slots"
+
+  slot :col, required: true do
+    attr :label, :string
+    attr :field, :any, doc: "the cursor field that to be used for ordering for this column"
+    attr :class, :string
+  end
+
+  slot :action, doc: "the slot for showing user actions in the last table column"
+  slot :empty, doc: "the slot for showing a message or content when there are no rows"
+  slot :prepend_rows, doc: "rows to prepend before the stream rows (rendered in a separate tbody)"
+
+  slot :notice,
+    doc: "the slot for showing a notice in the filter bar (e.g. active filter description)" do
+    attr :type, :string, doc: "the type of notice: info, warning, danger"
+  end
+
+  slot :footer, doc: "content rendered centered in the paginator bar"
+
+  def live_table(assigns) do
+    assigns =
+      assign(assigns, rows: if(assigns.query_error, do: [], else: assigns.rows))
+
+    # Rows haven't loaded yet, e.g. on the static render before the loader runs.
+    assigns =
+      assign(assigns,
+        show_skeleton: assigns.loading and is_nil(assigns.query_error) and Enum.empty?(assigns.rows)
+      )
+
+    ~H"""
+    <div class={["flex flex-col", @class]}>
+      <.resource_filter
+        stale={@stale}
+        loading={@loading}
+        live_table_id={@id}
+        form={@filter}
+        filters={@filters}
+        notice={@notice}
+      />
+      <div class="flex-1 overflow-auto flex flex-col">
+        <table
+          class={[
+            "w-full text-sm text-left text-body table-fixed shrink-0 transition-opacity",
+            @loading and not @show_skeleton && "opacity-50"
+          ]}
+          id={@id}
+        >
+          <Table.table_header table_id={@id} columns={@col} actions={@action} ordered_by={@ordered_by} />
+          <tbody :if={@prepend_rows != []}>
+            {render_slot(@prepend_rows)}
+          </tbody>
+          <tbody
+            id={"#{@id}-rows"}
+            phx-update={match?(%Phoenix.LiveView.LiveStream{}, @rows) && "stream"}
+          >
+            <Table.table_row
+              :for={row <- @rows}
+              columns={@col}
+              actions={@action}
+              row={row}
+              id={@row_id && @row_id.(row)}
+              patch={@row_patch}
+              click={@row_click}
+              selected={not is_nil(@row_selected) and @row_selected.(row)}
+              class={@row_class && @row_class.(row)}
+              mapper={@row_item}
+            />
+          </tbody>
+          <tbody :if={@show_skeleton} id={"#{@id}-skeleton"} aria-hidden="true">
+            <tr
+              :for={width <- ~w[w-40 w-28 w-36 w-24 w-32]}
+              class="border-b border-border animate-pulse"
+            >
+              <td :for={_col <- @col} class="px-4 py-3">
+                <div class={["h-2.5 rounded bg-border-strong max-w-full", width]}></div>
+              </td>
+              <td :if={@action != []} class="px-3 py-3"></td>
+            </tr>
+          </tbody>
+        </table>
+        <div
+          :if={@query_error == :query_timeout}
+          id={"#{@id}-query-timeout"}
+          class="flex flex-1 items-center justify-center"
+        >
+          <div class="flex flex-col items-center gap-3 py-16">
+            <div class="w-9 h-9 rounded-lg border border-border bg-raised flex items-center justify-center">
+              <Core.icon name="ri-time-line" class="w-5 h-5 text-subtle" />
+            </div>
+            <div class="text-center">
+              <p class="text-sm font-medium text-heading">
+                Your query includes too many results
+              </p>
+              <p class="text-xs text-subtle mt-0.5">
+                Try reducing the time window.
+              </p>
+            </div>
+          </div>
+        </div>
+        <div
+          :if={
+            Enum.empty?(@rows) and not @loading and is_nil(@query_error) and
+              not has_filter?(@filter, @filters)
+          }
+          id={"#{@id}-empty"}
+          class="flex flex-1 items-center justify-center"
+        >
+          {render_slot(@empty)}
+        </div>
+        <div
+          :if={
+            Enum.empty?(@rows) and not @loading and is_nil(@query_error) and
+              has_filter?(@filter, @filters)
+          }
+          id={"#{@id}-empty"}
+          class="flex flex-1 items-center justify-center"
+        >
+          <div class="flex flex-col items-center gap-3 py-16">
+            <div class="w-9 h-9 rounded-lg border border-border bg-raised flex items-center justify-center">
+              <Core.icon name="ri-search-line" class="w-4 h-4 text-subtle" />
+            </div>
+            <div class="text-center">
+              <p class="text-sm font-medium text-heading">No results found</p>
+              <p class="text-xs text-subtle mt-0.5">
+                {@filtered_empty_hint}
+              </p>
+            </div>
+            <Form.button
+              phx-click="filter"
+              phx-value-table_id={@id}
+              phx-value-filter={nil}
+              icon="ri-filter-3-line"
+              size="sm"
+              class="font-medium"
+            >
+              Clear filters
+            </Form.button>
+          </div>
+        </div>
+      </div>
+      <.paginator id={@id} metadata={@metadata} rows_count={Enum.count(@rows)} footer={@footer} />
+    </div>
+    """
+  end
+
+  # A filter that only holds its default value is not an active filter.
+  defp has_filter?(filter, filters) do
+    keys =
+      filters
+      |> Enum.map(&to_string(&1.name))
+      |> Enum.reject(&Map.get(filter.params, "#{&1}_default", false))
+
+    Map.take(filter.params, keys) != %{}
+  end
+
+  # Normalizes a multi-select filter's current value into a plain list of
+  # strings, regardless of whether it came from a form submission (list) or
+  # was reconstructed from URL params (map with numeric string keys).
+  defp list_filter_current(nil), do: []
+
+  defp list_filter_current(values) when is_list(values),
+    do: Enum.reject(values, &(&1 in [nil, ""]))
+
+  defp list_filter_current(values) when is_map(values) do
+    values
+    |> Enum.sort_by(fn {k, _} -> k end)
+    |> Enum.map(fn {_, v} -> v end)
+    |> Enum.reject(&(&1 in [nil, ""]))
+  end
+
+  defp list_filter_current(_), do: []
+
+  defp datetime_input(assigns) do
+    ~H"""
+    <label class="inline-flex items-center gap-1.5">
+      <span class="text-xs font-medium text-body select-none">
+        {@label}
+      </span>
+      <input
+        type="datetime-local"
+        data-display={@from_or_to}
+        id={"#{@field.id}-#{@from_or_to}"}
+        max={@max}
+        min={@min}
+        step="1"
+        autocomplete="off"
+        phx-update="ignore"
+        class={[
+          "bg-input border text-heading text-xs font-medium rounded h-8",
+          "px-2 py-1.5 w-56",
+          "[&::-webkit-calendar-picker-indicator]:cursor-pointer",
+          "border-input-border",
+          "focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 outline-none transition-colors",
+          @field.errors != [] && "border-danger"
+        ]}
+      />
+      <input
+        type="hidden"
+        name={"#{@field.name}[#{@from_or_to}]"}
+        value={normalize_value(:datetime_local, Map.get(@field.value || %{}, @from_or_to))}
+        data-canonical={@from_or_to}
+      />
+    </label>
+    """
+  end
+
+  defp normalize_value(:datetime_local, %DateTime{} = datetime) do
+    datetime
+    |> DateTime.shift_zone!("Etc/UTC")
+    |> DateTime.to_naive()
+    |> NaiveDateTime.to_iso8601()
+  end
+
+  defp normalize_value(_, nil), do: nil
+
+  defp notice_style("info"), do: "bg-info-light text-heading"
+  defp notice_style("warning"), do: "bg-warning-light text-heading"
+  defp notice_style("danger"), do: "bg-danger-light text-heading"
+  defp notice_style(_), do: "bg-raised text-heading"
+
+  defp resource_filter(assigns) do
+    ~H"""
+    <div class="flex items-start sm:items-center gap-3 px-6 py-3 border-b border-border bg-raised shrink-0">
+      <.form
+        :if={@filters != []}
+        id={"#{@live_table_id}-filters"}
+        for={@form}
+        phx-change="filter"
+        phx-debounce="100"
+        data-prevent-enter-submit
+        class="flex flex-wrap items-center gap-x-3 gap-y-2 flex-1 min-w-0"
+      >
+        <Form.input type="hidden" name="table_id" value={@live_table_id} />
+        <.filter
+          :for={filter <- @filters}
+          live_table_id={@live_table_id}
+          form={@form}
+          filter={filter}
+        />
+        <button
+          :if={has_filter?(@form, @filters)}
+          type="button"
+          phx-click="filter"
+          phx-value-table_id={@live_table_id}
+          phx-value-filter={nil}
+          class="order-last inline-flex items-center gap-1 px-2.5 h-8 rounded text-xs font-medium text-body hover:text-heading hover:bg-surface cursor-pointer transition-colors shrink-0"
+          title="Clear all filters"
+        >
+          <Core.icon name="ri-close-line" class="w-3.5 h-3.5" /> Reset
+        </button>
+      </.form>
+      <span
+        :if={@loading}
+        id={"#{@live_table_id}-loading"}
+        role="status"
+        class="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-body"
+      >
+        <Core.icon name="ri-loader-4-line" class="w-3.5 h-3.5 animate-spin" /> Running query...
+      </span>
+      <Form.button
+        :if={@stale}
+        id={"#{@live_table_id}-reload-btn"}
+        type="button"
+        style="warning"
+        size="xs"
+        title="The table data has changed"
+        phx-click="reload"
+        phx-value-table_id={@live_table_id}
+        class="shrink-0"
+      >
+        <Core.icon name="ri-loop-left-line" class="mr-1 w-3 h-3" /> Reload
+      </Form.button>
+      <span
+        :for={notice <- @notice}
+        class={["text-sm px-3 py-1.5 rounded-sm shrink-0", notice_style(notice[:type])]}
+      >
+        {render_slot(notice)}
+      </span>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:range, :datetime}}} = assigns) do
+    # `datetime-local` carries no zone, so the bounds are interpreted against
+    # whatever wall clock the input is showing. In Local mode the browser may
+    # be a day ahead of (or behind) UTC, so pad the lookback/lookahead by a
+    # day to keep legitimate "today local" entries reachable without changing
+    # the server-side filter (which has no lookback constraint).
+    today = Date.utc_today()
+    earliest = today |> Date.add(-91) |> Date.to_iso8601()
+    latest = today |> Date.add(1) |> Date.to_iso8601()
+    mode_field = "#{assigns.filter.name}_mode"
+    mode = if assigns.form[mode_field].value == "local", do: "local", else: "utc"
+    preset = assigns.form["#{assigns.filter.name}_preset"].value || @default_time_preset
+
+    assigns =
+      assign(assigns,
+        min: "#{earliest}T00:00:00",
+        max: "#{latest}T23:59:59",
+        mode: mode,
+        preset: preset,
+        presets: @time_presets
+      )
+
+    ~H"""
+    <div
+      id={"#{@live_table_id}-#{@filter.name}-range"}
+      phx-hook="DatetimeRangeFilter"
+      class="contents"
+    >
+      <label class="inline-flex items-center gap-1.5">
+        <span class="text-xs font-medium text-body select-none">{@filter.title}</span>
+        <div class="relative">
+          <select
+            id={"#{@live_table_id}-#{@filter.name}-preset"}
+            name={"#{@form[@filter.name].name}[preset]"}
+            class={[
+              "appearance-none bg-none bg-input border border-input-border text-heading text-xs font-medium",
+              "rounded h-8 pl-2 pr-7 outline-none transition-colors cursor-pointer",
+              "focus:border-border-focus focus:ring-1 focus:ring-border-focus/30"
+            ]}
+          >
+            <option
+              :for={{value, label, _seconds} <- @presets}
+              value={value}
+              selected={value == @preset}
+            >
+              {label}
+            </option>
+          </select>
+          <span class="pointer-events-none absolute inset-y-0 right-2 flex items-center text-subtle">
+            <Core.icon name="ri-arrow-drop-down-line" class="w-4 h-4" />
+          </span>
+        </div>
+      </label>
+      <div class="inline-flex h-8 items-center rounded border border-input-border bg-raised p-0.5 shrink-0">
+        <label
+          :for={target <- ["utc", "local"]}
+          for={"#{@live_table_id}-#{@filter.name}-mode-#{target}"}
+          data-tz-target={target}
+          class={[
+            "flex items-center px-2 h-7 text-[10px] font-semibold tracking-wide uppercase rounded transition-colors cursor-pointer",
+            if(@mode == target,
+              do: "bg-filter-active text-filter-text shadow-sm",
+              else: "text-body hover:text-heading"
+            )
+          ]}
+          title={
+            if target == "utc",
+              do: "Display and enter times in UTC",
+              else: "Display and enter times in this browser's local time zone"
+          }
+        >
+          <input
+            id={"#{@live_table_id}-#{@filter.name}-mode-#{target}"}
+            type="radio"
+            name={"#{@form[@filter.name].name}[mode]"}
+            value={target}
+            checked={@mode == target}
+            class="hidden"
+          />
+          {String.upcase(target)}
+        </label>
+      </div>
+      <.datetime_input
+        :if={@preset == "custom"}
+        field={@form[@filter.name]}
+        filter={@filter}
+        from_or_to={:from}
+        min={@min}
+        max={@max}
+        label="From"
+      />
+      <.datetime_input
+        :if={@preset == "custom"}
+        field={@form[@filter.name]}
+        filter={@filter}
+        from_or_to={:to}
+        min={@min}
+        max={@max}
+        label="To"
+      />
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:string, search_type}}} = assigns)
+       when search_type in [:websearch, :websearch_wide] do
+    assigns =
+      assign(
+        assigns,
+        :width_class,
+        if(search_type == :websearch_wide, do: "sm:w-80 lg:w-96", else: "sm:w-64")
+      )
+
+    ~H"""
+    <div
+      class={["relative w-full shrink-0", @width_class]}
+      phx-feedback-for={@form[@filter.name].name}
+    >
+      <Core.icon name="ri-search-line" class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-subtle pointer-events-none" />
+      <input
+        type="text"
+        name={@form[@filter.name].name}
+        id={@form[@filter.name].id}
+        value={Phoenix.HTML.Form.normalize_value("text", @form[@filter.name].value)}
+        placeholder={"Search by " <> @filter.title}
+        phx-debounce="300"
+        class={[
+          "w-full pl-8 pr-3 py-1.5 text-xs font-medium rounded border h-8",
+          "bg-input border-input-border text-heading",
+          "placeholder:text-subtle placeholder:font-normal outline-none transition-colors",
+          "focus:border-border-focus focus:ring-1 focus:ring-border-focus/30",
+          @form[@filter.name].errors != [] && "border-danger"
+        ]}
+      />
+      <Core.error
+        :for={msg <- @form[@filter.name].errors}
+        data-validation-error-for={@form[@filter.name].name}
+      >
+        {msg}
+      </Core.error>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: :integer}} = assigns) do
+    ~H"""
+    <div class="relative w-24 shrink-0" phx-feedback-for={@form[@filter.name].name}>
+      <input
+        type="number"
+        name={@form[@filter.name].name}
+        id={@form[@filter.name].id}
+        value={Phoenix.HTML.Form.normalize_value("number", @form[@filter.name].value)}
+        min="0"
+        max="65535"
+        step="1"
+        inputmode="numeric"
+        placeholder="Port"
+        aria-label={@filter.title}
+        phx-debounce="300"
+        class={[
+          "w-full px-3 py-1.5 text-xs font-medium rounded border h-8",
+          "bg-input border-input-border text-heading",
+          "placeholder:text-subtle placeholder:font-normal outline-none transition-colors",
+          "focus:border-border-focus focus:ring-1 focus:ring-border-focus/30",
+          @form[@filter.name].errors != [] && "border-danger"
+        ]}
+      />
+      <Core.error
+        :for={msg <- @form[@filter.name].errors}
+        data-validation-error-for={@form[@filter.name].name}
+      >
+        {msg}
+      </Core.error>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:string, :protocol_port}}} = assigns) do
+    ~H"""
+    <div class="relative w-36 shrink-0" phx-feedback-for={@form[@filter.name].name}>
+      <Core.icon name="ri-route-line" class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-subtle pointer-events-none" />
+      <input
+        type="text"
+        name={@form[@filter.name].name}
+        id={@form[@filter.name].id}
+        value={Phoenix.HTML.Form.normalize_value("text", @form[@filter.name].value)}
+        placeholder="Port or tcp/443"
+        aria-label={@filter.title}
+        title="Enter a port, protocol, or protocol/port pair: 443, tcp, or udp/53"
+        autocapitalize="none"
+        autocomplete="off"
+        spellcheck="false"
+        phx-debounce="300"
+        class={[
+          "w-full pl-8 pr-3 py-1.5 text-xs font-medium rounded border h-8",
+          "bg-input border-input-border text-heading",
+          "placeholder:text-subtle placeholder:font-normal outline-none transition-colors",
+          "focus:border-border-focus focus:ring-1 focus:ring-border-focus/30",
+          @form[@filter.name].errors != [] && "border-danger"
+        ]}
+      />
+      <Core.error
+        :for={msg <- @form[@filter.name].errors}
+        data-validation-error-for={@form[@filter.name].name}
+      >
+        {msg}
+      </Core.error>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:string, :email}}} = assigns) do
+    ~H"""
+    <div class="relative flex-1 max-w-xs" phx-feedback-for={@form[@filter.name].name}>
+      <Core.icon name="ri-search-line" class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-subtle pointer-events-none" />
+      <input
+        type="text"
+        name={@form[@filter.name].name}
+        id={@form[@filter.name].id}
+        value={Phoenix.HTML.Form.normalize_value("text", @form[@filter.name].value)}
+        placeholder={"Search by " <> @filter.title}
+        phx-debounce="300"
+        class={[
+          "w-full pl-8 pr-3 py-1.5 text-sm rounded border",
+          "bg-input border-input-border text-heading",
+          "placeholder:text-subtle outline-none transition-colors",
+          "focus:border-border-focus focus:ring-1 focus:ring-border-focus/30",
+          @form[@filter.name].errors != [] && "border-danger"
+        ]}
+      />
+      <Core.error
+        :for={msg <- @form[@filter.name].errors}
+        data-validation-error-for={@form[@filter.name].name}
+      >
+        {msg}
+      </Core.error>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:list, :string}}} = assigns) do
+    current = list_filter_current(assigns.form[assigns.filter.name].value)
+    selected_count = length(current)
+    panel_id = "#{assigns.live_table_id}-#{assigns.filter.name}-panel"
+    trigger_id = "#{assigns.live_table_id}-#{assigns.filter.name}-trigger"
+
+    assigns =
+      assign(assigns,
+        current: current,
+        selected_count: selected_count,
+        panel_id: panel_id,
+        trigger_id: trigger_id
+      )
+
+    ~H"""
+    <div class="relative shrink-0">
+      <button
+        type="button"
+        id={@trigger_id}
+        phx-hook="Popover"
+        data-popover-target-id={@panel_id}
+        data-popover-trigger="click"
+        data-popover-placement="bottom"
+        class={[
+          "inline-flex items-center gap-1.5 px-3 py-1.5 h-8 rounded border text-xs font-medium cursor-pointer transition-colors",
+          if(@selected_count > 0,
+            do: "border-brand/40 bg-brand-muted text-heading",
+            else:
+              "border-input-border bg-input text-body hover:text-heading"
+          )
+        ]}
+      >
+        <span>{@filter.title}</span>
+        <span
+          :if={@selected_count > 0}
+          class="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-semibold rounded-full bg-brand text-white tabular-nums"
+        >
+          {@selected_count}
+        </span>
+        <Core.icon name="ri-arrow-down-s-line" class="w-3.5 h-3.5 text-subtle" />
+      </button>
+      <div
+        id={@panel_id}
+        class="invisible opacity-0 fixed z-50 w-56 max-h-72 overflow-y-auto text-xs rounded border border-border bg-elevated shadow-lg"
+      >
+        <input type="hidden" name={"_reset:#{@form[@filter.name].name}[]"} value="" />
+        <div class="py-1">
+          <label
+            :for={{label, value} <- @filter.values}
+            class="flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-raised transition-colors"
+          >
+            <input
+              type="checkbox"
+              name={"#{@form[@filter.name].name}[]"}
+              value={value}
+              checked={value in @current}
+              class="w-3.5 h-3.5 rounded border-input-border text-brand focus:ring-1 focus:ring-border-focus/30 cursor-pointer"
+            />
+            <span class="text-heading">{label}</span>
+          </label>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:string, :uuid}}} = assigns) do
+    ~H"""
+    <div class="flex items-center order-4">
+      <div class="w-full">
+        <Form.input
+          type="group_select"
+          field={@form[@filter.name]}
+          options={
+            [
+              {nil, [{"For any " <> @filter.title, nil}]}
+            ] ++ @filter.values
+          }
+        />
+      </div>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: {:string, :select}}} = assigns) do
+    ~H"""
+    <div class="relative shrink-0 order-4">
+      <select
+        id={"#{@live_table_id}-#{@filter.name}"}
+        name={@form[@filter.name].name}
+        class={[
+          "appearance-none bg-none h-8 pl-3 pr-8 rounded border text-xs font-medium",
+          "cursor-pointer transition-colors outline-none",
+          "focus:ring-1 focus:ring-border-focus/30",
+          if(@form[@filter.name].value in [nil, ""],
+            do:
+              "border-input-border bg-input text-body hover:text-heading",
+            else: "border-brand/40 bg-brand-muted text-heading"
+          )
+        ]}
+      >
+        <option value="" selected={@form[@filter.name].value in [nil, ""]}>
+          All {pluralize(String.downcase(@filter.title))}
+        </option>
+        <option
+          :for={{label, value} <- @filter.values}
+          value={value}
+          selected={to_string(@form[@filter.name].value) == to_string(value)}
+        >
+          {label}
+        </option>
+      </select>
+      <span class="pointer-events-none absolute inset-y-0 right-2 flex items-center text-subtle">
+        <Core.icon name="ri-arrow-down-s-line" class="w-3.5 h-3.5" />
+      </span>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: :string, values: values}} = assigns)
+       when values != [] and length(values) < 5 do
+    ~H"""
+    <div class="inline-flex items-center gap-0.5 h-8 rounded border border-input-border bg-raised p-0.5 shrink-0">
+      <label
+        for={"#{@live_table_id}-#{@filter.name}-__all__"}
+        class={[
+          "px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer",
+          if(is_nil(@form[@filter.name].value),
+            do: "bg-filter-active text-filter-text shadow-sm",
+            else: "text-body hover:text-heading"
+          )
+        ]}
+      >
+        <Form.input
+          id={"#{@live_table_id}-#{@filter.name}-__all__"}
+          type="radio"
+          field={@form[@filter.name]}
+          name={"_reset:" <> @form[@filter.name].name}
+          value="true"
+          checked={is_nil(@form[@filter.name].value)}
+          class="hidden"
+        /> All
+      </label>
+      <label
+        :for={{label, value} <- @filter.values}
+        for={"#{@live_table_id}-#{@filter.name}-#{value}"}
+        class={[
+          "px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer",
+          if(@form[@filter.name].value == value,
+            do: "bg-filter-active text-filter-text shadow-sm",
+            else: "text-body hover:text-heading"
+          )
+        ]}
+      >
+        <Form.input
+          id={"#{@live_table_id}-#{@filter.name}-#{value}"}
+          type="radio"
+          field={@form[@filter.name]}
+          value={value}
+          checked={@form[@filter.name].value == value}
+          class="hidden"
+        />
+        {label}
+      </label>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: :string, values: values}} = assigns) when values != [] do
+    ~H"""
+    <div class="flex items-center order-4">
+      <div class="w-full">
+        <Form.input
+          type="select"
+          field={@form[@filter.name]}
+          prompt={"For any " <> @filter.title}
+          options={@filter.values}
+        />
+      </div>
+    </div>
+    """
+  end
+
+  defp filter(%{filter: %{type: :boolean}} = assigns) do
+    checked =
+      case assigns.form[assigns.filter.name].value do
+        true -> true
+        "true" -> true
+        _ -> false
+      end
+
+    assigns = assign(assigns, checked: checked)
+
+    ~H"""
+    <div class="inline-flex shrink-0">
+      <input type="hidden" name={@form[@filter.name].name} value="false" />
+      <Core.toggle
+        id={"#{@live_table_id}-#{@filter.name}-toggle"}
+        name={@form[@filter.name].name}
+        value="true"
+        checked={@checked}
+        size="sm"
+        label={@filter.title}
+        label_class="text-xs font-medium text-body select-none"
+        label_position="before"
+        class="h-8 px-2.5 rounded border border-input-border bg-input"
+      />
+    </div>
+    """
+  end
+
+  def paginator(assigns) do
+    first_row = assigns.metadata.offset + 1
+    last_row = assigns.metadata.offset + assigns.rows_count
+
+    assigns =
+      assign_new(assigns, :footer, fn -> [] end)
+
+    assigns =
+      assign(assigns,
+        count_label: count_label(assigns.metadata),
+        first_row: first_row,
+        last_row: last_row,
+        previous_page: page_from_offset(assigns.metadata.previous_offset, assigns.metadata.limit),
+        next_page: page_from_offset(assigns.metadata.next_offset, assigns.metadata.limit),
+        page_size_options: [{"10", 10}, {"25", 25}, {"50", 50}]
+      )
+
+    ~H"""
+    <div
+      :if={@rows_count > 0}
+      class="shrink-0 flex items-center justify-between gap-4 px-6 py-2.5 border-t border-border bg-raised text-xs text-subtle"
+    >
+      <div class="flex-1 flex items-center gap-4">
+        <.form
+          id={"#{@id}-pagination"}
+          for={%{}}
+          phx-change="change_limit"
+          phx-hook="PageSizePreference"
+          data-table-id={@id}
+          class="contents"
+        >
+          <input type="hidden" name="table_id" value={@id} />
+          <label class="flex items-center gap-2">
+            <span>Page Size</span>
+            <div class="relative">
+              <select
+                name="page_size"
+                class="appearance-none bg-none bg-surface border border-border rounded pl-2 pr-7 py-1 text-xs text-heading leading-5"
+              >
+                <option
+                  :for={{label, value} <- @page_size_options}
+                  value={value}
+                  selected={value == @metadata.limit}
+                >
+                  {label}
+                </option>
+              </select>
+              <span class="pointer-events-none absolute inset-y-0 right-2 flex items-center text-subtle">
+                <Core.icon name="ri-arrow-drop-down-line" class="w-4 h-4" />
+              </span>
+            </div>
+          </label>
+        </.form>
+        <div class="flex items-center gap-0.5">
+          <button
+            disabled={is_nil(@metadata.previous_offset)}
+            class={[
+              "flex items-center justify-center w-7 h-7 rounded transition-colors",
+              "text-body hover:bg-surface hover:text-heading",
+              "disabled:text-disabled disabled:cursor-not-allowed disabled:hover:bg-transparent"
+            ]}
+            phx-click="paginate"
+            phx-value-page={@previous_page}
+            phx-value-table_id={@id}
+          >
+            <Core.icon name="ri-arrow-left-s-line" class="w-5 h-5" />
+          </button>
+          <button
+            disabled={is_nil(@metadata.next_offset)}
+            class={[
+              "flex items-center justify-center w-7 h-7 rounded transition-colors",
+              "text-body hover:bg-surface hover:text-heading",
+              "disabled:text-disabled disabled:cursor-not-allowed disabled:hover:bg-transparent"
+            ]}
+            phx-click="paginate"
+            phx-value-page={@next_page}
+            phx-value-table_id={@id}
+          >
+            <Core.icon name="ri-arrow-right-s-line" class="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+      {render_slot(@footer)}
+      <span class="flex-1 text-right">
+        Showing <span class="font-medium tabular-nums text-heading mx-1">{@first_row}</span>&mdash;<span class="font-medium tabular-nums text-heading mx-1">{@last_row}</span>
+        of <span class="font-medium tabular-nums text-heading mx-1">{@count_label}</span>
+      </span>
+    </div>
+    """
+  end
+
+  defp count_label(%{count: count, count_limited: true}) do
+    count
+    |> Integer.to_string()
+    |> String.replace(~r/\B(?=(\d{3})+(?!\d))/, ",")
+    |> Kernel.<>("+")
+  end
+
+  defp count_label(%{count: count}), do: count
+
+  defp page_from_offset(nil, _limit), do: nil
+  defp page_from_offset(offset, limit), do: div(offset, limit) + 1
+
+  @doc """
+  Loads the initial state for a live table and persists it to the socket assigns.
+
+  Data is loaded with either:
+
+    * `:callback` - `fn socket, list_opts -> {:ok, socket} | {:error, reason} end`,
+      run synchronously inside `handle_params/3`.
+    * `:loader` - `fn subject, list_opts -> {:ok, assigns} | {:error, reason} end`,
+      run in an async task so the page can render a loading state. `assigns` is
+      assigned to the socket when the task finishes. The assigns the table reads
+      must be initialised in `mount/3`. `{:error, :query_timeout}` renders the
+      "too many results" state.
+
+  A `{:range, :datetime}` filter renders a time range dropdown (last hour up to
+  last 30 days, or custom). It defaults to the last 24 hours, so the query is
+  always bounded. The From and To pickers only show for "Custom".
+  """
+  def assign_live_table(socket, id, opts) do
+    query_module = Keyword.fetch!(opts, :query_module)
+    sortable_fields = Keyword.fetch!(opts, :sortable_fields)
+    callback = Keyword.get(opts, :callback)
+    loader = Keyword.get(opts, :loader)
+    enforce_filters = Keyword.get(opts, :enforce_filters, [])
+    hide_filters = Keyword.get(opts, :hide_filters, [])
+    limit = default_page_size(socket, Keyword.get(opts, :limit, 10))
+
+    # Note: we don't support nesting, :and or :where on the UI yet
+    hidden_filters = Enum.map(enforce_filters, &elem(&1, 0)) ++ hide_filters
+    render = if connected?(socket), do: :connected, else: :static
+
+    socket
+    |> attach_async_hook(loader)
+    |> assign(
+      live_table_ids: [id] ++ (socket.assigns[:live_table_ids] || []),
+      loader_by_table_id: put_table_state(socket, id, :loader_by_table_id, loader),
+      custom_timeranges_by_table_id:
+        put_table_state(socket, id, :custom_timeranges_by_table_id, %{}),
+      loading_by_table_id: put_table_state(socket, id, :loading_by_table_id, false),
+      query_error_by_table_id: put_table_state(socket, id, :query_error_by_table_id, nil),
+      query_module_by_table_id:
+        put_table_state(
+          socket,
+          id,
+          :query_module_by_table_id,
+          query_module
+        ),
+      callback_by_table_id:
+        put_table_state(
+          socket,
+          id,
+          :callback_by_table_id,
+          callback
+        ),
+      sortable_fields_by_table_id:
+        put_table_state(
+          socket,
+          id,
+          :sortable_fields_by_table_id,
+          sortable_fields
+        ),
+      filters_by_table_id:
+        put_table_state(
+          socket,
+          id,
+          :filters_by_table_id,
+          preload_filters(query_module, hidden_filters, socket.assigns.subject, render)
+        ),
+      enforced_filters_by_table_id:
+        put_table_state(
+          socket,
+          id,
+          :enforced_filters_by_table_id,
+          enforce_filters
+        ),
+      order_by_table_id:
+        put_table_state(
+          socket,
+          id,
+          :order_by_table_id,
+          maybe_use_default_order_by(query_module)
+        ),
+      limit_by_table_id: put_table_state(socket, id, :limit_by_table_id, limit)
+    )
+  end
+
+  defp preload_filters(query_module, hidden_filters, subject, render) do
+    query_module
+    |> Portal.Repo.Query.get_filters()
+    |> Enum.reject(fn filter -> is_nil(filter.title) or filter.name in hidden_filters end)
+    |> Enum.map(&preload_values(&1, subject, render))
+  end
+
+  def presence_updates_any_id?(
+        %Phoenix.Socket.Broadcast{
+          event: "presence_diff",
+          payload: %{joins: joins, leaves: leaves}
+        },
+        rendered_ids
+      ) do
+    updated_ids = Map.keys(joins) ++ Map.keys(leaves)
+    Enum.any?(updated_ids, &(&1 in rendered_ids))
+  end
+
+  def reload_live_table!(socket, id) do
+    list_opts = Map.get(socket.assigns[:list_opts_by_table_id] || %{}, id, [])
+
+    socket = assign(socket, stale: false)
+
+    case load(socket, id, list_opts) do
+      {:error, _reason} ->
+        push_navigate(socket, to: socket.assigns.current_path)
+
+      {:ok, socket} ->
+        :ok = maybe_notify_test_pid(id)
+        socket
+    end
+  end
+
+  @doc """
+  Flags the table as stale unless the rendered `rows` already reflect the change.
+
+  A change that arrives while the table is loading restarts the load instead,
+  since the rows are about to be replaced and the running query may have missed
+  the change.
+  """
+  def mark_stale_unless_reflected(socket, id, rows, %Portal.Changes.Change{} = change) do
+    cond do
+      Map.get(socket.assigns.loading_by_table_id, id, false) -> reload_live_table!(socket, id)
+      view_reflects_change?(rows, change) -> socket
+      true -> assign(socket, stale: true)
+    end
+  end
+
+  @doc """
+  Returns true when the rendered list already reflects the change.
+
+  For inserts and updates the rendered row must be field-equal to the
+  broadcast's `struct` — sharing an id is not enough since updates leave
+  the id intact. For deletes the rendered list must no longer contain
+  the deleted id.
+
+  Used by LVs subscribed to `Portal.Changes` to drop broadcasts that
+  fired for a mutation the LV itself just performed and reloaded for.
+  """
+  def view_reflects_change?(list, %Portal.Changes.Change{op: op, struct: struct})
+      when op in [:insert, :update] do
+    Enum.any?(list, &same_record?(&1, struct))
+  end
+
+  def view_reflects_change?(list, %Portal.Changes.Change{op: :delete, old_struct: %{id: id}}) do
+    not Enum.any?(list, &(&1.id == id))
+  end
+
+  defp same_record?(%mod{} = a, %mod{} = b) do
+    fields = mod.__schema__(:fields)
+    Map.take(a, fields) == Map.take(b, fields)
+  end
+
+  defp same_record?(_, _), do: false
+
+  if Mix.env() == :test do
+    defp maybe_notify_test_pid(id) do
+      if test_pid = Portal.Config.get_env(:portal, :test_pid) do
+        send(test_pid, {:live_table_reloaded, id})
+      end
+
+      :ok
+    end
+  else
+    defp maybe_notify_test_pid(_id), do: :ok
+  end
+
+  @doc """
+  This function should be called on each `c:LiveView.handle_params/3` call to
+  re-query the list of items using query parameters and update the socket assigns
+  with the new state.
+  """
+  def handle_live_tables_params(socket, params, _uri) do
+    Enum.reduce(socket.assigns.live_table_ids, socket, fn id, socket ->
+      handle_live_table_params(socket, params, id)
+    end)
+  end
+
+  defp handle_live_table_params(socket, params, id) do
+    query_module = Map.fetch!(socket.assigns.query_module_by_table_id, id)
+    enforced_filters = Map.fetch!(socket.assigns.enforced_filters_by_table_id, id)
+    sortable_fields = Map.fetch!(socket.assigns.sortable_fields_by_table_id, id)
+    filter_types = filter_types(socket, id)
+    limit = Map.fetch!(socket.assigns.limit_by_table_id, id)
+
+    raw_filter_params = Map.get(params, "#{id}_filter", %{})
+
+    with {:ok, filter} <- params_to_filter(id, params, filter_types),
+         custom_ranges = remember_custom_ranges(socket, id, filter, raw_filter_params, filter_types),
+         {filter, time_presets} =
+           resolve_time_ranges(filter, raw_filter_params, filter_types, DateTime.utc_now()),
+         filter = enforced_filters ++ filter,
+         {:ok, page} <- params_to_page(id, limit, params),
+         {:ok, order_by} <- params_to_order_by(sortable_fields, id, params) do
+      list_opts = [
+        page: page,
+        filter: filter,
+        order_by: List.wrap(order_by)
+      ]
+
+      case maybe_apply_callback(socket, id, list_opts) do
+        {:ok, socket} ->
+          socket
+          |> assign(
+            filter_form_by_table_id:
+              put_table_state(
+                socket,
+                id,
+                :filter_form_by_table_id,
+                filter_to_form(filter, raw_filter_params, id, time_presets)
+              ),
+            custom_timeranges_by_table_id:
+              put_table_state(socket, id, :custom_timeranges_by_table_id, custom_ranges),
+            order_by_table_id:
+              put_table_state(
+                socket,
+                id,
+                :order_by_table_id,
+                maybe_use_default_order_by(query_module, order_by)
+              ),
+            list_opts_by_table_id:
+              put_table_state(
+                socket,
+                id,
+                :list_opts_by_table_id,
+                list_opts
+              )
+          )
+
+        {:error, reason} ->
+          handle_load_error(socket, id, reason)
+      end
+    else
+      {:error, :invalid_page} ->
+        message = "The page was reset due to invalid pagination page."
+        reset_live_table_params(socket, id, message)
+
+      {:error, :invalid_filter} ->
+        message = "The page was reset due to invalid pagination filter."
+        reset_live_table_params(socket, id, message)
+    end
+  end
+
+  defp handle_load_error(socket, id, :invalid_page) do
+    message = "The page was reset due to invalid pagination page."
+    reset_live_table_params(socket, id, message)
+  end
+
+  defp handle_load_error(socket, id, {:unknown_filter, _metadata}) do
+    message = "The page was reset due to use of undefined pagination filter."
+    reset_live_table_params(socket, id, message)
+  end
+
+  defp handle_load_error(socket, id, {:invalid_type, _metadata}) do
+    message = "The page was reset due to invalid value of a pagination filter."
+    reset_live_table_params(socket, id, message)
+  end
+
+  defp handle_load_error(socket, id, {:invalid_value, _metadata}) do
+    message = "The page was reset due to invalid value of a pagination filter."
+    reset_live_table_params(socket, id, message)
+  end
+
+  defp handle_load_error(socket, id, :query_timeout) do
+    assign(socket,
+      query_error_by_table_id: put_table_state(socket, id, :query_error_by_table_id, :query_timeout)
+    )
+  end
+
+  defp handle_load_error(_socket, _id, _reason) do
+    raise PortalWeb.LiveErrors.NotFoundError
+  end
+
+  defp maybe_use_default_order_by(query_module, order_by \\ nil)
+
+  defp maybe_use_default_order_by(query_module, nil) do
+    if function_exported?(query_module, :cursor_fields, 0) do
+      query_module.cursor_fields() |> List.first()
+    else
+      []
+    end
+  end
+
+  defp maybe_use_default_order_by(_query_module, order_by) do
+    order_by
+  end
+
+  defp reset_live_table_params(socket, id, message) do
+    {:noreply, socket} =
+      socket
+      |> put_flash(:error, message)
+      |> update_query_params(fn query_params ->
+        Map.reject(query_params, fn {key, _} -> String.starts_with?(key, "#{id}_") end)
+      end)
+
+    socket
+  end
+
+  defp maybe_apply_callback(socket, id, list_opts) do
+    previous_list_opts = Map.get(socket.assigns[:list_opts_by_table_id] || %{}, id, [])
+
+    if list_opts != previous_list_opts do
+      load(socket, id, list_opts)
+    else
+      {:ok, socket}
+    end
+  end
+
+  defp load(socket, id, list_opts) do
+    case Map.get(socket.assigns.loader_by_table_id, id) do
+      nil ->
+        callback = Map.fetch!(socket.assigns.callback_by_table_id, id)
+        callback.(socket, list_opts)
+
+      loader ->
+        {:ok, start_load(socket, id, loader, list_opts)}
+    end
+  end
+
+  # A superseded query is cancelled so it stops holding a database connection.
+  defp start_load(socket, id, loader, list_opts) do
+    subject = socket.assigns.subject
+
+    socket
+    |> cancel_async({__MODULE__, id})
+    |> assign(
+      loading_by_table_id: put_table_state(socket, id, :loading_by_table_id, true),
+      query_error_by_table_id: put_table_state(socket, id, :query_error_by_table_id, nil)
+    )
+    |> start_async({__MODULE__, id}, fn -> loader.(subject, list_opts) end)
+  end
+
+  defp attach_async_hook(socket, nil), do: socket
+
+  defp attach_async_hook(socket, _loader) do
+    if socket.assigns[:live_table_async_hook] do
+      socket
+    else
+      socket
+      |> assign(live_table_async_hook: true)
+      |> attach_hook(:live_table_async, :handle_async, &handle_live_table_async/3)
+    end
+  end
+
+  defp handle_live_table_async({__MODULE__, id}, {:ok, result}, socket) do
+    socket =
+      assign(socket,
+        loading_by_table_id: put_table_state(socket, id, :loading_by_table_id, false)
+      )
+
+    case result do
+      {:ok, assigns} -> {:halt, assign(socket, assigns)}
+      {:error, reason} -> {:halt, handle_load_error(socket, id, reason)}
+    end
+  end
+
+  # A superseded load is cancelled before its replacement starts.
+  defp handle_live_table_async({__MODULE__, _id}, {:exit, {:shutdown, :cancel}}, socket),
+    do: {:halt, socket}
+
+  # The loader crashed. Crash with it so the error reaches the error tracker.
+  defp handle_live_table_async({__MODULE__, _id}, {:exit, reason}, _socket), do: exit(reason)
+
+  defp handle_live_table_async(_name, _result, socket), do: {:cont, socket}
+
+  defp put_table_state(socket, id, key, value) do
+    Map.put(socket.assigns[key] || %{}, id, value)
+  end
+
+  # A select renders the same without its options, so the static render skips
+  # the query and leaves it to the connected mount.
+  defp preload_values(%{type: {:string, :select}, values: fun} = filter, _subject, :static)
+       when is_function(fun, 1),
+       do: %{filter | values: []}
+
+  defp preload_values(%{values: fun} = filter, subject, _render) when is_function(fun, 1) do
+    options = fun.(subject) |> Enum.map(&{&1.name, &1.id})
+    %{filter | values: options}
+  end
+
+  defp preload_values(filter, _subject, _render),
+    do: filter
+
+  defp default_page_size(socket, default) do
+    connect_params = Map.get(socket.private, :connect_params, %{})
+
+    case Map.get(connect_params, "page_size") do
+      val when val in @page_size_values -> String.to_integer(val)
+      _ -> default
+    end
+  end
+
+  defp params_to_page(id, limit, params) do
+    effective_limit =
+      case Map.get(params, "#{id}_page_size") || Map.get(params, "#{id}_limit") do
+        val when val in @page_size_values -> String.to_integer(val)
+        _ -> limit
+      end
+
+    case Map.get(params, "#{id}_page") do
+      nil -> legacy_params_to_page(id, effective_limit, params)
+      page -> page_to_offset(page, effective_limit)
+    end
+  end
+
+  defp legacy_params_to_page(id, effective_limit, params) do
+    case Map.get(params, "#{id}_offset") do
+      nil -> {:ok, [offset: 0, limit: effective_limit]}
+      offset -> offset_to_page(offset, effective_limit)
+    end
+  end
+
+  defp page_to_offset(page, effective_limit) do
+    case Integer.parse(page) do
+      {page, ""} when page >= 1 ->
+        {:ok, [offset: (page - 1) * effective_limit, limit: effective_limit]}
+
+      _other ->
+        {:error, :invalid_page}
+    end
+  end
+
+  defp offset_to_page(offset, effective_limit) do
+    case Integer.parse(offset) do
+      {offset, ""} when offset >= 0 -> {:ok, [offset: offset, limit: effective_limit]}
+      _other -> {:error, :invalid_page}
+    end
+  end
+
+  defp filter_types(socket, id) do
+    socket.assigns.filters_by_table_id
+    |> Map.get(id, [])
+    |> Map.new(fn filter -> {to_string(filter.name), filter.type} end)
+  end
+
+  defp params_to_filter(id, params, filter_types) do
+    params
+    |> Map.get("#{id}_filter", [])
+    |> Enum.reduce_while({:ok, []}, fn {key, value}, {:ok, acc} ->
+      case cast_filter(value, Map.get(filter_types, key)) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, value} -> {:cont, {:ok, [{String.to_existing_atom(key), value}] ++ acc}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp cast_filter(value, :boolean) when value in ["true", true], do: {:ok, true}
+  defp cast_filter(value, :boolean) when value in ["false", false], do: {:ok, false}
+  defp cast_filter("", :integer), do: {:ok, nil}
+  defp cast_filter(value, :integer) when is_integer(value), do: {:ok, value}
+
+  defp cast_filter(value, :integer) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> {:ok, integer}
+      _ -> {:error, :invalid_filter}
+    end
+  end
+
+  defp cast_filter(value, {:range, :datetime}) when is_map(value) do
+    case Map.drop(value, ["preset", "mode"]) do
+      bounds when map_size(bounds) == 0 -> {:ok, nil}
+      bounds -> cast_filter(bounds)
+    end
+  end
+
+  defp cast_filter(value, _type), do: cast_filter(value)
+
+  defp cast_filter(%{"from" => from_raw, "to" => to_raw}) do
+    case {parse_datetime(from_raw), parse_datetime(to_raw)} do
+      {{:ok, from}, {:ok, to}} -> {:ok, %Portal.Repo.Filter.Range{from: from, to: to}}
+      {{:ok, from}, :empty} -> {:ok, %Portal.Repo.Filter.Range{from: from}}
+      {:empty, {:ok, to}} -> {:ok, %Portal.Repo.Filter.Range{to: to}}
+      {:empty, :empty} -> {:ok, nil}
+      _ -> {:error, :invalid_filter}
+    end
+  end
+
+  defp cast_filter(%{"from" => from_raw}) do
+    case parse_datetime(from_raw) do
+      {:ok, from} -> {:ok, %Portal.Repo.Filter.Range{from: from}}
+      :empty -> {:ok, nil}
+      :error -> {:error, :invalid_filter}
+    end
+  end
+
+  defp cast_filter(%{"to" => to_raw}) do
+    case parse_datetime(to_raw) do
+      {:ok, to} -> {:ok, %Portal.Repo.Filter.Range{to: to}}
+      :empty -> {:ok, nil}
+      :error -> {:error, :invalid_filter}
+    end
+  end
+
+  # A datetime range filter that only carries the UTC/Local mode sub-field
+  # (no actual `from`/`to` bounds) is meaningless for filtering, but we keep
+  # `mode` in the URL so the toggle's state survives reloads. Treat it as
+  # "no filter" rather than letting it fall through to the numeric-keys
+  # clause, which would reject it as invalid.
+  defp cast_filter(%{"mode" => _} = map) when map_size(map) == 1, do: {:ok, nil}
+
+  defp cast_filter(""), do: {:ok, nil}
+  defp cast_filter(binary) when is_binary(binary), do: {:ok, binary}
+
+  defp cast_filter(value) when is_list(value) do
+    case Enum.reject(value, &(&1 in [nil, ""])) do
+      [] -> {:ok, nil}
+      cleaned -> {:ok, cleaned}
+    end
+  end
+
+  # URL-encoded list (key[0]=v1&key[1]=v2) decodes to a map with numeric keys;
+  # convert it back to a positional list before validation.
+  defp cast_filter(%{} = map) when map_size(map) > 0 do
+    keys = Map.keys(map)
+
+    if Enum.all?(keys, &numeric_key?/1) do
+      cleaned =
+        map
+        |> Enum.sort_by(fn {k, _} -> String.to_integer(k) end)
+        |> Enum.map(fn {_, v} -> v end)
+        |> Enum.reject(&(&1 in [nil, ""]))
+
+      if cleaned == [], do: {:ok, nil}, else: {:ok, cleaned}
+    else
+      {:error, :invalid_filter}
+    end
+  end
+
+  defp cast_filter(_other), do: {:error, :invalid_filter}
+
+  defp numeric_key?(key) when is_binary(key) do
+    case Integer.parse(key) do
+      {n, ""} when n >= 0 -> true
+      _ -> false
+    end
+  end
+
+  defp numeric_key?(_), do: false
+
+  # Accepts both full ISO 8601 (`2024-05-26T12:00:00Z`) and the format produced
+  # by `<input type="datetime-local">` (`2024-05-26T12:00` or with seconds),
+  # which has no offset; the latter is interpreted as UTC.
+  defp parse_datetime(""), do: :empty
+  defp parse_datetime(nil), do: :empty
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} ->
+        {:ok, dt}
+
+      {:error, :missing_offset} ->
+        case NaiveDateTime.from_iso8601(value) do
+          {:ok, naive} -> {:ok, DateTime.from_naive!(naive, "Etc/UTC")}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp parse_datetime(_), do: :error
+
+  @doc false
+  def filter_to_form(filter, as), do: filter_to_form(filter, %{}, as)
+
+  @doc false
+  def filter_to_form(filter, raw_filter_params, as),
+    do: filter_to_form(filter, raw_filter_params, as, [])
+
+  @doc false
+  def filter_to_form(filter, raw_filter_params, as, time_presets) do
+    # Note: we don't support nesting, :and or :where on the UI yet
+    base =
+      for {key, value} <- filter, into: %{} do
+        {Atom.to_string(key), value}
+      end
+
+    # The default preset is not an active filter, see `has_filter?/2`.
+    preset_marks =
+      Enum.reduce(time_presets, %{}, fn {key, preset}, acc ->
+        acc
+        |> Map.put("#{key}_preset", preset)
+        |> Map.put("#{key}_default", preset == @default_time_preset)
+      end)
+
+    base
+    |> Map.merge(preset_marks)
+    |> add_filter_form_extras(raw_filter_params)
+    |> to_form(as: as)
+  end
+
+  # Every `{:range, :datetime}` filter is bounded below. A preset gives the
+  # last N hours or days, the custom range fills in whichever bound the user
+  # left out, and no setting at all means the default preset. Returns the
+  # effective ranges and the preset each filter ended up with.
+  defp resolve_time_ranges(filter, raw_filter_params, filter_types, now) do
+    now = DateTime.add(DateTime.truncate(now, :second), -now.second, :second)
+
+    for {name, {:range, :datetime}} <- filter_types, reduce: {filter, []} do
+      {filter, presets} ->
+        key = String.to_existing_atom(name)
+        preset = raw_filter_params |> Map.get(name) |> preset_param()
+        {range, preset} = resolve_time_range(preset, Keyword.get(filter, key), now)
+        {Keyword.put(filter, key, range), [{key, preset} | presets]}
+    end
+  end
+
+  defp preset_param(%{"preset" => preset}) when is_binary(preset), do: preset
+  defp preset_param(_raw), do: nil
+
+  defp resolve_time_range(preset, parsed, now) do
+    case List.keyfind(@time_presets, preset, 0) do
+      {preset, _label, seconds} when is_integer(seconds) ->
+        {%Portal.Repo.Filter.Range{from: DateTime.add(now, -seconds, :second)}, preset}
+
+      _custom_or_unset when preset == "custom" or not is_nil(parsed) ->
+        {fill_custom_bounds(parsed, now), "custom"}
+
+      _unset ->
+        {_preset, _label, seconds} = List.keyfind(@time_presets, @default_time_preset, 0)
+        {%Portal.Repo.Filter.Range{from: DateTime.add(now, -seconds, :second)}, @default_time_preset}
+    end
+  end
+
+  # `to` is rounded up to the next minute so flows from the current minute
+  # are inside the range.
+  defp fill_custom_bounds(nil, now) do
+    {_preset, _label, seconds} = List.keyfind(@time_presets, @default_time_preset, 0)
+    to = DateTime.add(now, 60, :second)
+    %Portal.Repo.Filter.Range{from: DateTime.add(to, -seconds, :second), to: to}
+  end
+
+  defp fill_custom_bounds(%Portal.Repo.Filter.Range{from: nil, to: to} = range, _now) do
+    {_preset, _label, seconds} = List.keyfind(@time_presets, @default_time_preset, 0)
+    %{range | from: DateTime.add(to, -seconds, :second)}
+  end
+
+  defp fill_custom_bounds(%Portal.Repo.Filter.Range{to: nil} = range, now),
+    do: %{range | to: DateTime.add(now, 60, :second)}
+
+  defp fill_custom_bounds(range, _now), do: range
+
+  # The last custom range the user set stays on the socket, so switching to a
+  # preset and back to Custom does not lose it. Only the bounds the user set
+  # are kept, not the ones filled in for display.
+  defp remember_custom_ranges(socket, id, filter, raw_filter_params, filter_types) do
+    remembered = Map.get(socket.assigns[:custom_timeranges_by_table_id] || %{}, id, %{})
+
+    for {name, {:range, :datetime}} <- filter_types, reduce: remembered do
+      remembered ->
+        key = String.to_existing_atom(name)
+        preset = raw_filter_params |> Map.get(name) |> preset_param()
+        parsed = Keyword.get(filter, key)
+
+        if not is_nil(parsed) and is_nil(duration(List.keyfind(@time_presets, preset, 0))) do
+          Map.put(remembered, key, parsed)
+        else
+          remembered
+        end
+    end
+  end
+
+  defp duration({_preset, _label, seconds}), do: seconds
+  defp duration(nil), do: nil
+
+  # Only the Custom preset carries From and To. The default preset is the
+  # same as no setting, so it is left out of the URL. Switching back to
+  # Custom with no bounds in the form restores the remembered range.
+  defp normalize_time_presets(filter, remembered) do
+    Map.new(filter, fn
+      {key, %{"preset" => "custom"} = value} ->
+        {key, restore_custom_range(value, remembered_range(remembered, key))}
+
+      {key, %{"preset" => preset} = value} when is_binary(preset) ->
+        value = Map.drop(value, ["from", "to"])
+        value = if preset == @default_time_preset, do: Map.delete(value, "preset"), else: value
+        {key, value}
+
+      other ->
+        other
+    end)
+  end
+
+  defp remembered_range(remembered, key) do
+    Enum.find_value(remembered, fn {name, range} ->
+      if Atom.to_string(name) == key, do: range
+    end)
+  end
+
+  defp restore_custom_range(value, nil), do: value
+
+  defp restore_custom_range(value, range) do
+    if value["from"] in [nil, ""] and value["to"] in [nil, ""] do
+      value
+      |> put_bound("from", range.from)
+      |> put_bound("to", range.to)
+    else
+      value
+    end
+  end
+
+  defp put_bound(value, _name, nil), do: value
+
+  defp put_bound(value, name, %DateTime{} = datetime) do
+    iso =
+      datetime
+      |> DateTime.shift_zone!("Etc/UTC")
+      |> DateTime.to_naive()
+      |> NaiveDateTime.to_iso8601()
+
+    Map.put(value, name, iso)
+  end
+
+  # Some sub-fields (e.g. the UTC/Local mode on a datetime range filter)
+  # are display-only and don't survive `cast_filter` — particularly when the
+  # user toggles mode without setting any bounds, since `cast_filter` returns
+  # `{:ok, nil}` and drops the key from the cast result entirely. Read the
+  # mode straight off the raw params so the re-render reflects the URL state.
+  defp add_filter_form_extras(base, raw_filter_params) do
+    Enum.reduce(raw_filter_params, base, fn
+      {key, %{"mode" => mode}}, acc when mode in ["utc", "local"] ->
+        Map.put(acc, "#{key}_mode", mode)
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp params_to_order_by(sortable_fields, id, params) do
+    order_by =
+      Map.get(params, "#{id}_order_by", "")
+      |> parse_order_by(sortable_fields)
+
+    {:ok, order_by}
+  end
+
+  defp parse_order_by(order_by, sortable_fields) do
+    with [field_assoc, field_direction, field_field] <- String.split(order_by, ":", parts: 3),
+         {assoc, field} <-
+           Enum.find(sortable_fields, fn {assoc, field} ->
+             to_string(assoc) == field_assoc && to_string(field) == field_field
+           end),
+         field_direction when field_direction in ["asc", "desc"] <- field_direction do
+      {assoc, String.to_existing_atom(field_direction), field}
+    else
+      _other -> nil
+    end
+  end
+
+  def handle_live_table_event("table_row_click", %{"path" => path}, socket) do
+    {:noreply, push_patch(socket, to: path)}
+  end
+
+  def handle_live_table_event("change_limit", %{"table_id" => id, "page_size" => page_size}, socket) do
+    update_query_params(socket, fn query_params ->
+      query_params
+      |> delete_page_from_params(id)
+      |> delete_page_size_from_params(id)
+      |> Map.put("#{id}_page_size", page_size)
+    end)
+  end
+
+  def handle_live_table_event("reload", %{"table_id" => id}, socket) do
+    {:noreply, reload_live_table!(socket, id)}
+  end
+
+  def handle_live_table_event("paginate", %{"table_id" => id, "page" => page}, socket) do
+    update_query_params(socket, fn query_params ->
+      put_page_to_params(query_params, id, page)
+    end)
+  end
+
+  def handle_live_table_event("order_by", %{"table_id" => id, "order_by" => order_by}, socket) do
+    sortable_fields = Map.fetch!(socket.assigns.sortable_fields_by_table_id, id)
+
+    order_by =
+      order_by
+      |> parse_order_by(sortable_fields)
+      |> reverse_order_by()
+
+    update_query_params(socket, fn query_params ->
+      query_params
+      |> delete_page_from_params(id)
+      |> put_order_by_to_params(id, order_by)
+    end)
+  end
+
+  def handle_live_table_event(
+        "filter",
+        %{"_target" => ["_reset:" <> id, field], "table_id" => id},
+        socket
+      ) do
+    update_query_params(socket, fn query_params ->
+      query_params
+      |> delete_page_from_params(id)
+      |> Map.reject(fn {key, _} -> String.starts_with?(key, "#{id}_filter[#{field}]") end)
+    end)
+  end
+
+  def handle_live_table_event("filter", %{"table_id" => id} = params, socket) do
+    remembered = Map.get(socket.assigns[:custom_timeranges_by_table_id] || %{}, id, %{})
+    filter = params |> Map.get(id, %{}) |> normalize_time_presets(remembered)
+
+    update_query_params(socket, fn query_params ->
+      query_params
+      |> delete_page_from_params(id)
+      |> put_filter_to_params(id, filter)
+    end)
+  end
+
+  defp reverse_order_by({assoc, :asc, field}), do: {assoc, :desc, field}
+  defp reverse_order_by({assoc, :desc, field}), do: {assoc, :asc, field}
+  defp reverse_order_by(nil), do: nil
+
+  def update_query_params(socket, update_fun) when is_function(update_fun, 1) do
+    query =
+      socket.assigns.query_params
+      |> update_fun.()
+      |> Enum.flat_map(fn
+        {key, values} when is_list(values) -> Enum.map(values, &{"#{key}[]", &1})
+        {key, values} when is_map(values) -> values |> Map.values() |> Enum.map(&{"#{key}[]", &1})
+        {key, value} -> [{key, value}]
+      end)
+      |> URI.encode_query(:rfc3986)
+
+    path = socket.assigns.current_path
+    {:noreply, push_patch(socket, to: String.trim_trailing("#{path}?#{query}", "?"))}
+  end
+
+  @doc """
+  Builds a patch path that carries the state of every live table on the socket
+  (filters, ordering, pagination) so that opening, closing or submitting a panel
+  does not reset the table.
+
+  Panel-local query keys such as `tab` and `page` are dropped; pass them in
+  `extra` when the target panel needs them. `return_to` is kept so a panel can
+  still navigate back to where it was opened from.
+
+  Accepts either a socket or the template assigns.
+  """
+  def live_table_path(socket_or_assigns, path, extra \\ [])
+
+  def live_table_path(%Phoenix.LiveView.Socket{assigns: assigns}, path, extra) do
+    live_table_path(assigns, path, extra)
+  end
+
+  def live_table_path(assigns, path, extra) when is_map(assigns) do
+    table_ids = Map.get(assigns, :live_table_ids, [])
+
+    query =
+      assigns
+      |> Map.get(:query_params, %{})
+      |> Map.filter(fn {key, _value} -> live_table_key?(key, table_ids) end)
+      |> Map.merge(Map.new(extra, fn {key, value} -> {to_string(key), value} end))
+      |> Map.reject(fn {_key, value} -> is_nil(value) end)
+      |> Plug.Conn.Query.encode()
+
+    if query == "" do
+      path
+    else
+      "#{path}?#{query}"
+    end
+  end
+
+  defp live_table_key?("return_to", _table_ids), do: true
+
+  defp live_table_key?(key, table_ids) do
+    Enum.any?(table_ids, &String.starts_with?(key, "#{&1}_"))
+  end
+
+  defp put_page_to_params(params, id, page) do
+    params
+    |> delete_page_from_params(id)
+    |> Map.put("#{id}_page", page)
+  end
+
+  defp delete_page_from_params(params, id) do
+    params
+    |> Map.delete("#{id}_page")
+    |> Map.delete("#{id}_offset")
+    |> Map.delete("#{id}_cursor")
+  end
+
+  defp delete_page_size_from_params(params, id) do
+    params
+    |> Map.delete("#{id}_page_size")
+    |> Map.delete("#{id}_limit")
+  end
+
+  defp put_order_by_to_params(params, id, {assoc, direction, field}) do
+    Map.put(params, "#{id}_order_by", "#{assoc}:#{direction}:#{field}")
+  end
+
+  defp put_order_by_to_params(params, id, nil) do
+    Map.delete(params, "#{id}_order_by")
+  end
+
+  defp put_filter_to_params(params, id, filter) do
+    filter_params = flatten_filter(filter, "#{id}_filter", %{})
+
+    params
+    |> Map.reject(fn {key, _} -> String.starts_with?(key, "#{id}_filter[") end)
+    |> Map.merge(filter_params)
+  end
+
+  defp flatten_filter([], _key_prefix, acc) do
+    acc
+  end
+
+  defp flatten_filter(map, key_prefix, acc) when is_map(map) do
+    flatten_filter(Map.to_list(map), key_prefix, acc)
+  end
+
+  defp flatten_filter([{_key, ""} | rest], key_prefix, acc) do
+    flatten_filter(rest, key_prefix, acc)
+  end
+
+  defp flatten_filter([{_key, "__all__"} | rest], key_prefix, acc) do
+    flatten_filter(rest, key_prefix, acc)
+  end
+
+  defp flatten_filter([{key, %{"date" => _} = datetime_range_filter} | rest], key_prefix, acc) do
+    if value = normalize_datetime_filter(datetime_range_filter) do
+      flatten_filter(rest, key_prefix, Map.put(acc, "#{key_prefix}[#{key}]", value))
+    else
+      flatten_filter(rest, key_prefix, acc)
+    end
+  end
+
+  # A list of plain values (e.g. multi-select checkboxes) stays as a list in
+  # the query-param map so `update_query_params` can emit `key[]=v` URL parts;
+  # an empty/blank list is dropped to keep clean URLs.
+  defp flatten_filter([{key, value} | rest], key_prefix, acc)
+       when is_list(value) do
+    case Enum.reject(value, &(&1 in [nil, ""])) do
+      [] -> flatten_filter(rest, key_prefix, acc)
+      cleaned -> flatten_filter(rest, key_prefix, Map.put(acc, "#{key_prefix}[#{key}]", cleaned))
+    end
+  end
+
+  defp flatten_filter([{key, value} | rest], key_prefix, acc)
+       when is_map(value) do
+    acc = Map.merge(acc, flatten_filter(value, "#{key_prefix}[#{key}]", %{}))
+    flatten_filter(rest, key_prefix, acc)
+  end
+
+  defp flatten_filter([{key, value} | rest], key_prefix, acc) do
+    flatten_filter(rest, key_prefix, Map.put(acc, "#{key_prefix}[#{key}]", value))
+  end
+
+  defp normalize_datetime_filter(params) do
+    with {:ok, date} <- Date.from_iso8601(params["date"]),
+         {:ok, time} <- normalize_time_filter(params["time"] || "00:00:00") do
+      DateTime.new!(date, time) |> DateTime.to_iso8601()
+    else
+      _other -> nil
+    end
+  end
+
+  defp normalize_time_filter(time) when byte_size(time) == 5 do
+    Time.from_iso8601(time <> ":00")
+  end
+
+  defp normalize_time_filter(time) do
+    Time.from_iso8601(time)
+  end
+
+  defp pluralize(word) do
+    cond do
+      String.ends_with?(word, "y") -> String.slice(word, 0..-2//1) <> "ies"
+      String.ends_with?(word, "s") -> word
+      true -> word <> "s"
+    end
+  end
+end

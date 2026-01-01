@@ -1,0 +1,36 @@
+defmodule Portal.Repo.List do
+  @moduledoc false
+
+  alias Portal.Repo.{Paginator, Preloader, Filter}
+
+  def call(repo, queryable, query_module, opts) do
+    {preload, opts} = Keyword.pop(opts, :preload, [])
+    {filter, opts} = Keyword.pop(opts, :filter, [])
+    {order_by, opts} = Keyword.pop(opts, :order_by, [])
+    {paginator_opts, opts} = Keyword.pop(opts, :page, [])
+    {limit, opts} = Keyword.pop(opts, :limit)
+
+    paginator_opts =
+      if limit do
+        Keyword.put_new(paginator_opts, :limit, limit)
+      else
+        paginator_opts
+      end
+
+    with {:ok, paginator_opts} <- Paginator.init(query_module, order_by, paginator_opts),
+         {:ok, queryable} <- Filter.filter(queryable, query_module, filter) do
+      count = repo.aggregate(queryable, :count)
+
+      {results, metadata} =
+        queryable
+        |> Paginator.query(paginator_opts)
+        |> repo.all(opts)
+        |> Paginator.metadata(paginator_opts)
+
+      {results, ecto_preloads} = Preloader.preload(results, preload, query_module)
+      results = repo.preload(results, ecto_preloads)
+
+      {:ok, results, %{metadata | count: count}}
+    end
+  end
+end

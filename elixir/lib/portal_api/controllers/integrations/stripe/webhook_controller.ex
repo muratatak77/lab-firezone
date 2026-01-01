@@ -1,0 +1,132 @@
+defmodule PortalAPI.Integrations.Stripe.WebhookController do
+  use PortalAPI, :controller
+  alias Portal.Billing
+  require Logger
+
+  @tolerance 300
+  @scheme "v1"
+
+  def handle_webhook(conn, _params) do
+    case get_req_header(conn, "stripe-signature") do
+      [signature_header] ->
+        case read_body(conn, length: 1_000_000) do
+          {:ok, body, conn} ->
+            Portal.Conn.wrap_errors(conn, &handle_body(&1, signature_header, body))
+
+          {:more, _, conn} ->
+            send_resp(conn, 413, "Request Entity Too Large")
+
+          {:error, reason} ->
+            Logger.error("Stripe webhook body could not be read", reason: inspect(reason))
+            send_resp(conn, 500, "Internal Error")
+        end
+
+      [] ->
+        conn
+        |> log_rejection(:missing_signature_header)
+        |> send_resp(400, "Bad Request: missing signature header")
+
+      [_ | _] ->
+        conn
+        |> log_rejection(:multiple_signature_headers)
+        |> send_resp(400, "Bad Request: invalid signature header")
+    end
+  end
+
+  defp handle_body(conn, signature_header, body) do
+    with {:ok, {timestamp, signatures}} <- fetch_timestamp_and_signatures(signature_header),
+         :ok <- verify_timestamp(timestamp, @tolerance),
+         secret = Billing.fetch_webhook_signing_secret!(),
+         :ok <- verify_signatures(signatures, timestamp, body, secret),
+         {:ok, payload} <- JSON.decode(body),
+         :ok <- Billing.handle_events([payload]) do
+      send_resp(conn, 200, "")
+    else
+      {:error, :missing_timestamp} ->
+        conn
+        |> log_rejection(:missing_timestamp)
+        |> send_resp(400, "Bad Request: missing timestamp")
+
+      {:error, :missing_signatures} ->
+        conn
+        |> log_rejection(:missing_signatures)
+        |> send_resp(400, "Bad Request: missing signatures")
+
+      {:error, :stale_event} ->
+        conn
+        |> log_rejection(:stale_event)
+        |> send_resp(400, "Bad Request: expired signature")
+
+      {:error, :invalid_signature} ->
+        conn
+        |> log_rejection(:invalid_signature)
+        |> send_resp(400, "Bad Request: invalid signature")
+
+      reason ->
+        :ok = Logger.error("Stripe webhook failed", reason: inspect(reason))
+        send_resp(conn, 500, "Internal Error")
+    end
+  end
+
+  defp log_rejection(conn, reason) do
+    Logger.warning("Stripe webhook failed authentication", reason: reason)
+    conn
+  end
+
+  defp fetch_timestamp_and_signatures(signature_header) do
+    signature_header
+    |> String.split(",")
+    |> Enum.map(&String.split(&1, "="))
+    |> Enum.reduce({nil, []}, fn
+      ["t", timestamp], {nil, signatures} ->
+        case Integer.parse(timestamp) do
+          {timestamp, ""} -> {timestamp, signatures}
+          _ -> {nil, signatures}
+        end
+
+      [@scheme, signature], {timestamp, signatures} ->
+        {timestamp, [signature | signatures]}
+
+      _, acc ->
+        acc
+    end)
+    |> case do
+      {nil, _} ->
+        {:error, :missing_timestamp}
+
+      {_, []} ->
+        {:error, :missing_signatures}
+
+      {timestamp, signatures} ->
+        {:ok, {timestamp, signatures}}
+    end
+  end
+
+  defp verify_timestamp(timestamp, tolerance) do
+    if abs(System.system_time(:second) - timestamp) > tolerance do
+      {:error, :stale_event}
+    else
+      :ok
+    end
+  end
+
+  defp verify_signatures(signatures, timestamp, payload, secret) do
+    expected_signature = sign(timestamp, secret, payload)
+
+    if Enum.any?(signatures, &Plug.Crypto.secure_compare(&1, expected_signature)) do
+      :ok
+    else
+      {:error, :invalid_signature}
+    end
+  end
+
+  @doc false
+  def sign(timestamp, secret, payload) do
+    hmac_sha256(secret, "#{timestamp}.#{payload}")
+  end
+
+  defp hmac_sha256(secret, payload) do
+    :crypto.mac(:hmac, :sha256, secret, payload)
+    |> Base.encode16(case: :lower)
+  end
+end

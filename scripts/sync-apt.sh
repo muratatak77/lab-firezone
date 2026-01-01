@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+# Shell script for syncing the APT repository metadata from a set of `.deb` files.
+#
+# This script maintains two release channels: stable and preview.
+# It expects the `.deb` files for these channels to be in the `pool-stable` and `pool-preview` directories.
+# To add new packages to the repository, upload them to the `import-stable` and `import-preview` directories NOT to the `pool-` directories.
+# The `pool-` directories are referenced by the live repository metadata and the files in there need to atomically change with the metadata.
+
+set -euo pipefail
+shopt -s globstar
+
+COMPONENT="main"
+WORK_DIR="$(mktemp -d)"
+DISTS_DIR="${WORK_DIR}/dists"
+
+if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ]; then
+    echo "Error: AZURE_STORAGE_ACCOUNT not set"
+    exit 1
+fi
+
+if [ -z "${GPG_KEY_ID:-}" ]; then
+    echo "Error: GPG_KEY_ID not set"
+    exit 1
+fi
+
+if [ -z "${GPG_KEY_EXPIRY:-}" ]; then
+    echo "Error: GPG_KEY_EXPIRY not set"
+    exit 1
+fi
+
+cleanup() {
+    rm -rf "${WORK_DIR}"
+}
+
+trap cleanup EXIT
+
+# The expiry is set here rather than in the stored key, so renewing it only takes a change to `GPG_KEY_EXPIRY`.
+GPG_KEY_FINGERPRINT=$(gpg --list-secret-keys --with-colons "${GPG_KEY_ID}" | awk -F: '$1 == "fpr" { print $10; exit }')
+gpg --batch --quick-set-expire "${GPG_KEY_FINGERPRINT}" "${GPG_KEY_EXPIRY}"
+
+for DISTRIBUTION in "stable" "preview"; do
+    POOL_DIR="${WORK_DIR}/pool-${DISTRIBUTION}"
+    IMPORT_DIR="${WORK_DIR}/import-${DISTRIBUTION}"
+
+    mkdir --parents "${POOL_DIR}"
+    mkdir --parents "${IMPORT_DIR}"
+
+    echo "Downloading existing packages for distribution $DISTRIBUTION..."
+
+    az storage blob download-batch \
+        --destination "${WORK_DIR}" \
+        --source apt \
+        --pattern "pool-${DISTRIBUTION}/*.deb" \
+        --auth-mode login \
+        --account-name "${AZURE_STORAGE_ACCOUNT}" \
+        2>&1 | grep -v "WARNING" || true
+
+    echo "Downloading import packages for distribution $DISTRIBUTION..."
+
+    az storage blob download-batch \
+        --destination "${WORK_DIR}" \
+        --source apt \
+        --pattern "import-${DISTRIBUTION}/*.deb" \
+        --auth-mode login \
+        --account-name "${AZURE_STORAGE_ACCOUNT}" \
+        2>&1 | grep -v "WARNING" || true
+
+    if [ "$(ls -A "${IMPORT_DIR}")" ]; then
+        echo "Normalizing package names..."
+
+        for deb in "${IMPORT_DIR}"/**; do
+            if [[ ! "$deb" == *.deb ]]; then
+                continue
+            fi
+
+            if [ -f "$deb" ]; then
+                # Extract metadata from the .deb file
+                PACKAGE=$(dpkg-deb -f "$deb" Package 2>/dev/null)
+                VERSION=$(dpkg-deb -f "$deb" Version 2>/dev/null)
+                ARCH=$(dpkg-deb -f "$deb" Architecture 2>/dev/null)
+
+                # Skip if any field is missing
+                if [ -z "$PACKAGE" ] || [ -z "$VERSION" ] || [ -z "$ARCH" ]; then
+                    echo "Warning: Could not extract metadata from $(basename "$deb"), skipping"
+                    continue
+                fi
+
+                # Construct the proper filename
+                NORMALIZED_NAME="${PACKAGE}_${VERSION}_${ARCH}.deb"
+
+                echo "Importing $(basename "$deb") as ${NORMALIZED_NAME}"
+                mv --force "$deb" "${POOL_DIR}/${NORMALIZED_NAME}"
+            fi
+        done
+    fi
+
+    if [ -z "$(ls -A "${POOL_DIR}")" ]; then
+        echo "No packages for distribution ${DISTRIBUTION}"
+
+        continue
+    fi
+
+    echo "Detecting architectures..."
+    ARCHITECTURES=$(for deb in "${POOL_DIR}"/*.deb; do dpkg-deb -f "$deb" Architecture 2>/dev/null; done | sort -u | tr '\n' ' ') || true
+
+    echo "Found: ${ARCHITECTURES}"
+
+    echo "Generating metadata..."
+    mkdir -p "${DISTS_DIR}/${DISTRIBUTION}/${COMPONENT}"
+
+    cd "$WORK_DIR"
+
+    for ARCH in $ARCHITECTURES; do
+        BINARY_DIR="${DISTS_DIR}/${DISTRIBUTION}/${COMPONENT}/binary-${ARCH}"
+        mkdir -p "${BINARY_DIR}"
+
+        apt-ftparchive packages --arch "${ARCH}" "pool-${DISTRIBUTION}" >"${BINARY_DIR}/Packages"
+        gzip -k -f "${BINARY_DIR}/Packages"
+
+        cat >"${BINARY_DIR}/Release" <<EOF
+Archive: ${DISTRIBUTION}
+Component: ${COMPONENT}
+Architecture: ${ARCH}
+EOF
+    done
+
+    cd "${DISTS_DIR}/${DISTRIBUTION}"
+    cat >Release <<EOF
+Origin: Firezone
+Label: Firezone
+Suite: ${DISTRIBUTION}
+Codename: ${DISTRIBUTION}
+Architectures: ${ARCHITECTURES}
+Components: ${COMPONENT}
+Description: Firezone APT Repository
+Date: $(date -R -u)
+EOF
+
+    apt-ftparchive release . >>Release
+
+    gpg --default-key "${GPG_KEY_ID}" -abs -o Release.gpg Release
+    gpg --default-key "${GPG_KEY_ID}" --clearsign -o InRelease Release
+
+    # Upload new pool directory
+    az storage blob upload-batch \
+        --destination apt \
+        --destination-path "pool-${DISTRIBUTION}" \
+        --source "${POOL_DIR}" \
+        --auth-mode login \
+        --account-name "${AZURE_STORAGE_ACCOUNT}" \
+        --overwrite \
+        --output table
+done
+
+echo "Uploading metadata..."
+az storage blob upload-batch \
+    --destination apt \
+    --source "${DISTS_DIR}" \
+    --destination-path dists \
+    --auth-mode login \
+    --account-name "${AZURE_STORAGE_ACCOUNT}" \
+    --overwrite \
+    --output table
+
+# Publish the public key alongside, so a renewed key reaches clients on the next sync.
+echo "Uploading public signing key..."
+gpg --armor --export "${GPG_KEY_ID}" >"${WORK_DIR}/key.gpg"
+az storage blob upload \
+    --container-name apt \
+    --name key.gpg \
+    --file "${WORK_DIR}/key.gpg" \
+    --auth-mode login \
+    --account-name "${AZURE_STORAGE_ACCOUNT}" \
+    --overwrite \
+    --output table
+
+# Delete import files
+az storage blob delete-batch \
+    --source apt \
+    --pattern "import-*/*.deb" \
+    --auth-mode login \
+    --account-name "${AZURE_STORAGE_ACCOUNT}" \
+    --output table

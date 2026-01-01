@@ -1,0 +1,1473 @@
+defmodule Portal.BillingTest do
+  use Portal.DataCase, async: true
+
+  import Ecto.Query
+  import ExUnit.CaptureLog
+  import Portal.Billing
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.DeviceFixtures
+  import Portal.ClientSessionFixtures
+  import Portal.SiteFixtures
+  import Portal.TokenFixtures
+
+  alias Portal.Mocks.Stripe
+
+  setup do
+    account = account_fixture()
+
+    %{account: account}
+  end
+
+  describe "enabled?/0" do
+    test "returns true when billing is enabled" do
+      assert enabled?() == true
+    end
+
+    test "returns false when billing is disabled" do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      assert enabled?() == false
+    end
+  end
+
+  describe "account_provisioned?/1" do
+    test "returns true when account is provisioned", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_" <> Stripe.random_id()}}
+        })
+
+      assert account_provisioned?(account) == true
+    end
+
+    test "returns false when account is not provisioned", %{account: account} do
+      account = update_account(account, %{metadata: %{stripe: %{}}})
+      assert account_provisioned?(account) == false
+    end
+  end
+
+  describe "users_limit_exceeded?/2" do
+    test "returns false when users limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 10}})
+      assert users_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when users limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 10}})
+      assert users_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when users limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: nil}})
+      assert users_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "seats_limit_exceeded?/2" do
+    test "returns false when seats limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{monthly_active_users_count: 10}})
+      assert seats_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when seats limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{monthly_active_users_count: 10}})
+      assert seats_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when seats limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{monthly_active_users_count: nil}})
+      assert seats_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "can_create_users?/1" do
+    test "returns true when seats limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{monthly_active_users_count: 3}})
+
+      actor1 = actor_fixture(type: :account_admin_user, account: account)
+      client1 = client_fixture(account: account, actor: actor1)
+      client_session_fixture(account: account, client: client1)
+
+      actor2 = actor_fixture(type: :account_user, account: account)
+      client2 = client_fixture(account: account, actor: actor2)
+      client_session_fixture(account: account, client: client2)
+
+      assert can_create_users?(account) == true
+    end
+
+    test "returns false when seats limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{monthly_active_users_count: 1}})
+
+      actor1 = actor_fixture(type: :account_admin_user, account: account)
+      client1 = client_fixture(account: account, actor: actor1)
+      client_session_fixture(account: account, client: client1)
+
+      actor2 = actor_fixture(type: :account_user, account: account)
+      client2 = client_fixture(account: account, actor: actor2)
+      client_session_fixture(account: account, client: client2)
+
+      assert can_create_users?(account) == false
+    end
+
+    test "returns false when users limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 1}})
+
+      actor_fixture(type: :account_admin_user, account: account)
+      actor_fixture(type: :account_user, account: account)
+
+      assert can_create_users?(account) == false
+    end
+
+    test "returns false when account is disabled" do
+      account = disabled_account_fixture()
+      assert can_create_users?(account) == false
+    end
+
+    test "returns true when limits are not set", %{account: account} do
+      account =
+        update_account(account, %{
+          limits: %{users_count: nil, monthly_active_users_count: nil}
+        })
+
+      assert can_create_users?(account) == true
+    end
+  end
+
+  describe "service_accounts_limit_exceeded?/2" do
+    test "returns false when service accounts limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{service_accounts_count: 10}})
+      assert service_accounts_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when service accounts limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{service_accounts_count: 10}})
+      assert service_accounts_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when service accounts limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{service_accounts_count: nil}})
+      assert service_accounts_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "can_create_service_accounts?/1" do
+    test "returns true when service accounts limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{service_accounts_count: 3}})
+
+      actor_fixture(type: :service_account, account: account)
+      actor_fixture(type: :service_account, account: account)
+
+      assert can_create_service_accounts?(account) == true
+    end
+
+    test "returns false when service accounts limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{service_accounts_count: 1}})
+
+      actor_fixture(type: :service_account, account: account)
+      actor_fixture(type: :service_account, account: account)
+
+      assert can_create_service_accounts?(account) == false
+    end
+
+    test "returns false when account is disabled" do
+      account = disabled_account_fixture()
+      assert can_create_service_accounts?(account) == false
+    end
+
+    test "returns true when service accounts limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{service_accounts_count: nil}})
+      assert can_create_service_accounts?(account) == true
+    end
+  end
+
+  describe "sites_limit_exceeded?/2" do
+    test "returns false when sites limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{sites_count: 10}})
+      assert sites_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when sites limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{sites_count: 10}})
+      assert sites_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when sites limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{sites_count: nil}})
+      assert sites_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "can_create_sites?/1" do
+    test "returns true when sites limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{sites_count: 3}})
+
+      site_fixture(account: account)
+      site_fixture(account: account)
+
+      assert can_create_sites?(account) == true
+    end
+
+    test "returns false when sites limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{sites_count: 1}})
+
+      site_fixture(account: account)
+
+      assert can_create_sites?(account) == false
+    end
+
+    test "returns false when account is disabled" do
+      account = disabled_account_fixture()
+      assert can_create_sites?(account) == false
+    end
+
+    test "returns true when sites limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{sites_count: nil}})
+      assert can_create_sites?(account) == true
+    end
+  end
+
+  describe "admins_limit_exceeded?/2" do
+    test "returns false when admins limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: 10}})
+      assert admins_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when admins limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: 10}})
+      assert admins_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when admins limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: nil}})
+      assert admins_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "can_create_admin_users?/1" do
+    test "returns true when admins limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: 5}})
+
+      actor_fixture(type: :account_admin_user, account: account)
+      actor_fixture(type: :account_admin_user, account: account)
+
+      assert can_create_admin_users?(account) == true
+    end
+
+    test "returns false when admins limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: 1}})
+
+      actor_fixture(type: :account_admin_user, account: account)
+
+      assert can_create_admin_users?(account) == false
+    end
+
+    test "returns false when account is disabled" do
+      account = disabled_account_fixture()
+      assert can_create_admin_users?(account) == false
+    end
+
+    test "returns true when admins limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: nil}})
+      assert can_create_admin_users?(account) == true
+    end
+  end
+
+  describe "api_clients_limit_exceeded?/2" do
+    test "returns false when api_clients_count limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 10}})
+
+      assert api_clients_limit_exceeded?(account, 5) == false
+    end
+
+    test "returns false when api_clients_count equals limit", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 10}})
+
+      assert api_clients_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when api_clients_count limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 10}})
+
+      assert api_clients_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when api_clients_count limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: nil}})
+
+      assert api_clients_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "can_create_api_clients?/1" do
+    test "returns true when api_clients limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 5}})
+
+      api_client_fixture(account: account)
+      api_client_fixture(account: account)
+
+      assert can_create_api_clients?(account) == true
+    end
+
+    test "returns false when api_clients limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 1}})
+
+      api_client_fixture(account: account)
+
+      assert can_create_api_clients?(account) == false
+    end
+
+    test "returns false when account is disabled" do
+      account = disabled_account_fixture()
+
+      assert can_create_api_clients?(account) == false
+    end
+
+    test "returns true when api_clients limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: nil}})
+
+      assert can_create_api_clients?(account) == true
+    end
+
+    test "disabled API clients are not counted against limit", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 1}})
+
+      api_client = api_client_fixture(account: account)
+      disabled_actor_fixture(account: account, type: :api_client)
+
+      # Only the enabled one counts
+      refute can_create_api_clients?(account)
+
+      # Disable the enabled one
+      api_client
+      |> Ecto.Changeset.change(is_disabled: true)
+      |> Portal.Repo.update!()
+
+      # Now we can create more
+      assert can_create_api_clients?(account)
+    end
+  end
+
+  describe "check_actor_enable_limits/2" do
+    test "rejects a user when the user limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :account_user)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :users_limit_reached}
+    end
+
+    test "rejects an admin when the user limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{users_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :account_admin_user)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :users_limit_reached}
+    end
+
+    test "rejects an admin when the admin limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{account_admin_users_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :account_admin_user)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :admin_users_limit_reached}
+    end
+
+    test "rejects a service account when the service account limit is reached", %{
+      account: account
+    } do
+      account = update_account(account, %{limits: %{service_accounts_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :service_account)
+
+      assert check_actor_enable_limits(account, actor) ==
+               {:error, :service_accounts_limit_reached}
+    end
+
+    test "rejects an API client when the API client limit is reached", %{account: account} do
+      account = update_account(account, %{limits: %{api_clients_count: 0}})
+      actor = disabled_actor_fixture(account: account, type: :api_client)
+
+      assert check_actor_enable_limits(account, actor) == {:error, :api_clients_limit_reached}
+    end
+
+    test "allows all actor types when limits are not reached", %{account: account} do
+      for type <- [:account_user, :account_admin_user, :service_account, :api_client] do
+        actor = disabled_actor_fixture(account: account, type: type)
+        assert check_actor_enable_limits(account, actor) == :ok
+      end
+    end
+  end
+
+  describe "api_tokens_limit_exceeded?/2" do
+    test "returns false when api_tokens_per_client_count limit is not exceeded", %{
+      account: account
+    } do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: 10}})
+
+      assert api_tokens_limit_exceeded?(account, 5) == false
+    end
+
+    test "returns false when api_tokens_per_client_count equals limit", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: 10}})
+
+      assert api_tokens_limit_exceeded?(account, 10) == false
+    end
+
+    test "returns true when api_tokens_per_client_count limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: 10}})
+
+      assert api_tokens_limit_exceeded?(account, 11) == true
+    end
+
+    test "returns false when api_tokens_per_client_count limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: nil}})
+
+      assert api_tokens_limit_exceeded?(account, 1000) == false
+    end
+  end
+
+  describe "can_create_api_tokens?/2" do
+    test "returns true when api_tokens limit is not exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: 5}})
+      api_client = api_client_fixture(account: account)
+
+      api_token_fixture(account: account, actor: api_client)
+      api_token_fixture(account: account, actor: api_client)
+
+      assert can_create_api_tokens?(account, api_client) == true
+    end
+
+    test "returns false when api_tokens limit is exceeded", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: 1}})
+      api_client = api_client_fixture(account: account)
+
+      api_token_fixture(account: account, actor: api_client)
+
+      assert can_create_api_tokens?(account, api_client) == false
+    end
+
+    test "returns false when account is disabled" do
+      account = disabled_account_fixture()
+      api_client = api_client_fixture(account: account)
+
+      assert can_create_api_tokens?(account, api_client) == false
+    end
+
+    test "returns true when api_tokens limit is not set", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: nil}})
+      api_client = api_client_fixture(account: account)
+
+      assert can_create_api_tokens?(account, api_client) == true
+    end
+
+    test "tokens are counted per API client, not globally", %{account: account} do
+      account = update_account(account, %{limits: %{api_tokens_per_client_count: 2}})
+
+      api_client1 = api_client_fixture(account: account)
+      api_client2 = api_client_fixture(account: account)
+
+      # Create 2 tokens for client1 (at limit)
+      api_token_fixture(account: account, actor: api_client1)
+      api_token_fixture(account: account, actor: api_client1)
+
+      # Client1 is at limit
+      assert can_create_api_tokens?(account, api_client1) == false
+
+      # Client2 can still create tokens
+      assert can_create_api_tokens?(account, api_client2) == true
+    end
+  end
+
+  describe "plan_type/1" do
+    test "recognizes the Business plan" do
+      assert plan_type("Business") == :business
+      assert plan_type(business_account_fixture()) == :business
+    end
+
+    test "treats Business as a paid plan" do
+      assert paid_plan?(business_account_fixture())
+    end
+  end
+
+  describe "seats_warning_level/2" do
+    defp business_with_seats(limit) do
+      update_account(business_account_fixture(), %{limits: %{monthly_active_users_count: limit}})
+    end
+
+    test "is :clear with more than 10% of seats remaining" do
+      assert seats_warning_level(business_with_seats(100), 89) == :clear
+    end
+
+    test "is :clear at exactly 10% remaining" do
+      assert seats_warning_level(business_with_seats(100), 90) == :clear
+    end
+
+    test "is :approaching with fewer than 10% of seats remaining" do
+      assert seats_warning_level(business_with_seats(100), 91) == :approaching
+      assert seats_warning_level(business_with_seats(100), 99) == :approaching
+    end
+
+    test "is :at_limit when every seat is used" do
+      assert seats_warning_level(business_with_seats(100), 100) == :at_limit
+    end
+
+    test "is :over when the limit is exceeded" do
+      assert seats_warning_level(business_with_seats(100), 101) == :over
+    end
+
+    test "is nil when there is no seat limit" do
+      assert seats_warning_level(business_with_seats(nil), 5) == nil
+    end
+
+    test "is nil for plans other than Business and Enterprise" do
+      account =
+        update_account(team_account_fixture(), %{limits: %{monthly_active_users_count: 10}})
+
+      assert seats_warning_level(account, 10) == nil
+    end
+
+    test "warns Enterprise accounts too" do
+      account =
+        update_account(account_fixture(), %{
+          metadata: %{stripe: %{product_name: "Enterprise"}},
+          limits: %{monthly_active_users_count: 10}
+        })
+
+      assert seats_warning_level(account, 10) == :at_limit
+    end
+  end
+
+  describe "connected_devices_limit_reached?/3" do
+    setup do
+      account = update_account(account_fixture(), %{limits: %{connected_devices_per_actor: 2}})
+      actor = actor_fixture(account: account, type: :account_user)
+      %{account: account, actor: actor}
+    end
+
+    defp connect_device(account, actor) do
+      device = client_fixture(account: account, actor: actor)
+      :ok = Portal.Presence.Devices.connect(device, Ecto.UUID.generate())
+      device
+    end
+
+    test "is false below the limit", %{account: account, actor: actor} do
+      connect_device(account, actor)
+
+      refute connected_devices_limit_reached?(account, actor.id, Ecto.UUID.generate())
+    end
+
+    test "is true at the limit", %{account: account, actor: actor} do
+      connect_device(account, actor)
+      connect_device(account, actor)
+
+      assert connected_devices_limit_reached?(account, actor.id, Ecto.UUID.generate())
+    end
+
+    test "never counts the device itself", %{account: account, actor: actor} do
+      connect_device(account, actor)
+      device = connect_device(account, actor)
+
+      refute connected_devices_limit_reached?(account, actor.id, device.id)
+    end
+
+    test "is always false when the limit is nil (unlimited)", %{account: account, actor: actor} do
+      account = update_account(account, %{limits: %{connected_devices_per_actor: nil}})
+      for _ <- 1..5, do: connect_device(account, actor)
+
+      refute connected_devices_limit_reached?(account, actor.id, Ecto.UUID.generate())
+    end
+  end
+
+  describe "client_seat_restricted?/2" do
+    defp business_account_with_seats(limit) do
+      update_account(business_account_fixture(), %{limits: %{monthly_active_users_count: limit}})
+    end
+
+    defp make_active(account, actor) do
+      client = client_fixture(account: account, actor: actor)
+      client_session_fixture(account: account, actor: actor, client: client)
+    end
+
+    test "does not restrict a new user while seats remain" do
+      account = business_account_with_seats(2)
+      make_active(account, actor_fixture(account: account))
+      new_actor = actor_fixture(account: account)
+
+      refute client_seat_restricted?(account, new_actor.id)
+    end
+
+    test "restricts a new user who would push past the limit" do
+      account = business_account_with_seats(2)
+      make_active(account, actor_fixture(account: account))
+      make_active(account, actor_fixture(account: account))
+      new_actor = actor_fixture(account: account)
+
+      assert client_seat_restricted?(account, new_actor.id)
+    end
+
+    test "does not restrict a new service account while adhoc service accounts remain" do
+      account =
+        update_account(business_account_fixture(), %{
+          limits: %{monthly_active_users_count: 1, adhoc_service_accounts_count: 1}
+        })
+
+      make_active(account, actor_fixture(account: account))
+      new_service_account = actor_fixture(account: account, type: :service_account)
+
+      refute client_seat_restricted?(account, new_service_account.id)
+    end
+
+    test "restricts a new service account when adhoc service accounts and seats are full" do
+      account =
+        update_account(business_account_fixture(), %{
+          limits: %{monthly_active_users_count: 1, adhoc_service_accounts_count: 1}
+        })
+
+      make_active(account, actor_fixture(account: account))
+      make_active(account, actor_fixture(account: account, type: :service_account))
+      new_service_account = actor_fixture(account: account, type: :service_account)
+
+      assert client_seat_restricted?(account, new_service_account.id)
+    end
+
+    test "never restricts an already active user, even when over the limit" do
+      account = business_account_with_seats(1)
+      active = actor_fixture(account: account)
+      make_active(account, active)
+      make_active(account, actor_fixture(account: account))
+
+      refute client_seat_restricted?(account, active.id)
+    end
+
+    test "service accounts take a seat" do
+      account = business_account_with_seats(1)
+      service_account = actor_fixture(account: account, type: :service_account)
+      make_active(account, service_account)
+
+      assert client_seat_restricted?(account, actor_fixture(account: account).id)
+      refute client_seat_restricted?(account, service_account.id)
+
+      assert seats_warning_level(account, 1) == :at_limit
+    end
+
+    test "does not restrict when there is no seat limit" do
+      account = business_account_with_seats(nil)
+      make_active(account, actor_fixture(account: account))
+
+      refute client_seat_restricted?(account, actor_fixture(account: account).id)
+    end
+
+    test "does not restrict other plans" do
+      account =
+        update_account(team_account_fixture(), %{limits: %{monthly_active_users_count: 0}})
+
+      refute client_seat_restricted?(account, actor_fixture(account: account).id)
+    end
+
+    test "seats_limit_exceeded alone does not block sign-in or connect" do
+      account = update_account(business_account_fixture(), %{seats_limit_exceeded: true})
+
+      refute client_sign_in_restricted?(account)
+      refute client_connect_restricted?(account)
+    end
+  end
+
+  describe "client_sign_in_restricted?/1" do
+    test "returns false when no limits are exceeded", %{account: account} do
+      refute client_sign_in_restricted?(account)
+    end
+
+    test "returns true when users_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{users_limit_exceeded: true})
+      assert client_sign_in_restricted?(account)
+    end
+
+    test "returns false when only seats_limit_exceeded is true", %{account: account} do
+      # seats_limit_exceeded no longer blocks sign-in, it only logs
+      account = update_account(account, %{seats_limit_exceeded: true})
+      refute client_sign_in_restricted?(account)
+    end
+
+    test "returns true when users_limit_exceeded is true even with seats_limit_exceeded", %{
+      account: account
+    } do
+      account = update_account(account, %{users_limit_exceeded: true, seats_limit_exceeded: true})
+      assert client_sign_in_restricted?(account)
+    end
+
+    test "returns false when only sites_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{sites_limit_exceeded: true})
+      refute client_sign_in_restricted?(account)
+    end
+
+    test "returns false when only service_accounts_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{service_accounts_limit_exceeded: true})
+      refute client_sign_in_restricted?(account)
+    end
+
+    test "returns false when only admins_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{admins_limit_exceeded: true})
+      refute client_sign_in_restricted?(account)
+    end
+  end
+
+  describe "client_connect_restricted?/1" do
+    test "returns false when no limits are exceeded", %{account: account} do
+      refute client_connect_restricted?(account)
+    end
+
+    test "returns true when users_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{users_limit_exceeded: true})
+      assert client_connect_restricted?(account)
+    end
+
+    test "returns false when only seats_limit_exceeded is true", %{account: account} do
+      # seats_limit_exceeded no longer blocks connections, it only logs
+      account = update_account(account, %{seats_limit_exceeded: true})
+      refute client_connect_restricted?(account)
+    end
+
+    test "returns true when service_accounts_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{service_accounts_limit_exceeded: true})
+      assert client_connect_restricted?(account)
+    end
+
+    test "returns false when only sites_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{sites_limit_exceeded: true})
+      refute client_connect_restricted?(account)
+    end
+
+    test "returns false when only admins_limit_exceeded is true", %{account: account} do
+      account = update_account(account, %{admins_limit_exceeded: true})
+      refute client_connect_restricted?(account)
+    end
+  end
+
+  describe "evaluate_account_limits/1" do
+    test "returns account unchanged when not provisioned", %{account: account} do
+      # Account without customer_id is not provisioned
+      account = update_account(account, %{metadata: %{stripe: %{}}})
+      assert {:ok, ^account} = Portal.Billing.evaluate_account_limits(account)
+    end
+  end
+
+  describe "create_customer/1" do
+    test "returns error when Stripe API returns 400 status", %{account: account} do
+      Stripe.stub([{"POST", "/v1/customers", 400, %{"error" => "Bad request"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.create_customer(account)
+    end
+
+    test "returns error when Stripe API returns 500 status", %{account: account} do
+      Stripe.stub([{"POST", "/v1/customers", 500, %{"error" => "Server error"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.create_customer(account)
+    end
+
+    test "uses billing_email from metadata when present", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{billing_email: "billing@example.com"}}
+        })
+
+      Stripe.stub(Stripe.mock_create_customer_endpoint(account))
+
+      assert {:ok, _updated} = Portal.Billing.create_customer(account)
+    end
+
+    test "sends nil email when no billing_email in metadata", %{account: account} do
+      # Account without billing_email in metadata
+      account = update_account(account, %{metadata: %{stripe: %{}}})
+
+      Stripe.stub(Stripe.mock_create_customer_endpoint(account))
+
+      assert {:ok, _updated} = Portal.Billing.create_customer(account)
+    end
+
+    test "handles account with nil stripe metadata", %{account: account} do
+      # Create a raw account struct with nil stripe metadata to test the edge case
+      # This tests the `_ -> %{}` branch in update_account_metadata_changeset
+      raw_account = %Portal.Account{
+        id: account.id,
+        name: account.name,
+        legal_name: account.legal_name,
+        slug: account.slug,
+        metadata: %Portal.Account.Metadata{stripe: nil}
+      }
+
+      Stripe.stub(Stripe.mock_create_customer_endpoint(account))
+
+      # This should still work even with nil stripe metadata
+      assert {:ok, _updated} = Portal.Billing.create_customer(raw_account)
+    end
+  end
+
+  describe "update_stripe_customer/1" do
+    test "returns error when Stripe API returns 400 status", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      Stripe.stub([{"POST", "/v1/customers/cus_test123", 400, %{"error" => "Bad request"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.update_stripe_customer(account)
+    end
+
+    test "returns error when Stripe API returns 500 status", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      Stripe.stub([{"POST", "/v1/customers/cus_test123", 500, %{"error" => "Server error"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.update_stripe_customer(account)
+    end
+  end
+
+  describe "fetch_customer_account_id/1" do
+    test "returns error when Stripe API returns 400 status" do
+      Stripe.stub([{"GET", "/v1/customers/cus_test123", 400, %{"error" => "Bad request"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.fetch_customer_account_id("cus_test123")
+    end
+
+    test "returns error when Stripe API returns 500 status" do
+      Stripe.stub([{"GET", "/v1/customers/cus_test123", 500, %{"error" => "Server error"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.fetch_customer_account_id("cus_test123")
+    end
+
+    test "returns error when customer has no account_id in metadata" do
+      customer =
+        Stripe.build_customer(
+          id: "cus_test123",
+          metadata: %{"other_key" => "other_value"}
+        )
+
+      Stripe.stub([{"GET", "/v1/customers/cus_test123", 200, customer}])
+
+      assert {:error, :customer_not_provisioned} =
+               Portal.Billing.fetch_customer_account_id("cus_test123")
+    end
+  end
+
+  describe "list_all_subscriptions/0" do
+    test "calls Stripe API to list subscriptions" do
+      subscriptions = %{
+        "object" => "list",
+        "has_more" => false,
+        "data" => [Stripe.subscription_object("cus_test123", %{}, %{}, 1)]
+      }
+
+      Stripe.stub([{"GET", ~r/\/v1\/subscriptions/, 200, subscriptions}])
+
+      assert {:ok, result} = Portal.Billing.list_all_subscriptions()
+      assert is_list(result)
+    end
+  end
+
+  describe "create_subscription/1" do
+    test "returns error when Stripe API returns 400 status", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      Stripe.stub([{"POST", "/v1/subscriptions", 400, %{"error" => "Bad request"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.create_subscription(account)
+    end
+
+    test "returns error when Stripe API returns 500 status", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      Stripe.stub([{"POST", "/v1/subscriptions", 500, %{"error" => "Server error"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.create_subscription(account)
+    end
+  end
+
+  describe "fetch_product/1" do
+    test "returns error when Stripe API returns 400 status" do
+      Stripe.stub([{"GET", "/v1/products/prod_test123", 400, %{"error" => "Bad request"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.fetch_product("prod_test123")
+    end
+
+    test "returns error when Stripe API returns 500 status" do
+      Stripe.stub([{"GET", "/v1/products/prod_test123", 500, %{"error" => "Server error"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.fetch_product("prod_test123")
+    end
+  end
+
+  describe "provision_account/1" do
+    test "only creates internet site when billing is disabled", %{account: account} do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+
+      # Account should not have internet site yet
+      assert {:error, :not_found} =
+               Portal.Billing.Database.fetch_internet_site(account)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      # Internet site and resource should be created
+      assert {:ok, _site} = Portal.Billing.Database.fetch_internet_site(account)
+      assert {:ok, _resource} = Portal.Billing.Database.fetch_internet_resource(account)
+    end
+
+    test "only creates internet site when account is already provisioned", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_already_provisioned"}}
+        })
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      # Internet site and resource should be created
+      assert {:ok, _site} = Portal.Billing.Database.fetch_internet_site(account)
+      assert {:ok, _resource} = Portal.Billing.Database.fetch_internet_resource(account)
+    end
+
+    test "creates internet site and resource when they don't exist", %{account: account} do
+      # Stub successful Stripe calls for the full provisioning flow
+      customer = Stripe.build_customer(id: "cus_new123", metadata: %{"account_id" => account.id})
+      subscription = Stripe.subscription_object("cus_new123", %{}, %{}, 1)
+
+      Stripe.stub([
+        {"POST", "/v1/customers", 200, customer},
+        {"POST", "/v1/subscriptions", 200, subscription}
+      ])
+
+      assert {:ok, _provisioned} = Portal.Billing.provision_account(account)
+
+      # Internet site and resource should be created
+      assert {:ok, _site} = Portal.Billing.Database.fetch_internet_site(account)
+      assert {:ok, _resource} = Portal.Billing.Database.fetch_internet_resource(account)
+    end
+
+    test "creates the My devices pool, the Account owner group and the policy", %{
+      account: account
+    } do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      admin = actor_fixture(account: account, type: :account_admin_user)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      pool = Portal.Repo.get_by!(Portal.Resource, account_id: account.id, type: :device_pool)
+      assert pool.name == "My devices"
+
+      assert pool.device_membership_criteria ==
+               Portal.Resource.DeviceMembershipCriteria.own_devices()
+
+      owner_group =
+        Portal.Repo.get_by!(Portal.Group, account_id: account.id, name: "Account owner")
+
+      assert owner_group.type == :static
+
+      policy = Portal.Repo.get_by!(Portal.Policy, account_id: account.id, resource_id: pool.id)
+      assert policy.group_id == owner_group.id
+
+      assert Portal.Repo.get_by!(Portal.Membership,
+               account_id: account.id,
+               group_id: owner_group.id,
+               actor_id: admin.id
+             )
+    end
+
+    test "puts the oldest admin in the Account owner group", %{account: account} do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      first = actor_fixture(account: account, type: :account_admin_user)
+      _second = actor_fixture(account: account, type: :account_admin_user)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      owner_group =
+        Portal.Repo.get_by!(Portal.Group, account_id: account.id, name: "Account owner")
+
+      assert [membership] =
+               Portal.Repo.all(
+                 from(m in Portal.Membership,
+                   where: m.account_id == ^account.id and m.group_id == ^owner_group.id
+                 )
+               )
+
+      assert membership.actor_id == first.id
+    end
+
+    test "leaves the defaults alone when they are already there", %{account: account} do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+      actor_fixture(account: account, type: :account_admin_user)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+      pool = Portal.Repo.get_by!(Portal.Resource, account_id: account.id, type: :device_pool)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      assert [^pool] =
+               Portal.Repo.all(
+                 from(r in Portal.Resource,
+                   where: r.account_id == ^account.id and r.type == :device_pool
+                 )
+               )
+
+      assert Portal.Repo.aggregate(
+               from(g in Portal.Group,
+                 where: g.account_id == ^account.id and g.name == "Account owner"
+               ),
+               :count
+             ) == 1
+    end
+
+    test "creates the group without a membership when the account has no admin", %{
+      account: account
+    } do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+
+      assert {:ok, ^account} = Portal.Billing.provision_account(account)
+
+      owner_group =
+        Portal.Repo.get_by!(Portal.Group, account_id: account.id, name: "Account owner")
+
+      assert Portal.Repo.aggregate(
+               from(m in Portal.Membership,
+                 where: m.account_id == ^account.id and m.group_id == ^owner_group.id
+               ),
+               :count
+             ) == 0
+    end
+
+    test "returns error when provisioning fails", %{account: account} do
+      Stripe.stub([{"POST", "/v1/customers", 500, %{"error" => "Server error"}}])
+
+      assert {:error, :retry_later} = Portal.Billing.provision_account(account)
+    end
+  end
+
+  describe "on_account_name_or_slug_changed/1" do
+    test "returns :ok when account is not provisioned", %{account: account} do
+      account = update_account(account, %{metadata: %{stripe: %{}}})
+      assert :ok = Portal.Billing.on_account_name_or_slug_changed(account)
+    end
+
+    test "returns :ok when billing is disabled", %{account: account} do
+      Portal.Config.put_env_override(Portal.Billing, enabled: false)
+
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      assert :ok = Portal.Billing.on_account_name_or_slug_changed(account)
+    end
+
+    test "updates Stripe customer when provisioned and enabled", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      Stripe.stub(Stripe.mock_update_customer_endpoint(account))
+
+      assert :ok = Portal.Billing.on_account_name_or_slug_changed(account)
+    end
+  end
+
+  describe "billing_portal_url/3" do
+    test "returns error when subject is not admin", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      actor = actor_fixture(type: :account_user, account: account)
+      subject = Portal.SubjectFixtures.subject_fixture(account: account, actor: actor)
+
+      assert {:error, :unauthorized} =
+               Portal.Billing.billing_portal_url(account, "https://example.com", subject)
+    end
+
+    test "returns error when subject is admin of different account", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      other_account = account_fixture()
+      actor = actor_fixture(type: :account_admin_user, account: other_account)
+      subject = Portal.SubjectFixtures.subject_fixture(account: other_account, actor: actor)
+
+      assert {:error, :unauthorized} =
+               Portal.Billing.billing_portal_url(account, "https://example.com", subject)
+    end
+
+    test "returns URL when subject is admin of same account", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      actor = actor_fixture(type: :account_admin_user, account: account)
+      subject = Portal.SubjectFixtures.subject_fixture(account: account, actor: actor)
+
+      Stripe.stub(Stripe.mock_create_billing_session_endpoint(account))
+
+      assert {:ok, url} =
+               Portal.Billing.billing_portal_url(account, "https://example.com", subject)
+
+      assert url =~ "billing.stripe.com"
+    end
+  end
+
+  describe "Database.count_users_for_account/1" do
+    test "counts enabled users and admin users", %{account: account} do
+      actor_fixture(type: :account_user, account: account)
+      actor_fixture(type: :account_user, account: account)
+      actor_fixture(type: :account_admin_user, account: account)
+
+      assert Portal.Billing.Database.count_users_for_account(account) == 3
+    end
+
+    test "excludes disabled users", %{account: account} do
+      actor_fixture(type: :account_user, account: account)
+      disabled_actor_fixture(type: :account_user, account: account)
+
+      assert Portal.Billing.Database.count_users_for_account(account) == 1
+    end
+
+    test "includes service accounts", %{account: account} do
+      actor_fixture(type: :account_user, account: account)
+      actor_fixture(type: :service_account, account: account)
+
+      assert Portal.Billing.Database.count_users_for_account(account) == 1
+    end
+
+    test "excludes api clients", %{account: account} do
+      actor_fixture(type: :account_user, account: account)
+      api_client_fixture(account: account)
+
+      assert Portal.Billing.Database.count_users_for_account(account) == 1
+    end
+
+    test "returns 0 for account with no users", %{account: account} do
+      assert Portal.Billing.Database.count_users_for_account(account) == 0
+    end
+  end
+
+  describe "Database.count_service_accounts_for_account/1" do
+    test "counts enabled service accounts", %{account: account} do
+      actor_fixture(type: :service_account, account: account)
+      actor_fixture(type: :service_account, account: account)
+
+      assert Portal.Billing.Database.count_service_accounts_for_account(account) == 2
+    end
+
+    test "excludes disabled service accounts", %{account: account} do
+      actor_fixture(type: :service_account, account: account)
+      disabled_actor_fixture(type: :service_account, account: account)
+
+      assert Portal.Billing.Database.count_service_accounts_for_account(account) == 1
+    end
+
+    test "excludes users and admin users", %{account: account} do
+      actor_fixture(type: :service_account, account: account)
+      actor_fixture(type: :account_user, account: account)
+      actor_fixture(type: :account_admin_user, account: account)
+
+      assert Portal.Billing.Database.count_service_accounts_for_account(account) == 1
+    end
+
+    test "returns 0 for account with no service accounts", %{account: account} do
+      assert Portal.Billing.Database.count_service_accounts_for_account(account) == 0
+    end
+  end
+
+  describe "Database.count_account_admin_users_for_account/1" do
+    test "counts enabled admin users", %{account: account} do
+      actor_fixture(type: :account_admin_user, account: account)
+      actor_fixture(type: :account_admin_user, account: account)
+
+      assert Portal.Billing.Database.count_account_admin_users_for_account(account) == 2
+    end
+
+    test "excludes disabled admin users", %{account: account} do
+      actor_fixture(type: :account_admin_user, account: account)
+      disabled_actor_fixture(type: :account_admin_user, account: account)
+
+      assert Portal.Billing.Database.count_account_admin_users_for_account(account) == 1
+    end
+
+    test "excludes regular users", %{account: account} do
+      actor_fixture(type: :account_admin_user, account: account)
+      actor_fixture(type: :account_user, account: account)
+
+      assert Portal.Billing.Database.count_account_admin_users_for_account(account) == 1
+    end
+
+    test "returns 0 for account with no admin users", %{account: account} do
+      assert Portal.Billing.Database.count_account_admin_users_for_account(account) == 0
+    end
+  end
+
+  describe "monthly_active_usage/1" do
+    test "splits active service accounts between ad hoc ones and seats", %{account: account} do
+      account = update_account(account, %{limits: %{adhoc_service_accounts_count: 2}})
+
+      for type <- [:account_user, :service_account, :service_account, :service_account] do
+        actor = actor_fixture(type: type, account: account)
+        client = client_fixture(account: account, actor: actor)
+        client_session_fixture(account: account, actor: actor, client: client)
+      end
+
+      assert Portal.Billing.monthly_active_usage(account) == %{seats: 2, adhoc_service_accounts: 2}
+    end
+
+    test "counts no ad hoc service accounts without the add-on", %{account: account} do
+      actor = actor_fixture(type: :service_account, account: account)
+      client = client_fixture(account: account, actor: actor)
+      client_session_fixture(account: account, actor: actor, client: client)
+
+      assert Portal.Billing.monthly_active_usage(account) == %{seats: 1, adhoc_service_accounts: 0}
+    end
+  end
+
+  describe "count_monthly_active_users/1" do
+    test "counts distinct active users within last month", %{account: account} do
+      actor1 = actor_fixture(type: :account_user, account: account)
+      actor2 = actor_fixture(type: :account_admin_user, account: account)
+
+      # Create clients with recent sessions
+      client1 = client_fixture(account: account, actor: actor1)
+      client2 = client_fixture(account: account, actor: actor2)
+      client_session_fixture(account: account, actor: actor1, client: client1)
+      client_session_fixture(account: account, actor: actor2, client: client2)
+
+      assert Portal.Billing.count_monthly_active_users(account) == 2
+    end
+
+    test "counts user only once even with multiple clients", %{account: account} do
+      actor = actor_fixture(type: :account_user, account: account)
+
+      # Same actor with multiple clients
+      client1 = client_fixture(account: account, actor: actor)
+      client2 = client_fixture(account: account, actor: actor)
+      client_session_fixture(account: account, actor: actor, client: client1)
+      client_session_fixture(account: account, actor: actor, client: client2)
+
+      assert Portal.Billing.count_monthly_active_users(account) == 1
+    end
+
+    test "excludes users not seen in last month", %{account: account} do
+      actor1 = actor_fixture(type: :account_user, account: account)
+      actor2 = actor_fixture(type: :account_user, account: account)
+
+      # Actor1 seen recently
+      client1 = client_fixture(account: account, actor: actor1)
+      client_session_fixture(account: account, actor: actor1, client: client1)
+
+      # Actor2 seen more than a month ago
+      client2 = client_fixture(account: account, actor: actor2)
+
+      session =
+        client_session_fixture(
+          account: account,
+          actor: actor2,
+          client: client2
+        )
+
+      # Backdate the session to more than a month ago
+      session
+      |> Ecto.Changeset.change(last_seen_at: DateTime.add(DateTime.utc_now(), -35, :day))
+      |> Repo.update!()
+
+      assert Portal.Billing.count_monthly_active_users(account) == 1
+    end
+
+    test "excludes disabled users", %{account: account} do
+      actor = actor_fixture(type: :account_user, account: account)
+      disabled_actor = disabled_actor_fixture(type: :account_user, account: account)
+
+      client1 = client_fixture(account: account, actor: actor)
+      client2 = client_fixture(account: account, actor: disabled_actor)
+      client_session_fixture(account: account, actor: actor, client: client1)
+      client_session_fixture(account: account, actor: disabled_actor, client: client2)
+
+      assert Portal.Billing.count_monthly_active_users(account) == 1
+    end
+
+    test "includes service accounts", %{account: account} do
+      user = actor_fixture(type: :account_user, account: account)
+      service_account = actor_fixture(type: :service_account, account: account)
+
+      client1 = client_fixture(account: account, actor: user)
+      client2 = client_fixture(account: account, actor: service_account)
+      client_session_fixture(account: account, actor: user, client: client1)
+      client_session_fixture(account: account, actor: service_account, client: client2)
+
+      # Service accounts take a seat too
+      assert Portal.Billing.count_monthly_active_users(account) == 2
+    end
+
+    test "returns 0 for account with no active users", %{account: account} do
+      assert Portal.Billing.count_monthly_active_users(account) == 0
+    end
+
+    test "service accounts take a seat only beyond adhoc_service_accounts_count", %{account: account} do
+      account = update_account(account, %{limits: %{adhoc_service_accounts_count: 1}})
+
+      for type <- [:account_user, :service_account, :service_account] do
+        actor = actor_fixture(type: type, account: account)
+        client = client_fixture(account: account, actor: actor)
+        client_session_fixture(account: account, actor: actor, client: client)
+      end
+
+      assert Portal.Billing.count_monthly_active_users(account) == 2
+    end
+
+    test "service accounts never take a seat with unlimited adhoc_service_accounts_count", %{
+      account: account
+    } do
+      account = update_account(account, %{limits: %{adhoc_service_accounts_count: nil}})
+
+      for type <- [:account_user, :service_account] do
+        actor = actor_fixture(type: type, account: account)
+        client = client_fixture(account: account, actor: actor)
+        client_session_fixture(account: account, actor: actor, client: client)
+      end
+
+      assert Portal.Billing.count_monthly_active_users(account) == 1
+    end
+  end
+
+  describe "Database.count_sites_for_account/1" do
+    test "counts account-managed sites", %{account: account} do
+      site_fixture(account: account, managed_by: :account)
+      site_fixture(account: account, managed_by: :account)
+
+      assert Portal.Billing.Database.count_sites_for_account(account) == 2
+    end
+
+    test "excludes system-managed sites", %{account: account} do
+      site_fixture(account: account, managed_by: :account)
+      site_fixture(account: account, managed_by: :system)
+
+      assert Portal.Billing.Database.count_sites_for_account(account) == 1
+    end
+
+    test "returns 0 for account with no sites", %{account: account} do
+      assert Portal.Billing.Database.count_sites_for_account(account) == 0
+    end
+  end
+
+  describe "Database.count_api_clients_for_account/1" do
+    test "counts enabled API clients", %{account: account} do
+      api_client_fixture(account: account)
+      api_client_fixture(account: account)
+
+      assert Portal.Billing.Database.count_api_clients_for_account(account) == 2
+    end
+
+    test "excludes disabled API clients", %{account: account} do
+      api_client_fixture(account: account)
+      disabled_actor_fixture(type: :api_client, account: account)
+
+      assert Portal.Billing.Database.count_api_clients_for_account(account) == 1
+    end
+
+    test "excludes users and service accounts", %{account: account} do
+      api_client_fixture(account: account)
+      actor_fixture(type: :account_user, account: account)
+      actor_fixture(type: :service_account, account: account)
+
+      assert Portal.Billing.Database.count_api_clients_for_account(account) == 1
+    end
+
+    test "returns 0 for account with no API clients", %{account: account} do
+      assert Portal.Billing.Database.count_api_clients_for_account(account) == 0
+    end
+  end
+
+  describe "Database.count_api_tokens_for_actor/1" do
+    test "counts tokens for the given actor", %{account: account} do
+      api_client = api_client_fixture(account: account)
+
+      api_token_fixture(account: account, actor: api_client)
+      api_token_fixture(account: account, actor: api_client)
+
+      assert Portal.Billing.Database.count_api_tokens_for_actor(api_client) == 2
+    end
+
+    test "does not count tokens from other actors", %{account: account} do
+      api_client1 = api_client_fixture(account: account)
+      api_client2 = api_client_fixture(account: account)
+
+      api_token_fixture(account: account, actor: api_client1)
+      api_token_fixture(account: account, actor: api_client2)
+      api_token_fixture(account: account, actor: api_client2)
+
+      assert Portal.Billing.Database.count_api_tokens_for_actor(api_client1) == 1
+      assert Portal.Billing.Database.count_api_tokens_for_actor(api_client2) == 2
+    end
+
+    test "returns 0 for actor with no tokens", %{account: account} do
+      api_client = api_client_fixture(account: account)
+
+      assert Portal.Billing.Database.count_api_tokens_for_actor(api_client) == 0
+    end
+  end
+
+  describe "handle_events/1" do
+    test "returns :ok when event is processed successfully", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      {product, _price, subscription} =
+        Stripe.build_all(:team, account.metadata.stripe.customer_id, 10)
+
+      customer =
+        Stripe.build_customer(
+          id: account.metadata.stripe.customer_id,
+          metadata: %{"account_id" => account.id}
+        )
+
+      event = Stripe.build_event("customer.subscription.updated", subscription)
+
+      Stripe.stub(
+        Stripe.fetch_customer_endpoint(customer) ++
+          Stripe.fetch_product_endpoint(product)
+      )
+
+      assert :ok = handle_events([event])
+    end
+
+    test "returns error when event processing fails", %{account: account} do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test123"}}
+        })
+
+      subscription =
+        Stripe.subscription_object(account.metadata.stripe.customer_id, %{}, %{}, 10)
+
+      customer =
+        Stripe.build_customer(
+          id: account.metadata.stripe.customer_id,
+          metadata: %{"account_id" => account.id}
+        )
+
+      event = Stripe.build_event("customer.subscription.updated", subscription)
+
+      # Only stub customer endpoint, NOT the product endpoint
+      # This will cause fetch_product to fail
+      Stripe.stub(Stripe.fetch_customer_endpoint(customer))
+
+      # Should return error instead of silently swallowing it
+      assert capture_log(fn ->
+               assert {:error, :retry_later} = handle_events([event])
+             end) =~ "Cannot fetch Stripe product"
+    end
+  end
+end

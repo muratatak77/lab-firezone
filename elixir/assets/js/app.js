@@ -1,0 +1,75 @@
+// Self-hosted variable fonts (avoids CSP issues with Google Fonts CDN)
+import "@fontsource-variable/roboto";
+import "@fontsource-variable/roboto-mono";
+
+// Include phoenix_html to handle method=PUT/DELETE in forms and buttons.
+import "phoenix_html";
+
+// Establish Phoenix Socket and LiveView configuration.
+import { Socket } from "phoenix";
+import { LiveSocket } from "phoenix_live_view";
+import topbar from "../vendor/topbar";
+import Hooks from "./hooks";
+import { DismissableBanner } from "./hooks/dismissable_banner";
+import { ThemeToggle } from "./hooks/theme";
+import { SidebarCollapse } from "./hooks/sidebar_collapse";
+import { DatetimeRangeFilter } from "./hooks/datetime_range_filter";
+import { PostureJsonEditor } from "./hooks/posture_json_editor";
+import { Turnstile } from "./hooks/turnstile";
+import {
+  PageSizePreference,
+  getPageSizePreference,
+} from "./hooks/page_size_preference";
+import "./event_listeners";
+
+Hooks.DismissableBanner = DismissableBanner;
+Hooks.ThemeToggle = ThemeToggle;
+Hooks.SidebarCollapse = SidebarCollapse;
+Hooks.DatetimeRangeFilter = DatetimeRangeFilter;
+Hooks.PostureJsonEditor = PostureJsonEditor;
+Hooks.Turnstile = Turnstile;
+Hooks.PageSizePreference = PageSizePreference;
+Hooks.SupportForm = {
+  mounted() {
+    this.el.addEventListener("click", () => {
+      this.pushEventTo(this.el, "open", { url: window.location.href });
+    });
+  },
+};
+
+// Read CSRF token from the meta tag and use it in the LiveSocket params
+let csrfToken = document
+  .querySelector("meta[name='csrf-token']")
+  .getAttribute("content");
+let pageSizePreference = getPageSizePreference();
+
+let liveSocket = new LiveSocket("/live", Socket, {
+  hooks: Hooks,
+  params: {
+    _csrf_token: csrfToken,
+    ...(pageSizePreference ? { page_size: pageSizePreference } : {}),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    locale: Intl.NumberFormat().resolvedOptions().locale,
+  },
+});
+
+// Show progress bar on live navigation and form submits
+topbar.config({ barColors: { 0: "#29d" }, shadowColor: "rgba(0, 0, 0, .3)" });
+window.addEventListener("phx:page-loading-start", (_info) => topbar.show(300));
+window.addEventListener("phx:page-loading-stop", (_info) => topbar.hide());
+
+// connect if there are any LiveViews on the page
+liveSocket.connect();
+
+// expose liveSocket on window for web console debug logs and latency simulation:
+// >> liveSocket.enableDebug()
+// >> liveSocket.enableLatencySim(1000)  // enabled for duration of browser session
+// >> liveSocket.disableLatencySim()
+window.liveSocket = liveSocket;
+
+window.addEventListener("phx:live_reload:attached", ({ detail: reloader }) => {
+  // Enable server log streaming to client.
+  // Disable with reloader.disableServerLogs()
+  reloader.enableServerLogs();
+  window.liveReloader = reloader;
+});

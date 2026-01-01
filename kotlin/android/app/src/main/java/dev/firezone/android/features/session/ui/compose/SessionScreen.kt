@@ -1,0 +1,217 @@
+// Licensed under Apache 2.0 (C) 2026 Firezone, Inc.
+package dev.firezone.android.features.session.ui.compose
+
+import android.os.Parcelable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LeadingIconTab
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import dev.firezone.android.R
+import dev.firezone.android.core.data.Favorites
+import dev.firezone.android.features.session.ui.ResourceUiModel
+import dev.firezone.android.features.session.ui.isDevicePool
+import dev.firezone.android.features.session.ui.isInternetResource
+import dev.firezone.android.ui.FirezoneIcons
+import kotlinx.collections.immutable.ImmutableList
+import kotlinx.parcelize.Parcelize
+
+private const val TAB_FAVORITES = 0
+private const val TAB_ALL = 1
+
+@Composable
+fun SessionScreen(
+    actorName: String?,
+    resources: ImmutableList<ResourceUiModel>,
+    favorites: Favorites,
+    onToggleInternet: () -> Unit,
+    onAddFavorite: (String) -> Unit,
+    onRemoveFavorite: (String) -> Unit,
+    onSettings: () -> Unit,
+    onEndSession: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val hasFavorites = favorites.inner.isNotEmpty()
+    var selectedTab by rememberSaveable { mutableIntStateOf(TAB_FAVORITES) }
+    // No favorites -> always show "All", and latch the selection there so that adding the
+    // first favorite doesn't unexpectedly switch the user onto the Favorites tab.
+    LaunchedEffect(hasFavorites) {
+        if (!hasFavorites) selectedTab = TAB_ALL
+    }
+    val effectiveTab = if (!hasFavorites) TAB_ALL else selectedTab
+
+    // The two tabs share one list, so without this the scroll state restores the previous tab's
+    // anchor (a row that sits lower in the other tab) and lands partway down. Reset to the top.
+    val listState = rememberLazyListState()
+    LaunchedEffect(effectiveTab) { listState.scrollToItem(0) }
+
+    val favoriteResources =
+        remember(resources, favorites) {
+            resources.filter { favorites.inner.contains(it.id) }
+        }
+    // The internet resource is pinned first in the flat list; everything else follows in order.
+    val allResources =
+        remember(resources) {
+            val internet = resources.firstOrNull { it.isInternetResource() }
+            listOfNotNull(internet) + resources.filter { !it.isInternetResource() }
+        }
+
+    var selection by rememberSaveable { mutableStateOf<Selection?>(null) }
+    val selectedResource =
+        remember(resources, selection) {
+            (selection as? Selection.Resource)?.let { sel -> resources.firstOrNull { it.id == sel.id } }
+        }
+    val selectedPool =
+        remember(resources, selection) {
+            selection?.poolId?.let { poolId -> resources.firstOrNull { it.id == poolId } }
+        }
+    val selectedDevice =
+        remember(selectedPool, selection) {
+            (selection as? Selection.Device)?.let { sel -> selectedPool?.devices?.firstOrNull { it.id == sel.id } }
+        }
+
+    val profileName = actorName ?: stringResource(R.string.signed_in)
+
+    when {
+        selectedPool != null && selectedDevice != null -> {
+            ConnectedDeviceScreen(
+                device = selectedDevice,
+                onBack = { selection = Selection.Pool(selectedPool.id) },
+                modifier = modifier,
+            )
+        }
+
+        selectedPool != null -> {
+            DevicePoolScreen(
+                pool = selectedPool,
+                onSelectDevice = { id -> selection = Selection.Device(selectedPool.id, id) },
+                onBack = { selection = null },
+                modifier = modifier,
+            )
+        }
+
+        else -> {
+            Scaffold(
+                modifier = modifier,
+                topBar = {
+                    FirezoneTopBar {
+                        ProfileMenu(
+                            actorName = profileName,
+                            onSettings = onSettings,
+                            onEndSession = onEndSession,
+                        )
+                    }
+                },
+            ) { innerPadding ->
+                // No top padding: the app bar centres its title in a 64dp box, so it already leaves space below it.
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .padding(start = 16.dp, top = 0.dp, end = 16.dp, bottom = 16.dp),
+                ) {
+                    SectionTitle(text = stringResource(R.string.resources))
+
+                    // The tab bar is the top-level switcher, pinned below the app bar so it stays visible and
+                    // accessible no matter how far the list is scrolled.
+                    if (hasFavorites) {
+                        // M3 labels tabs with `primary`, which the brand makes orange; only the indicator
+                        // under the selected tab should carry it.
+                        TabRow(
+                            selectedTabIndex = effectiveTab,
+                            contentColor = MaterialTheme.colorScheme.onSurface,
+                        ) {
+                            LeadingIconTab(
+                                selected = effectiveTab == TAB_FAVORITES,
+                                onClick = { selectedTab = TAB_FAVORITES },
+                                text = { Text(stringResource(R.string.resources_favorites)) },
+                                icon = { Icon(imageVector = FirezoneIcons.Star, contentDescription = null) },
+                            )
+                            LeadingIconTab(
+                                selected = effectiveTab == TAB_ALL,
+                                onClick = { selectedTab = TAB_ALL },
+                                text = { Text(stringResource(R.string.resources_all)) },
+                                icon = { Icon(imageVector = FirezoneIcons.GridView, contentDescription = null) },
+                            )
+                        }
+                    }
+
+                    val resourceList = if (hasFavorites && effectiveTab == TAB_FAVORITES) favoriteResources else allResources
+
+                    LazyColumn(state = listState, modifier = Modifier.weight(1f)) {
+                        itemsIndexed(resourceList, key = { _, resource -> resource.id }) { index, resource ->
+                            if (index > 0) HorizontalDivider()
+                            ResourceRow(
+                                resource = resource,
+                                onClick = {
+                                    selection =
+                                        if (resource.isDevicePool()) Selection.Pool(resource.id) else Selection.Resource(resource.id)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+
+            selectedResource?.let { resource ->
+                ResourceDetailsSheet(
+                    resource = resource,
+                    isFavorite = favorites.inner.contains(resource.id),
+                    onAddFavorite = { onAddFavorite(resource.id) },
+                    onRemoveFavorite = { onRemoveFavorite(resource.id) },
+                    onToggleInternet = onToggleInternet,
+                    onDismiss = { selection = null },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SectionTitle(
+    text: String,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.headlineSmall,
+        modifier = modifier.padding(bottom = 8.dp),
+    )
+}
+
+// A resource opens as a sheet over the list; a device pool, and a device within it, open as screens.
+private sealed interface Selection : Parcelable {
+    val poolId: String? get() = null
+
+    @Parcelize data class Resource(
+        val id: String,
+    ) : Selection
+
+    @Parcelize data class Pool(
+        override val poolId: String,
+    ) : Selection
+
+    @Parcelize data class Device(
+        override val poolId: String,
+        val id: String,
+    ) : Selection
+}

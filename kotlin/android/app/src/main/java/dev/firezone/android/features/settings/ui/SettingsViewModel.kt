@@ -1,0 +1,267 @@
+// Licensed under Apache 2.0 (C) 2024 Firezone, Inc.
+package dev.firezone.android.features.settings.ui
+
+import android.content.Context
+import android.content.Intent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.FileProvider
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.firezone.android.core.data.Repository
+import dev.firezone.android.core.data.model.Config
+import dev.firezone.android.core.data.model.ControlPlane
+import dev.firezone.android.core.data.model.ManagedConfigStatus
+import dev.firezone.android.core.data.model.SignInSettings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import uniffi.connlib.ConnlibException
+import uniffi.connlib.validateLogFilter
+import java.io.File
+import java.io.FileOutputStream
+import java.net.URI
+import java.net.URISyntaxException
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import javax.inject.Inject
+
+@HiltViewModel
+internal class SettingsViewModel
+    @Inject
+    constructor(
+        private val repo: Repository,
+    ) : ViewModel() {
+        private val _uiState = MutableStateFlow(UiState())
+        val uiState: StateFlow<UiState> = _uiState
+
+        var config by mutableStateOf(
+            Config(
+                authUrl = "",
+                apiUrl = "",
+                logFilter = "",
+                accountSlug = "",
+                startOnLogin = false,
+                connectOnStart = false,
+            ),
+        )
+            private set
+
+        // Kept apart from the URLs so that picking Custom does not snap back to a control plane whose URLs match.
+        var controlPlane by mutableStateOf(ControlPlane.CUSTOM)
+            private set
+
+        // `null` while signed out.
+        val signedInWith: SignInSettings? = repo.getActiveSignInSettingsSync()
+
+        private val _managedStatusStateFlow = MutableStateFlow<ManagedConfigStatus?>(null)
+        val managedStatusStateFlow: StateFlow<ManagedConfigStatus?> = _managedStatusStateFlow
+
+        fun populateFieldsFromConfig() {
+            viewModelScope.launch {
+                repo.getConfig().collect {
+                    config = it
+                    _managedStatusStateFlow.value = repo.getManagedStatus()
+                    controlPlane = detectControlPlane(it)
+                }
+            }
+        }
+
+        fun onViewResume(context: Context) {
+            val directory = File(context.cacheDir.absolutePath + "/logs")
+            viewModelScope.launch(Dispatchers.IO) {
+                val totalSize =
+                    directory
+                        .walkTopDown()
+                        .filter { it.isFile }
+                        .map { it.length() }
+                        .sum()
+
+                _uiState.value =
+                    _uiState.value.copy(
+                        logSizeBytes = totalSize,
+                    )
+            }
+        }
+
+        fun onControlPlaneChanged(newControlPlane: ControlPlane) {
+            val previousControlPlane = controlPlane
+            val managedStatus = repo.getManagedStatus()
+            if (previousControlPlane == ControlPlane.CUSTOM && !managedStatus.isAuthUrlManaged && !managedStatus.isApiUrlManaged) {
+                repo.saveLastCustomUrlsSync(config.authUrl, config.apiUrl)
+            }
+            controlPlane = newControlPlane
+
+            if (newControlPlane.authUrl != null && newControlPlane.apiUrl != null) {
+                persist(config.copy(authUrl = newControlPlane.authUrl, apiUrl = newControlPlane.apiUrl))
+            } else if (previousControlPlane != ControlPlane.CUSTOM) {
+                // Without any custom URLs saved yet, Custom starts from the cloud control plane's.
+                val (authUrl, apiUrl) = repo.getLastCustomUrlsSync() ?: (config.authUrl to config.apiUrl)
+                persist(config.copy(authUrl = authUrl, apiUrl = apiUrl))
+            }
+        }
+
+        fun onAuthUrlChanged(authUrl: String) = persist(config.copy(authUrl = authUrl))
+
+        fun onApiUrlChanged(apiUrl: String) = persist(config.copy(apiUrl = apiUrl))
+
+        fun onLogFilterChanged(logFilter: String) = persist(config.copy(logFilter = logFilter))
+
+        fun onAccountSlugChanged(accountSlug: String) = persist(config.copy(accountSlug = accountSlug))
+
+        fun onStartOnLoginChanged(isChecked: Boolean) = persist(config.copy(startOnLogin = isChecked))
+
+        fun onConnectOnStartChanged(isChecked: Boolean) = persist(config.copy(connectOnStart = isChecked))
+
+        fun deleteLogDirectory(context: Context) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val logDir = context.cacheDir.absolutePath + "/logs"
+                val directory = File(logDir)
+                directory.walkTopDown().forEach { file ->
+                    file.delete()
+                }
+                _uiState.value =
+                    _uiState.value.copy(
+                        logSizeBytes = 0,
+                    )
+            }
+        }
+
+        fun createLogZip(context: Context) {
+            viewModelScope.launch {
+                val logDir = context.cacheDir.absolutePath + "/logs"
+                val sourceFolder = File(logDir)
+                val zipFile = File(getLogZipPath(context))
+
+                zipFolder(sourceFolder, zipFile).collect()
+
+                val sendIntent =
+                    Intent(Intent.ACTION_SEND).apply {
+                        putExtra(
+                            Intent.EXTRA_SUBJECT,
+                            "Sharing diagnostic logs",
+                        )
+
+                        // Add additional details to the share intent, for ex: email body.
+                        // putExtra(
+                        //    Intent.EXTRA_TEXT,
+                        //    "Sharing diagnostic logs for $input"
+                        // )
+
+                        val fileURI =
+                            FileProvider.getUriForFile(
+                                context,
+                                "${context.applicationContext.packageName}.provider",
+                                zipFile,
+                            )
+                        putExtra(Intent.EXTRA_STREAM, fileURI)
+
+                        flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        data = fileURI
+                    }
+                val shareIntent = Intent.createChooser(sendIntent, null)
+                context.startActivity(shareIntent)
+            }
+        }
+
+        fun resetSettingsToDefaults() {
+            // The log filter lives on the diagnostics page, so this page's reset leaves it alone.
+            val defaults = repo.getDefaultConfigSync().copy(logFilter = config.logFilter)
+            _managedStatusStateFlow.value = repo.getManagedStatus()
+            controlPlane = detectControlPlane(defaults)
+            persist(defaults)
+            repo.resetFavorites()
+        }
+
+        fun deleteLogZip(context: Context) {
+            val zipFile = File(getLogZipPath(context))
+            if (zipFile.exists()) {
+                zipFile.delete()
+            }
+        }
+
+        private suspend fun zipFolder(
+            sourceFolder: File,
+            zipFile: File,
+        ) = flow {
+            ZipOutputStream(FileOutputStream(zipFile)).use { zipStream ->
+                sourceFolder.walkTopDown().filter { it != sourceFolder }.forEach { file ->
+                    val entryName = sourceFolder.toPath().relativize(file.toPath()).toString()
+                    if (file.isDirectory) {
+                        zipStream.putNextEntry(ZipEntry("$entryName/"))
+                        zipStream.closeEntry()
+                    } else {
+                        zipStream.putNextEntry(ZipEntry(entryName))
+                        file.inputStream().use { input ->
+                            input.copyTo(zipStream)
+                        }
+                        zipStream.closeEntry()
+                    }
+                    emit(Result.success(zipFile))
+                }
+            }
+        }.catch { e ->
+            emit(Result.failure(e))
+        }.flowOn(Dispatchers.IO)
+
+        // With only one of the URLs managed, Custom keeps the other one editable.
+        private fun detectControlPlane(config: Config): ControlPlane {
+            val managedStatus = repo.getManagedStatus()
+            if (managedStatus.isAuthUrlManaged != managedStatus.isApiUrlManaged) {
+                return ControlPlane.CUSTOM
+            }
+
+            return ControlPlane.of(config.authUrl, config.apiUrl)
+        }
+
+        private fun getLogZipPath(context: Context) = "${context.cacheDir.absolutePath}/logs.zip"
+
+        private fun persist(newConfig: Config) {
+            config = newConfig
+
+            // Only URLs the user typed are worth offering again; managed ones come back by themselves.
+            val managedStatus = repo.getManagedStatus()
+            if (controlPlane == ControlPlane.CUSTOM && !managedStatus.isAuthUrlManaged && !managedStatus.isApiUrlManaged) {
+                repo.saveLastCustomUrlsSync(newConfig.authUrl, newConfig.apiUrl)
+            }
+
+            repo.saveSettingsSync(newConfig)
+        }
+
+        internal data class UiState(
+            val logSizeBytes: Long = 0,
+        )
+    }
+
+// Returns why connlib would reject `logFilter`, or `null` if it accepts it.
+internal fun logFilterError(logFilter: String): String? =
+    try {
+        validateLogFilter(logFilter)
+        null
+    } catch (e: ConnlibException) {
+        e.use { it.message() }
+    }
+
+internal fun isValidAuthUrl(url: String): Boolean = isValidUrl(url, "http", "https")
+
+internal fun isValidApiUrl(url: String): Boolean = isValidUrl(url, "ws", "wss")
+
+private fun isValidUrl(
+    url: String,
+    vararg schemes: String,
+): Boolean {
+    val uri =
+        try {
+            URI(url)
+        } catch (e: URISyntaxException) {
+            return false
+        }
+    return uri.host != null && uri.scheme in schemes
+}

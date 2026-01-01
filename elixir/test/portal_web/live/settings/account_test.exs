@@ -1,0 +1,1042 @@
+defmodule PortalWeb.Settings.AccountTest do
+  use PortalWeb.ConnCase, async: true
+
+  alias Portal.Accounts.Deletion
+  alias Portal.Workers.DeleteAccount
+
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.ClientSessionFixtures
+  import Portal.DeviceFixtures
+  import Portal.ObanJobFixtures
+  import Portal.OutboundEmailTestHelpers
+  import Portal.SubjectFixtures
+
+  setup do
+    account = account_fixture(features: %{slug_changes: true})
+    actor = admin_actor_fixture(account: account)
+    %{account: account, actor: actor}
+  end
+
+  describe "unauthorized" do
+    test "redirects to sign-in when not authenticated", %{conn: conn, account: account} do
+      path = ~p"/#{account}/settings/account"
+
+      assert live(conn, path) ==
+               {:error,
+                {:redirect,
+                 %{
+                   to: ~p"/#{account}/sign_in?#{%{redirect_to: path}}",
+                   flash: %{"error" => "You must sign in to access that page."}
+                 }}}
+    end
+  end
+
+  describe "usage" do
+    test "counts usage only after the socket connects", %{conn: conn, account: account, actor: actor} do
+      conn = authorize_conn(conn, actor)
+
+      static = conn |> get(~p"/#{account}/settings/account") |> html_response(200)
+      assert static =~ ~s(id="usage-skeleton")
+      refute static =~ ~s(id="usage")
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/settings/account")
+      assert has_element?(lv, "#usage", "Admins")
+      refute has_element?(lv, "#usage-skeleton")
+    end
+  end
+
+  describe "limits banner" do
+    for {flags, message} <- [
+          {%{users_limit_exceeded: true}, "users."},
+          {%{users_limit_exceeded: true, seats_limit_exceeded: true},
+           "users, monthly active users."}
+        ] do
+      test "renders a complete warning for #{message}", %{
+        conn: conn,
+        account: account,
+        actor: actor
+      } do
+        account =
+          update_account(
+            account,
+            Map.put(unquote(Macro.escape(flags)), :metadata, %{
+              stripe: %{customer_id: "cus_test", product_name: "Enterprise"}
+            })
+          )
+
+        {:ok, _lv, html} =
+          conn
+          |> authorize_conn(actor)
+          |> live(~p"/#{account}/settings/account")
+
+        alerts = html |> Floki.parse_document!() |> Floki.find("[role=alert]")
+        text = alerts |> Floki.text() |> String.replace(~r/\s+/, " ")
+
+        assert text =~ "Your account has exceeded the following limits: #{unquote(message)}"
+        assert text =~ "Please check your billing information to continue using Firezone."
+
+        assert Floki.find(alerts, "a[href='/#{account.slug}/settings/account']") != []
+      end
+    end
+
+    test "does not show a warning when no limits are exceeded", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute html =~ "Your account has exceeded the following limits:"
+      refute html =~ "check your billing information"
+    end
+  end
+
+  describe "billing plan UI" do
+    test "shows manage plan button for non-enterprise provisioned account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test", product_name: "Team"}}
+        })
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ "Manage plan"
+      refute html =~ "Contact your account manager for plan changes."
+    end
+
+    test "shows contact message instead of manage plan button for enterprise provisioned account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{customer_id: "cus_test", product_name: "Enterprise"}}
+        })
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute html =~ "Manage plan"
+      assert html =~ "Contact your account manager for plan changes."
+    end
+
+    test "shows neither manage plan button nor contact message for unprovisioned account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute html =~ "Manage plan"
+      refute html =~ "Contact your account manager for plan changes."
+    end
+  end
+
+  describe "index (default action)" do
+    test "renders account settings page with account slug", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ account.slug
+    end
+
+    test "renders plan features section", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ "Plan Features"
+      assert html =~ "Device Posture"
+      refute html =~ "ICE-less"
+    end
+
+    test "hides data residency on on-prem portals", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute has_element?(lv, "#data-residency")
+    end
+
+    test "shows where the US region stores account data", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      Portal.Config.put_env_override(:data_residency_region, :us)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert has_element?(lv, "#data-residency", "Cloud region: United States")
+      assert has_element?(lv, "#data-residency", "Iowa, United States")
+      assert has_element?(lv, "#data-residency", "Arizona, United States")
+
+      assert has_element?(
+               lv,
+               "#data-residency a[href='https://www.firezone.dev/kb/architecture/regional-availability']"
+             )
+
+      refute has_element?(lv, "#data-residency", "closed beta")
+    end
+
+    test "shows where the EU region stores account data", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      Portal.Config.put_env_override(:data_residency_region, :eu)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert has_element?(lv, "#data-residency", "Cloud region: European Union")
+      assert has_element?(lv, "#data-residency", "Gävle, Sweden")
+      assert has_element?(lv, "#data-residency", "Paris, France")
+    end
+
+    test "hides and ignores the transfer request on on-prem portals", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute has_element?(lv, "#request-region-transfer")
+
+      html = render_click(lv, "open_region_transfer")
+      refute html =~ "region-transfer-modal"
+
+      html = render_click(lv, "request_region_transfer")
+      refute html =~ "Request sent"
+      refute_receive {:email, _email}
+    end
+
+    test "sends a region transfer request to support", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      Portal.Config.put_env_override(:data_residency_region, :us)
+      account = update_account(account, metadata: %{stripe: %{product_name: "Team"}})
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html =
+        lv
+        |> element("#request-region-transfer", "Request transfer to the European Union region")
+        |> render_click()
+
+      assert html =~ "Transfer your account to the European Union region?"
+      assert html =~ "maintenance window of up to 8 hours"
+      assert html =~ "every session, Gateway token, service account token, and"
+      assert html =~ "macOS and iOS 1.5.24, Android 1.5.18"
+      assert html =~ "https://eu.app.firezone.dev"
+      assert html =~ "wss://eu.api.firezone.dev"
+      assert html =~ "headless Clients need new service"
+      assert html =~ "reconnect your MCP clients"
+      assert html =~ "Logs are not moved."
+      assert html =~ "bill in EUR from then on"
+      assert html =~ actor.email
+
+      html = render_click(lv, "request_region_transfer")
+
+      assert html =~ "Request sent. Firezone support will contact you at #{actor.email}"
+      refute html =~ "region-transfer-modal"
+
+      assert_receive {:email, email}
+      assert email.to == [{"", "support@firezone.dev"}]
+      assert email.subject == "Region transfer request: #{account.name}"
+      assert email.reply_to == {actor.name, actor.email}
+      assert email.text_body =~ "Account: #{account.name} (#{account.id})"
+      assert email.text_body =~ "From region: United States"
+      assert email.text_body =~ "To region: European Union"
+      refute email.text_body =~ "Client notes for the customer"
+      refute email.text_body =~ "Clients at macOS"
+      refute email.text_body =~ "Older Clients"
+    end
+
+    test "renders usage section", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ "Usage"
+      refute html =~ "Ad hoc Service Accounts"
+    end
+
+    test "hides seats when the plan has no active seat limit", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account = update_account(account, %{limits: %{monthly_active_users_count: nil}})
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      refute html =~ "Seats"
+      refute html =~ "Monthly Active Users"
+    end
+
+    test "renders seats when the plan has an active seat limit", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account = update_account(account, %{limits: %{monthly_active_users_count: 25}})
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ "Seats"
+      assert html =~ "0 / 25"
+    end
+
+    test "renders add-ons and ad hoc service account usage", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account =
+        update_account(account, %{
+          limits: %{monthly_active_users_count: 100, adhoc_service_accounts_count: 10_000},
+          metadata: %{
+            stripe: %{
+              customer_id: "cus_test",
+              product_name: "Enterprise",
+              add_ons: [
+                %{
+                  name: "Ad hoc service account + device",
+                  quantity: 10_000,
+                  limit: "adhoc_service_accounts_count"
+                }
+              ]
+            }
+          }
+        })
+
+      service_account = actor_fixture(type: :service_account, account: account)
+      client = client_fixture(account: account, actor: service_account)
+      client_session_fixture(account: account, actor: service_account, client: client)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ "Add-ons"
+      assert html =~ "Ad hoc service account + device"
+      assert html =~ "× 10000"
+      assert html =~ "Ad hoc Service Accounts"
+      assert html =~ "1 / 10000"
+      assert html =~ "Seats"
+      assert html =~ "0 / 100"
+    end
+  end
+
+  describe "edit account name" do
+    test "renders account name on the settings page", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      assert html =~ account.name
+    end
+
+    test "can open the edit account panel", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html = render_click(lv, "open_edit_account")
+      assert html =~ "Edit Account"
+    end
+
+    test "validates name length", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "open_edit_account")
+
+      html =
+        lv
+        |> form("form[phx-submit='submit_account']", %{account: %{name: "ab"}})
+        |> render_change()
+
+      assert html =~ "too short"
+    end
+
+    test "saves updated account name", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "open_edit_account")
+
+      new_name = "Updated Account Name"
+
+      lv
+      |> form("form[phx-submit='submit_account']", %{account: %{name: new_name}})
+      |> render_submit()
+
+      html = render(lv)
+      assert html =~ new_name
+      # Panel slides back off-screen after save (translate-x-full = hidden)
+      assert html =~ "translate-x-full"
+    end
+  end
+
+  describe "edit account slug" do
+    test "shows the slug read-only without the slug_changes feature", %{conn: conn} do
+      account = account_fixture(features: %{slug_changes: false})
+      actor = admin_actor_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html = render_click(lv, "open_edit_account")
+
+      assert html =~ "Slug changes are available on the Team plan and higher."
+      refute html =~ "Old slugs keep working"
+      refute html =~ ~s(<input type="text" name="account[slug]")
+
+      html = render_submit(lv, "submit_account", %{"account" => %{"slug" => "new-slug"}})
+
+      assert html =~ "cannot be changed on your current plan"
+      assert fetch_account!(account.id).slug == account.slug
+    end
+
+    test "explains how slug changes work", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html = render_click(lv, "open_edit_account")
+
+      assert html =~ "Account Slug"
+      assert html =~ "Old slugs keep working"
+      assert html =~ "up to 3 new slugs every 30 days"
+      assert html =~ account.id
+      assert html =~ "3 left."
+    end
+
+    test "saves a new slug and moves to the new URL", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      old_slug = account.slug
+      conn = authorize_conn(conn, actor)
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/settings/account")
+      render_click(lv, "open_edit_account")
+
+      assert {:error, {:live_redirect, %{to: to}}} =
+               lv
+               |> form("form[phx-submit='submit_account']", %{account: %{slug: " New_Slug_1 "}})
+               |> render_submit()
+
+      assert to == "/new_slug_1/settings/account"
+      assert fetch_account!(account.id).slug == "new_slug_1"
+
+      assert conn |> get("/#{old_slug}/settings/account") |> redirected_to() ==
+               "/new_slug_1/settings/account"
+
+      {:ok, _lv, html} = live(conn, to)
+      assert html =~ "new_slug_1"
+    end
+
+    test "validates the slug format", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "open_edit_account")
+
+      for {slug, message} <- [
+            {"ab", "should be at least 3 character(s)"},
+            {"bad slug", "may only contain lowercase letters"},
+            {"bad-slug", "may only contain lowercase letters"},
+            {"sign_in", "is reserved"},
+            {"images", "is reserved"},
+            {"eu", "is reserved"},
+            {"firezone", "is reserved"},
+            {Ecto.UUID.generate(), "may not look like an account ID"},
+            {"", "can&#39;t be blank"}
+          ] do
+        html =
+          lv
+          |> form("form[phx-submit='submit_account']", %{account: %{slug: slug}})
+          |> render_change()
+
+        assert html =~ message, "expected #{inspect(slug)} to fail with #{message}"
+      end
+    end
+
+    test "rejects a slug another account used before", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      other = account_fixture()
+      taken_slug = other.slug
+      update_account(other, slug: "#{taken_slug}_moved")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "open_edit_account")
+
+      html =
+        lv
+        |> form("form[phx-submit='submit_account']", %{account: %{slug: taken_slug}})
+        |> render_submit()
+
+      assert html =~ "has already been taken"
+      assert fetch_account!(account.id).slug == account.slug
+    end
+
+    test "rechecks the history at submit time", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "open_edit_account")
+
+      Enum.each(1..3, fn n -> update_account(account, slug: "#{account.slug}_v#{n}") end)
+
+      html =
+        lv
+        |> form("form[phx-submit='submit_account']", %{account: %{slug: "#{account.slug}_v4"}})
+        |> render_submit()
+
+      assert html =~ "can be changed at most 3 times every 30 days"
+      assert fetch_account!(account.id).slug == "#{account.slug}_v3"
+    end
+
+    test "allows three new slugs per 30 days and then stops", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      first_slug = account.slug
+      conn = authorize_conn(conn, actor)
+
+      account =
+        Enum.reduce(1..3, account, fn n, account ->
+          {:ok, lv, _html} = live(conn, ~p"/#{account}/settings/account")
+          render_click(lv, "open_edit_account")
+
+          assert {:error, {:live_redirect, _}} =
+                   lv
+                   |> form("form[phx-submit='submit_account']", %{
+                     account: %{slug: "#{first_slug}_v#{n}"}
+                   })
+                   |> render_submit()
+
+          fetch_account!(account.id)
+        end)
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/settings/account")
+      html = render_click(lv, "open_edit_account")
+      assert html =~ "None left right now."
+
+      html =
+        lv
+        |> form("form[phx-submit='submit_account']", %{account: %{slug: "#{first_slug}_v4"}})
+        |> render_submit()
+
+      assert html =~ "can be changed at most 3 times every 30 days"
+      assert fetch_account!(account.id).slug == "#{first_slug}_v3"
+
+      assert {:error, {:live_redirect, %{to: to}}} =
+               lv
+               |> form("form[phx-submit='submit_account']", %{account: %{slug: first_slug}})
+               |> render_submit()
+
+      assert to == "/#{first_slug}/settings/account"
+    end
+
+    test "ignores slug changes older than 30 days", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      first_slug = account.slug
+      long_ago = DateTime.add(DateTime.utc_now(), -31, :day)
+
+      Portal.Repo.update_all(Portal.AccountSlug,
+        set: [inserted_at: DateTime.add(long_ago, -1, :day)]
+      )
+
+      for n <- 1..3 do
+        Portal.Repo.insert!(%Portal.AccountSlug{
+          account_id: account.id,
+          slug: "#{first_slug}_old#{n}",
+          inserted_at: long_ago
+        })
+      end
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html = render_click(lv, "open_edit_account")
+      assert html =~ "3 left."
+    end
+
+    test "refuses to change the slug of a locked account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      account =
+        account
+        |> Ecto.Changeset.change(lock_enabled_at: DateTime.utc_now())
+        |> Portal.Repo.update!()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "open_edit_account")
+
+      html =
+        lv
+        |> form("form[phx-submit='submit_account']", %{account: %{slug: "#{account.slug}_v2"}})
+        |> render_submit()
+
+      assert html =~ "cannot be changed while the account is locked"
+      assert fetch_account!(account.id).slug == account.slug
+    end
+  end
+
+  describe "delete account" do
+    setup do
+      Portal.Config.put_env_override(:portal, Portal.Mailer.InternalEmail, recipient: "feedback@example.com")
+      :ok
+    end
+
+    test "shows confirm delete dialog on click", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html = render_click(lv, "confirm_delete_account")
+      assert html =~ "Delete this account?"
+      assert html =~ account.slug
+    end
+
+    test "can cancel delete confirmation", %{conn: conn, account: account, actor: actor} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      html = render_click(lv, "cancel_delete_account")
+
+      refute html =~ "Delete this account?"
+      assert html =~ "Delete account"
+    end
+
+    test "schedules account for deletion when slug matches", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      admin_2 = admin_actor_fixture(account: account)
+      _disabled_admin = disabled_actor_fixture(account: account, type: :account_admin_user)
+      _account_user = actor_fixture(account: account, type: :account_user)
+      _other_admin = admin_actor_fixture()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      html =
+        lv
+        |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+        |> render_submit()
+
+      account = fetch_account!(account.id)
+
+      assert html =~ "Cancel deletion"
+      assert account.is_disabled
+      assert account.scheduled_deletion_at
+
+      queued_emails = collect_queued_emails(account.id)
+      assert length(queued_emails) == 1
+
+      [email] = queued_emails
+
+      recipients =
+        email.bcc
+        |> Enum.map(fn {_name, address} -> address end)
+
+      assert actor.email in recipients
+      assert admin_2.email in recipients
+      assert length(recipients) == 2
+      assert email.subject == "Firezone Account Scheduled for Deletion"
+      assert email.text_body =~ Calendar.strftime(account.scheduled_deletion_at, "%B %-d, %Y")
+    end
+
+    test "prompts for feedback after scheduling deletion", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      html =
+        lv
+        |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+        |> render_submit()
+
+      assert html =~ "Sorry Firezone didn&#39;t work out"
+      assert html =~ "Anything you&#39;d like to share about your experience?"
+
+      html =
+        lv
+        |> form("#deletion-feedback-form", %{
+          deletion_feedback: %{feedback: "  Too hard to set up  "}
+        })
+        |> render_submit()
+
+      refute html =~ "Sorry Firezone didn&#39;t work out"
+      assert [email] = feedback_emails(account.id)
+      assert email.text_body =~ "Too hard to set up"
+    end
+
+    test "skipping the feedback prompt sends nothing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      lv
+      |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+      |> render_submit()
+
+      html = render_click(lv, "skip_deletion_feedback")
+
+      refute html =~ "Sorry Firezone didn&#39;t work out"
+      assert [] == feedback_emails(account.id)
+    end
+
+    test "submitting empty feedback closes the prompt without sending", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      render_click(lv, "confirm_delete_account")
+      render_click(lv, "update_slug_confirmation", %{"slug_confirmation" => account.slug})
+
+      lv
+      |> form("form[phx-submit='delete_account']", %{slug_confirmation: account.slug})
+      |> render_submit()
+
+      html =
+        lv
+        |> form("#deletion-feedback-form", %{
+          deletion_feedback: %{feedback: "   "}
+        })
+        |> render_submit()
+
+      refute html =~ "Sorry Firezone didn&#39;t work out"
+      assert [] == feedback_emails(account.id)
+    end
+
+    test "sends aborted deletion email when cancellation restores the account", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      scheduled_deletion_at = DateTime.utc_now() |> DateTime.add(7, :day) |> DateTime.truncate(:second)
+
+      account =
+        update_account(account,
+          is_disabled: true,
+          scheduled_deletion_at: scheduled_deletion_at
+        )
+
+      assert {:ok, _job} =
+               Oban.insert(
+                 DeleteAccount.new(%{"account_id" => account.id}, scheduled_at: scheduled_deletion_at)
+               )
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/account")
+
+      html = render_click(lv, "cancel_account_deletion")
+
+      account = fetch_account!(account.id)
+      [scheduled_job] =
+        jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id)
+
+      refute account.is_disabled
+      refute account.scheduled_deletion_at
+      refute html =~ "scheduled for deletion"
+      assert scheduled_job.state == "cancelled"
+
+      queued_emails = collect_queued_emails(account.id)
+      assert length(queued_emails) == 1
+
+      [email] = queued_emails
+      assert email.subject == "Firezone Account Deletion Aborted"
+      assert email.text_body =~ "has been canceled"
+      assert email.text_body =~ account.slug
+    end
+
+    test "scheduling is idempotent and only queues one email", %{account: account, actor: actor} do
+      subject = subject_fixture(account: account, actor: actor)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
+
+      attrs = %{
+        is_disabled: true,
+        scheduled_deletion_at: scheduled_deletion_at
+      }
+
+      assert {:ok, first_account} =
+               Deletion.schedule_account_deletion(account, attrs, subject)
+
+      assert {:ok, second_account} =
+               Deletion.schedule_account_deletion(
+                 account,
+                 %{
+                   is_disabled: true,
+                   scheduled_deletion_at: DateTime.add(scheduled_deletion_at, 1, :day)
+                 },
+                 subject
+               )
+
+      assert DateTime.compare(first_account.scheduled_deletion_at, scheduled_deletion_at) == :eq
+      assert DateTime.compare(second_account.scheduled_deletion_at, scheduled_deletion_at) == :eq
+      assert length(collect_queued_emails(account.id)) == 1
+    end
+
+    test "scheduling requires account update permission", %{account: account} do
+      actor = actor_fixture(account: account, type: :account_user)
+      subject = subject_fixture(account: account, actor: actor)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      attrs = %{
+        is_disabled: true,
+        scheduled_deletion_at: DateTime.add(now, 7, :day)
+      }
+
+      assert {:error, :unauthorized} =
+               Deletion.schedule_account_deletion(account, attrs, subject)
+
+      account = fetch_account!(account.id)
+      refute account.is_disabled
+      refute account.scheduled_deletion_at
+      assert jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id) == []
+      assert collect_queued_emails(account.id) == []
+    end
+
+    test "scheduling requires subject to belong to the account", %{account: account} do
+      other_account = account_fixture()
+      other_actor = admin_actor_fixture(account: other_account)
+      subject = subject_fixture(account: other_account, actor: other_actor)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      attrs = %{
+        is_disabled: true,
+        scheduled_deletion_at: DateTime.add(now, 7, :day)
+      }
+
+      assert {:error, :unauthorized} =
+               Deletion.schedule_account_deletion(account, attrs, subject)
+
+      account = fetch_account!(account.id)
+      refute account.is_disabled
+      refute account.scheduled_deletion_at
+      assert jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id) == []
+      assert collect_queued_emails(account.id) == []
+    end
+
+    test "cancellation is idempotent and only queues one email", %{account: account, actor: actor} do
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
+
+      account =
+        update_account(account,
+          is_disabled: true,
+          scheduled_deletion_at: scheduled_deletion_at
+        )
+
+      assert {:ok, _job} =
+               Oban.insert(
+                 DeleteAccount.new(%{"account_id" => account.id}, scheduled_at: scheduled_deletion_at)
+               )
+
+      subject = subject_fixture(account: account, actor: actor)
+
+      assert {:ok, first_account} =
+               Deletion.cancel_account_deletion(account, subject)
+
+      assert {:ok, second_account} =
+               Deletion.cancel_account_deletion(account, subject)
+
+      refute first_account.scheduled_deletion_at
+      refute second_account.scheduled_deletion_at
+      [scheduled_job] =
+        jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id)
+
+      assert scheduled_job.state == "cancelled"
+      assert length(collect_queued_emails(account.id)) == 1
+    end
+
+    test "cancellation requires account update permission", %{account: account} do
+      actor = actor_fixture(account: account, type: :account_user)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
+
+      account =
+        update_account(account,
+          is_disabled: true,
+          scheduled_deletion_at: scheduled_deletion_at
+        )
+
+      assert {:ok, _job} =
+               Oban.insert(
+                 DeleteAccount.new(%{"account_id" => account.id}, scheduled_at: scheduled_deletion_at)
+               )
+
+      subject = subject_fixture(account: account, actor: actor)
+
+      assert {:error, :unauthorized} =
+               Deletion.cancel_account_deletion(account, subject)
+
+      account = fetch_account!(account.id)
+      assert account.is_disabled
+      assert account.scheduled_deletion_at
+
+      [scheduled_job] =
+        jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id)
+
+      assert scheduled_job.state == "scheduled"
+      assert collect_queued_emails(account.id) == []
+    end
+
+    test "cancellation requires subject to belong to the account", %{account: account} do
+      other_account = account_fixture()
+      other_actor = admin_actor_fixture(account: other_account)
+      subject = subject_fixture(account: other_account, actor: other_actor)
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      scheduled_deletion_at = DateTime.add(now, 7, :day)
+
+      account =
+        update_account(account,
+          is_disabled: true,
+          scheduled_deletion_at: scheduled_deletion_at
+        )
+
+      assert {:ok, _job} =
+               Oban.insert(
+                 DeleteAccount.new(%{"account_id" => account.id}, scheduled_at: scheduled_deletion_at)
+               )
+
+      assert {:error, :unauthorized} =
+               Deletion.cancel_account_deletion(account, subject)
+
+      account = fetch_account!(account.id)
+      assert account.is_disabled
+      assert account.scheduled_deletion_at
+
+      [scheduled_job] =
+        jobs_for_worker_and_arg("Portal.Workers.DeleteAccount", "account_id", account.id)
+
+      assert scheduled_job.state == "scheduled"
+      assert collect_queued_emails(account.id) == []
+    end
+  end
+
+  defp feedback_emails(account_id) do
+    account_id
+    |> collect_queued_emails()
+    |> Enum.filter(&({nil, "feedback@example.com"} in &1.to or {"", "feedback@example.com"} in &1.to))
+  end
+end

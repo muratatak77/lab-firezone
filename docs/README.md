@@ -1,0 +1,213 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/cae1e42d-78cb-4368-87b0-06b621962233">
+    <img alt="Firezone logo" width="400" src="https://github.com/user-attachments/assets/81a90197-2250-4f5c-8195-43e25fb0b0b8">
+  </picture>
+</p>
+<p align="center">
+  <strong>Blazing-fast remote access with identity-based policies, attested device trust, and detailed audit logs</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.firezone.dev/kb">Documentation</a>
+  | <a href="https://www.firezone.dev/kb/quickstart">Quickstart</a>
+  | <a href="https://www.firezone.dev/kb/client-apps">Download Clients</a>
+  | <a href="https://www.firezone.dev/support">Support</a>
+</p>
+
+---
+
+<p align="center">
+  <img src="https://img.shields.io/static/v1?logo=github&logoColor=959DA5&label=Test&labelColor=333a41&message=passing&color=3AC358" alt="firezone" />
+  <!--<a href="https://coveralls.io/github/firezone/firezone?branch=main">
+    <img src="https://coveralls.io/repos/github/firezone/firezone/badge.svg?branch=main" alt="Coverage Status" />
+  </a>-->
+  <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/firezone/firezone"/>
+  <img alt="GitHub closed issues" src="https://img.shields.io/github/issues-closed/firezone/firezone"/>
+  <a href="https://x.com/intent/follow?screen_name=firezonehq">
+    <img alt="X (formerly Twitter) Follow" src="https://img.shields.io/badge/Follow-%40firezonehq-black?style=flat&logo=x" />
+  </a>
+</p>
+
+---
+
+## Overview
+
+[Firezone](https://www.firezone.dev/?utm_source=readme) is a secure remote access
+platform built on WireGuard®. Connect users to private applications, databases,
+servers, and subnets with granular policies that define who can access each
+Resource and under what conditions.
+
+Combine identity-based access with cryptographic device verification and detailed
+audit records. Gateways run in your infrastructure, and the full product source
+is available for inspection in this repository.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/a95a32a3-9449-455e-85e8-20ee4327c1e1">
+    <img width="570" height="696" alt="Firezone component diagram" src="https://github.com/user-attachments/assets/411265e5-a131-4e25-9dad-1a0b77534b28" />
+  </picture>
+</p>
+
+## Getting Started
+
+### Cloud (recommended)
+
+[Sign up free](https://app.firezone.dev/sign_up?utm_source=readme) and follow
+the [Quickstart](https://www.firezone.dev/kb/quickstart) to:
+
+1. Deploy a Gateway in the network containing your Resources.
+   See the [Gateway sizing documentation](https://www.firezone.dev/kb/deploy/sizing)
+   for sizing and configuration guidance.
+2. Define Resources and policies that grant access to the appropriate groups.
+3. Install a Client, sign in, and connect to an authorized Resource.
+
+For plan details and feature availability, see [pricing](https://www.firezone.dev/pricing?utm_source=readme).
+
+### Self-hosting
+
+The [licenses](#license) permit self-hosting, subject to their terms. Production
+self-hosting is not officially supported. For development or evaluation, follow
+[CONTRIBUTING.md](CONTRIBUTING.md) to run a local environment.
+
+Published Clients are only guaranteed to work with the managed service. Internal
+APIs change, and app store releases may lag behind this repository. A self-hosted
+portal may require Clients built from a compatible revision. Build instructions
+are available in [swift/apple](../swift/apple),
+[kotlin/android](../kotlin/android), and [rust/gui-client](../rust/gui-client).
+
+## Features
+
+- **Least-privilege access:** Grant groups access to specific Resources through
+  policies, including conditions that require device attestation.
+- **Device Trust:** Require cryptographic device verification in addition to user
+  authentication, using X.509 certificates issued by your MDM or enterprise PKI.
+  [Learn more](https://www.firezone.dev/kb/device-trust).
+- **Audit Logs:** Track configuration changes, sessions, API requests, and traffic
+  flows with 90-day retention. Export records to your SIEM through Log Sinks.
+  [Learn more](https://www.firezone.dev/kb/audit-logs).
+- **Device Pools:** Create a peer-to-peer mesh of devices with encrypted
+  Client-to-Client WireGuard tunnels, without deploying a Gateway. Policies
+  control which groups can reach the devices in each pool.
+  [Learn more](https://www.firezone.dev/kb/concepts/resources#device-pools).
+- **Identity provider integration:** Authenticate with Google Workspace, Okta,
+  Microsoft Entra ID, or OIDC. Directory sync keeps users and groups aligned with
+  your identity provider.
+- **Encrypted connectivity:** WireGuard tunnels encrypt traffic between Clients
+  and Gateways or between devices in a Device Pool. Direct connections reduce
+  routing overhead; Relays carry encrypted traffic when a direct connection
+  cannot be established.
+- **Distributed deployment:** Deploy Gateways near your Resources across cloud
+  and on-premises environments. Use multiple Gateways for load balancing and
+  failover.
+- **Cross-platform access:** Clients are available for Windows, macOS, Linux,
+  iOS, and Android, with headless clients for automated workloads.
+- **Compliance:** The managed service is SOC 2 Type II compliant.
+  See the [Trust Center](https://trust.firezone.dev).
+
+See the [architecture documentation](https://www.firezone.dev/kb/architecture)
+for details on the control plane, data plane, and connection lifecycle.
+
+## Performance
+
+Firezone is committed to achieving the fastest possible speeds on every platform.
+Its shared Rust data plane combines WireGuard encryption with platform-specific
+I/O optimizations to reduce system calls, task wake-ups, and per-packet overhead.
+
+### Throughput
+
+| Platform | Throughput (as tested)                                |
+| -------- | ----------------------------------------------------- |
+| iOS      | 2+ Gbps                                               |
+| Android  | 2+ Gbps                                               |
+| Windows  | 5+ Gbps                                               |
+| macOS    | 5+ Gbps                                               |
+| Linux    | 5+ Gbps on commodity VMs / 10+ Gbps on tuned hardware |
+
+Throughput varies with round-trip latency, packet loss, hardware, network capacity,
+and workload.
+
+### Platform-specific optimizations
+
+Firezone combines packet batching with each platform's available offloads to
+process more packets with fewer system calls and wake-ups.
+
+- **macOS and iOS:** kqueue-backed readiness through Tokio/Mio, with batched
+  `sendmsg_x` / `recvmsg_x` calls for both UDP sockets and the `utun` interface.
+  A cache of connected UDP sockets enables Darwin's fast send path and flow
+  advisories for active peers.
+- **Windows:** Batched packet transfer to and from WinTUN, with support for TCP
+  coalescing before injection into its ring buffer. UDP sockets use segmentation
+  offload (USO) and receive coalescing (URO) where supported.
+- **Android:** UDP GSO/GRO where supported by the device's kernel.
+- **Linux:** UDP GSO/GRO plus TCP and UDP segmentation and checksum offloads on
+  the TUN interface.
+
+### Network path optimizations
+
+The [bandwidth-delay product](https://en.wikipedia.org/wiki/Bandwidth-delay_product)
+means throughput is a function of round-trip latency. Firezone keeps network
+paths short to minimize that latency.
+
+Direct peer connections form on demand through a custom NAT traversal system
+optimized for time to first byte. By piggybacking connection
+establishment on the WireGuard handshake, connections to new peers are typically
+ready in 200 ms or less.
+
+When a direct connection is unavailable, encrypted traffic flows through one of
+our 34 relay clusters worldwide. Relays combine eBPF/XDP and SR-IOV to process
+packets at line rate for most workloads.
+
+## Repository structure
+
+This monorepo contains the Firezone product:
+
+| Directory                                       | Contents                                        |
+| ----------------------------------------------- | ----------------------------------------------- |
+| [elixir](../elixir)                             | Admin portal and control plane                  |
+| [rust](../rust)                                 | Data plane and shared Rust libraries            |
+| [rust/gateway](../rust/gateway)                 | WireGuard tunnel server for your infrastructure |
+| [rust/relay](../rust/relay)                     | STUN/TURN relay for connection establishment    |
+| [rust/headless-client](../rust/headless-client) | Headless client                                 |
+| [rust/gui-client](../rust/gui-client)           | Windows and Linux GUI client                    |
+| [swift/apple](../swift/apple)                   | macOS and iOS clients                           |
+| [kotlin/android](../kotlin/android)             | Android and ChromeOS clients                    |
+| [policy-templates](../policy-templates)         | MDM policy templates for Windows and macOS      |
+
+## Documentation and support
+
+- [Documentation](https://www.firezone.dev/kb): Deployment, configuration, and troubleshooting.
+- [GitHub Issues](https://github.com/firezone/firezone/issues): Bug reports and feature requests.
+- [Support](https://www.firezone.dev/support): Support options for your deployment.
+- [Contact sales](https://www.firezone.dev/contact/sales?utm_source=readme): Enterprise requirements and deployment planning.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code guidelines,
+testing, and the pull request process. Browse
+[help wanted issues](https://github.com/firezone/firezone/issues?q=is%3Aissue+is%3Aopen+label%3Akind/help_wanted)
+for contribution opportunities.
+
+## Star History
+
+[![Star History Chart](https://api.gitrep.fyi/v1/star-history.svg?repos=firezone/firezone&theme=light&markers=true)](https://gitrep.fyi/history?compare=firezone/firezone)
+
+## Security
+
+To report a vulnerability, follow [SECURITY.md](SECURITY.md). Do not report
+security vulnerabilities through public GitHub issues.
+
+## License
+
+Portions of this software are licensed as follows:
+
+- All content residing under the "elixir/" directory of this repository, if that
+  directory exists, is licensed under the "Elastic License 2.0" license defined
+  in "elixir/LICENSE".
+- All third party components incorporated into the Firezone Software are
+  licensed under the original license provided by the owner of the applicable
+  component.
+- Content outside of the above mentioned directories or restrictions above is
+  available under the "Apache 2.0 License" license as defined in "LICENSE".
+
+WireGuard® is a registered trademark of Jason A. Donenfeld.

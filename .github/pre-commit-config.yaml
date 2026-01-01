@@ -1,0 +1,69 @@
+# Fuzz inputs are opaque bytes; no hook may touch them.
+exclude: ^rust/tests/fuzz/corpus/
+repos:
+  - repo: local
+    hooks:
+      - id: no-tracing-macro-imports
+        name: "rust: no direct tracing macro imports"
+        entry: "bash -c 'if grep -E \"use tracing::(trace|debug|info|warn|error)[^_]|use tracing::\\{[^}]*(trace|debug|info|warn|error)[^_]\" \"$@\"; then echo \"Error: Do not import tracing macros\"; exit 1; fi' --"
+        language: system
+        types: [rust]
+      - id: codespell
+        name: "python: codespell"
+        args: [--config=.github/codespellrc]
+        entry: codespell
+        language: system
+        pass_filenames: false
+      - id: prettier
+        name: Prettier
+        entry: bash -c 'cd .github && git -C .. ls-files "*.md" "*.json" "*.yaml" "*.yml" "*.css" "*.js" "*.ts" "*.tsx" | sed "s|^|../|" | xargs pnpm exec prettier --ignore-path ../.prettierignore --check --ignore-unknown --no-error-on-unmatched-pattern'
+        language: system
+        pass_filenames: false
+  # Standard pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+        description: Forces to replace line ending by the UNIX 'lf' character.
+        exclude: "(^kotlin/android/gradlew.bat|^rust/windows-client/wintun/|^elixir/priv/static/)"
+      - id: check-yaml
+      - id: check-xml
+        files: '\.(xml|manifest|wxs|svg)$'
+        types: [file]
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+        exclude: (^elixir/priv/static/|^swift/apple/FirezoneNetworkExtension/Connlib/Generated/)
+      - id: trailing-whitespace
+        exclude: (^swift/apple/FirezoneNetworkExtension/Connlib/Generated/)
+      - id: check-merge-conflict
+  # Third party pre-commit hooks
+  - repo: local
+    hooks:
+      - id: shellcheck
+        name: ShellCheck
+        entry: shellcheck
+        args: ["--severity=warning"]
+        language: system
+        types: [shell]
+        exclude: ^.*/gradlew$
+  - repo: https://github.com/pecigonzalo/pre-commit-shfmt
+    rev: v2.2.0
+    hooks:
+      - id: shell-fmt
+        args:
+          - -i
+          - "4"
+  - repo: https://github.com/DevinR528/cargo-sort
+    rev: v2.0.1
+    hooks:
+      - id: cargo-sort
+        args: ["--check", "--workspace", "rust/"]
+  - repo: local
+    hooks:
+      - id: actionlint
+        name: actionlint
+        entry: actionlint
+        language: system
+        types: [yaml]
+        files: ^\.github/workflows/

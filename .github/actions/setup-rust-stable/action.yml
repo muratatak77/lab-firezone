@@ -1,0 +1,74 @@
+---
+name: "Setup Rust"
+description: "Sets up the correct Rust version"
+inputs:
+  targets:
+    description: "Additional targets to install"
+    required: false
+    default: ""
+
+outputs:
+  bench-packages:
+    description: Benchmarkable packages for the current OS
+    value: ${{
+      (runner.os == 'Linux' && '--help') ||
+      (runner.os == 'macOS' && '--help') ||
+      (runner.os == 'Windows' && '-p bin-shared') }}
+  compile-packages:
+    description: Compilable packages for the current OS
+    value: ${{
+      (runner.os == 'Linux' && '--workspace') ||
+      (runner.os == 'macOS' && '--workspace') ||
+      (runner.os == 'Windows' && '--workspace') }}
+  test-packages:
+    description: Testable packages for the current OS
+    value: ${{
+      (runner.os == 'Linux' && '--workspace') ||
+      (runner.os == 'macOS' && '--workspace --exclude bin-shared --exclude firezone-gui-client') ||
+      (runner.os == 'Windows' && '--workspace') }}
+
+runs:
+  using: "composite"
+  steps:
+    # macos-26 ships a broken Homebrew rustup formula whose proxies reject
+    # cargo argv (actions/runner-images#14099, #14097). Replace it with an
+    # official install so PATH resolution is clean.
+    - name: Replace Homebrew rustup with official install (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew uninstall --ignore-dependencies rustup 2>/dev/null || true
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    # `line-tables-only` keeps file:line in backtraces but makes the debug
+    # builds of every CI job much faster to compile and link.
+    - name: Reduce debug info
+      shell: bash
+      run: |
+        echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+
+    - name: Extract pinned Rust channel
+      id: rust
+      shell: bash
+      run: |
+        CHANNEL=$(awk -F'"' '/^channel/ {print $2}' rust/rust-toolchain.toml)
+        echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        rustup toolchain install ${{ steps.rust.outputs.channel }} \
+          --profile minimal \
+          --component rust-src \
+          --component clippy \
+          --component rustfmt \
+          --component llvm-tools-preview
+        rustup default ${{ steps.rust.outputs.channel }}
+
+    - name: Install additional targets
+      if: ${{ inputs.targets != '' }}
+      shell: bash
+      run: rustup target add ${{ inputs.targets }}

@@ -1,0 +1,445 @@
+defmodule Portal.DeviceFixtures do
+  @moduledoc """
+  Test helpers for creating client and gateway devices and related data.
+  """
+
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.SiteFixtures
+  import Portal.TokenFixtures
+
+  ##############################################################################
+  # Address helpers shared by client and gateway fixtures
+  ##############################################################################
+
+  def valid_ipv4_address_attrs do
+    offset = System.unique_integer([:positive, :monotonic])
+    third = rem(div(offset, 256), 32)
+    fourth = rem(offset, 256)
+    fourth = if fourth < 2, do: fourth + 2, else: fourth
+
+    %{
+      address: %Postgrex.INET{address: {100, 64, third, fourth}}
+    }
+  end
+
+  def valid_ipv6_address_attrs do
+    offset = System.unique_integer([:positive, :monotonic])
+    w7 = rem(div(offset, 65_536), 65_536)
+    w8 = rem(offset, 65_536)
+    w8 = if w8 < 2, do: w8 + 2, else: w8
+
+    %{
+      address: %Postgrex.INET{address: {64_768, 8_225, 4_369, 0, 0, 0, w7, w8}}
+    }
+  end
+
+  def sync_device_ipv4(%Portal.Device{} = device, %Postgrex.INET{} = address) do
+    Portal.Repo.update!(Ecto.Changeset.change(device, ipv4: address))
+  end
+
+  def sync_device_ipv6(%Portal.Device{} = device, %Postgrex.INET{} = address) do
+    Portal.Repo.update!(Ecto.Changeset.change(device, ipv6: address))
+  end
+
+  @doc """
+  Returns the device row used by channel and API tests.
+  """
+  def fetch_device!(%Portal.Device{} = device), do: device
+
+  @doc """
+  Generate a random WireGuard public key for tests.
+  """
+  def generate_public_key do
+    :crypto.strong_rand_bytes(32)
+    |> Base.encode64()
+  end
+
+  ##############################################################################
+  # Client devices
+  ##############################################################################
+
+  @doc """
+  Generate valid client attributes with sensible defaults.
+  """
+  def valid_client_attrs(attrs \\ %{}) do
+    unique_num = System.unique_integer([:positive, :monotonic])
+
+    Enum.into(attrs, %{
+      name: "Client #{unique_num}",
+      firezone_id: "client_#{unique_num}",
+      device_serial: "SN#{unique_num}",
+      device_uuid: "UUID-#{unique_num}",
+      firebase_installation_id: "firebase_#{unique_num}"
+    })
+  end
+
+  @doc """
+  Build an unpersisted client `Device` changeset with the given attrs cast against a
+  random `actor_id` (so `:client`-type validations pass). Useful for asserting
+  `errors_on/1` without round-tripping the database.
+  """
+  def client_changeset(attrs \\ %{}) do
+    %Portal.Device{type: :client, actor_id: Ecto.UUID.generate()}
+    |> Ecto.Changeset.cast(attrs, [:name, :firezone_id, :hostname])
+    |> Portal.Device.changeset()
+  end
+
+  @doc """
+  Attempt to insert a client device with the given attrs against a real account + actor.
+  Returns the raw `{:ok, device} | {:error, changeset}` so tests can pattern-match
+  constraint failures (e.g. unique index violations) without relying on bang variants
+  raising.
+  """
+  def insert_client(account, actor, attrs) do
+    %Portal.Device{}
+    |> Ecto.Changeset.cast(attrs, [:name, :firezone_id, :hostname])
+    |> Ecto.Changeset.put_change(:type, :client)
+    |> Ecto.Changeset.put_change(:account_id, account.id)
+    |> Ecto.Changeset.put_change(:actor_id, actor.id)
+    |> Portal.Devices.put_free_slug(account.id, Portal.Devices.owner_name(actor))
+    |> Portal.Device.changeset()
+    |> Portal.Repo.insert()
+  end
+
+  @doc """
+  Generate a client with valid default attributes.
+
+  The client will be created with an associated account and actor unless they are provided.
+
+  ## Examples
+
+      client = client_fixture()
+      client = client_fixture(name: "My Laptop")
+      client = client_fixture(actor: actor)
+
+  """
+  def client_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+
+    # Get or create account
+    account = Map.get(attrs, :account) || account_fixture()
+
+    # Get or create actor
+    actor = Map.get(attrs, :actor) || actor_fixture(account: account)
+
+    device_attrs =
+      attrs
+      |> Map.drop([:account, :actor, :ipv4_address, :ipv6_address])
+      |> valid_client_attrs()
+
+    device_attrs =
+      Map.put_new_lazy(device_attrs, :slug, fn ->
+        Portal.Devices.next_free_slug(
+          account.id,
+          device_attrs.name,
+          Portal.Devices.owner_name(actor)
+        )
+      end)
+
+    {:ok, device} =
+      %Portal.Device{}
+      |> Ecto.Changeset.cast(device_attrs, [
+        :name,
+        :slug,
+        :firezone_id,
+        :device_serial,
+        :device_uuid,
+        :identifier_for_vendor,
+        :firebase_installation_id,
+        :hostname,
+        :last_attested_device_serial,
+        :last_attested_device_uuid,
+        :last_attested_mdm_device_id,
+        :last_attested_cert_serial,
+        :last_attested_cert_fingerprint,
+        :last_attested_cert_issuer,
+        :last_attested_at,
+        :verified_at
+      ])
+      |> Ecto.Changeset.put_change(:type, :client)
+      |> Ecto.Changeset.put_change(:account_id, account.id)
+      |> Ecto.Changeset.put_change(:actor_id, actor.id)
+      |> Ecto.Changeset.put_assoc(:account, account)
+      |> Ecto.Changeset.put_assoc(:actor, actor)
+      |> Portal.Device.changeset()
+      |> Portal.Repo.insert()
+
+    ipv4 =
+      attrs
+      |> Map.fetch(:ipv4_address)
+      |> case do
+        {:ok, value} -> extract_address(value)
+        :error -> valid_ipv4_address_attrs().address
+      end
+
+    ipv6 =
+      attrs
+      |> Map.fetch(:ipv6_address)
+      |> case do
+        {:ok, value} -> extract_address(value)
+        :error -> valid_ipv6_address_attrs().address
+      end
+
+    device =
+      device
+      |> maybe_sync_device_ipv4(ipv4)
+      |> maybe_sync_device_ipv6(ipv6)
+
+    Portal.Repo.preload(device, :actor)
+  end
+
+  @doc """
+  Generate a verified client.
+  """
+  def verified_client_fixture(attrs \\ %{}) do
+    client_fixture(Map.put(attrs, :verified_at, DateTime.utc_now()))
+  end
+
+  @doc """
+  Verify a device (sets verified_at timestamp).
+  """
+  def verify_device(device) do
+    device
+    |> Ecto.Changeset.change(verified_at: DateTime.utc_now())
+    |> Portal.Repo.update!()
+  end
+
+  @doc """
+  Inserts `count` client devices of one new actor in a single statement, for tests that
+  need many devices. Their addresses start at 100.80.0.0 and fd00:2021:1111::18:0,
+  clear of those the other device fixtures assign.
+  """
+  def bulk_clients_fixture(%Portal.Account{} = account, count) do
+    actor = actor_fixture(account: account)
+    now = DateTime.utc_now()
+
+    rows =
+      for n <- 1..count do
+        %{
+          account_id: account.id,
+          actor_id: actor.id,
+          type: :client,
+          name: "Bulk device #{n}",
+          firezone_id: "bulk-device-#{n}",
+          slug: "bulk-device-#{n}",
+          ipv4: {100, 80, div(n, 256), rem(n, 256)},
+          ipv6: {0xFD00, 0x2021, 0x1111, 0, 0, 0, 0x18, n},
+          inserted_at: now,
+          updated_at: now
+        }
+      end
+
+    {^count, devices} =
+      Portal.Repo.insert_all(Portal.Device, rows, returning: [:account_id, :id, :slug])
+
+    devices
+  end
+
+  @doc """
+  Records when the device was last seen, as a connect does.
+  """
+  def record_last_seen(device, last_seen_at) do
+    device
+    |> Ecto.Changeset.change(last_seen_at: last_seen_at)
+    |> Portal.Repo.update!()
+  end
+
+  ##############################################################################
+  # Gateway devices
+  ##############################################################################
+
+  @doc """
+  Generate valid gateway attributes with sensible defaults.
+  """
+  def valid_gateway_attrs(attrs \\ %{}) do
+    unique_num = System.unique_integer([:positive, :monotonic])
+
+    Enum.into(attrs, %{
+      name: "Gateway #{unique_num}",
+      firezone_id: "gateway_#{unique_num}",
+      public_key: generate_public_key()
+    })
+  end
+
+  @doc """
+  Generate a gateway with valid default attributes.
+
+  The gateway will be created with an associated account and site unless they are provided.
+
+  ## Examples
+
+      gateway = gateway_fixture()
+      gateway = gateway_fixture(name: "Production Gateway")
+      gateway = gateway_fixture(site: site)
+
+  """
+  def gateway_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+
+    # Get or create account
+    account = Map.get(attrs, :account) || account_fixture()
+
+    # Get or create site
+    site = Map.get(attrs, :site) || site_fixture(account: account)
+
+    # Extract session-related attrs
+    session_attrs =
+      Map.take(attrs, [
+        :last_seen_user_agent,
+        :last_seen_remote_ip,
+        :last_seen_remote_ip_location_region,
+        :last_seen_remote_ip_location_city,
+        :last_seen_remote_ip_location_lat,
+        :last_seen_remote_ip_location_lon,
+        :last_seen_version,
+        :last_seen_at
+      ])
+
+    device_attrs =
+      attrs
+      |> Map.drop([
+        :account,
+        :site,
+        :token,
+        :ipv4_address,
+        :ipv6_address,
+        :last_seen_user_agent,
+        :last_seen_remote_ip,
+        :last_seen_remote_ip_location_region,
+        :last_seen_remote_ip_location_city,
+        :last_seen_remote_ip_location_lat,
+        :last_seen_remote_ip_location_lon,
+        :last_seen_version,
+        :last_seen_at
+      ])
+      |> valid_gateway_attrs()
+
+    {:ok, gateway} =
+      %Portal.Device{}
+      |> Ecto.Changeset.cast(device_attrs, [
+        :name,
+        :firezone_id,
+        :device_serial,
+        :device_uuid
+      ])
+      |> Ecto.Changeset.put_change(:type, :gateway)
+      |> Ecto.Changeset.put_change(:account_id, account.id)
+      |> Ecto.Changeset.put_change(:site_id, site.id)
+      |> Portal.Devices.put_free_slug(account.id, nil)
+      |> Ecto.Changeset.put_assoc(:account, account)
+      |> Ecto.Changeset.put_assoc(:site, site)
+      |> Portal.Device.changeset()
+      |> Portal.Repo.insert()
+
+    Portal.Repo.insert!(%Portal.SiteDevice{
+      account_id: account.id,
+      site_id: site.id,
+      device_id: gateway.id
+    })
+
+    ipv4 =
+      attrs
+      |> Map.fetch(:ipv4_address)
+      |> case do
+        {:ok, value} -> extract_address(value)
+        :error -> valid_ipv4_address_attrs().address
+      end
+
+    ipv6 =
+      attrs
+      |> Map.fetch(:ipv6_address)
+      |> case do
+        {:ok, value} -> extract_address(value)
+        :error -> valid_ipv6_address_attrs().address
+      end
+
+    gateway =
+      gateway
+      |> maybe_sync_device_ipv4(ipv4)
+      |> maybe_sync_device_ipv6(ipv6)
+
+    # Always record a latest session (gateways always have sessions in
+    # practice). Defaults to a legacy multi-owner site token; pass
+    # `token: :single_owner` to bind the session to a single-owner token, or
+    # pass a token struct directly.
+    token =
+      case Map.get(attrs, :token) do
+        nil -> gateway_token_fixture(account: account, site: site)
+        :single_owner -> gateway_token_fixture(gateway: gateway)
+        %Portal.GatewayToken{} = token -> token
+      end
+
+    public_key = Map.get(device_attrs, :public_key, generate_public_key())
+
+    gateway =
+      gateway
+      |> Ecto.Changeset.cast(
+        %{
+          public_key: public_key,
+          last_seen_user_agent:
+            Map.get(session_attrs, :last_seen_user_agent, "Firezone-Gateway/1.3.0"),
+          last_seen_remote_ip: Map.get(session_attrs, :last_seen_remote_ip, {100, 64, 0, 1}),
+          last_seen_remote_ip_location_region:
+            Map.get(session_attrs, :last_seen_remote_ip_location_region),
+          last_seen_remote_ip_location_city:
+            Map.get(session_attrs, :last_seen_remote_ip_location_city),
+          last_seen_remote_ip_location_lat:
+            Map.get(session_attrs, :last_seen_remote_ip_location_lat),
+          last_seen_remote_ip_location_lon:
+            Map.get(session_attrs, :last_seen_remote_ip_location_lon),
+          last_seen_version: Map.get(session_attrs, :last_seen_version, "1.3.0"),
+          last_seen_at: Map.get(session_attrs, :last_seen_at, DateTime.utc_now())
+        },
+        [
+          :public_key,
+          :last_seen_user_agent,
+          :last_seen_remote_ip,
+          :last_seen_remote_ip_location_region,
+          :last_seen_remote_ip_location_city,
+          :last_seen_remote_ip_location_lat,
+          :last_seen_remote_ip_location_lon,
+          :last_seen_version,
+          :last_seen_at
+        ]
+      )
+      |> Ecto.Changeset.put_change(:gateway_token_id, token.id)
+      |> Portal.Repo.update!()
+
+    Portal.Repo.preload(gateway, :site)
+  end
+
+  ##############################################################################
+  # Private helpers
+  ##############################################################################
+
+  @doc "Generate a client attested by a certificate, optionally associating a client token."
+  def attested_client_fixture(attrs) do
+    attrs = Enum.into(attrs, %{})
+    certificate = Map.fetch!(attrs, :certificate)
+    issuer_der = Map.fetch!(attrs, :issuer_der)
+    {:Certificate, tbs, _algorithm, _signature} = :public_key.der_decode(:Certificate, certificate)
+
+    client =
+      attrs
+      |> Map.drop([:certificate, :issuer_der, :token])
+      |> Map.put(:last_attested_cert_issuer, Portal.Crypto.X509.subject(issuer_der))
+      |> Map.put(:last_attested_cert_serial, tbs |> elem(2) |> Integer.to_string(16))
+      |> client_fixture()
+
+    case Map.get(attrs, :token) do
+      nil -> client
+      token -> client |> Ecto.Changeset.change(client_token_id: token.id) |> Portal.Repo.update!()
+    end
+  end
+
+  defp maybe_sync_device_ipv4(device, nil), do: device
+  defp maybe_sync_device_ipv4(device, ipv4), do: sync_device_ipv4(device, ipv4)
+
+  defp maybe_sync_device_ipv6(device, nil), do: device
+  defp maybe_sync_device_ipv6(device, ipv6), do: sync_device_ipv6(device, ipv6)
+
+  defp extract_address(nil), do: nil
+  defp extract_address(%Postgrex.INET{} = address), do: address
+  defp extract_address(%{address: %Postgrex.INET{} = address}), do: address
+end

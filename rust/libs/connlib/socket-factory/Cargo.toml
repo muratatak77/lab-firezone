@@ -1,0 +1,36 @@
+[package]
+name = "socket-factory"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+bufferpool = { workspace = true }
+derive_more = { workspace = true, features = ["debug"] }
+ip-packet = { workspace = true }
+memchr = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
+otel-instruments = { workspace = true }
+quinn-udp = { workspace = true }
+smallvec = { workspace = true, features = ["const_generics"] }
+socket2 = { workspace = true, features = ["all"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+bufferpool = { workspace = true }
+derive_more = { workspace = true, features = ["deref"] }
+ip-packet = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

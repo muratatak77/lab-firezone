@@ -1,0 +1,1347 @@
+defmodule PortalAPI.PolicyControllerTest do
+  use PortalAPI.ConnCase, async: true
+  alias Portal.Policy
+
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.PolicyFixtures
+  import Portal.ResourceFixtures
+  import Portal.GroupFixtures
+  import Portal.TrustAnchorFixtures
+
+  setup do
+    account = account_fixture()
+    actor = api_client_fixture(account: account)
+
+    %{
+      account: account,
+      actor: actor
+    }
+  end
+
+  describe "index/2" do
+    test "returns error when not authorized", %{conn: conn} do
+      conn = get(conn, "/policies")
+      assert %{"type" => "about:blank", "status" => 401, "title" => "Unauthorized"} =
+               json_response(conn, 401)
+    end
+
+    test "returns error for invalid page cursor", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", page_cursor: "not-a-valid-cursor")
+
+      assert %{"type" => "about:blank", "status" => 400, "detail" => "Invalid page cursor"} =
+               json_response(conn, 400)
+    end
+
+    test "lists all policies", %{conn: conn, account: account, actor: actor} do
+      policies = for _ <- 1..3, do: policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", JSON.encode!(%{}))
+
+      assert %{
+               "data" => data,
+               "metadata" => %{
+                 "count" => count,
+                 "limit" => limit,
+                 "next_page" => next_page,
+                 "prev_page" => prev_page
+               }
+             } = json_response(conn, 200)
+
+      assert count == 3
+      assert limit == 50
+      assert is_nil(next_page)
+      assert is_nil(prev_page)
+
+      data_ids = Enum.map(data, & &1["id"])
+      policy_ids = Enum.map(policies, & &1.id)
+
+      assert equal_ids?(data_ids, policy_ids)
+    end
+
+    test "lists policies with limit", %{conn: conn, account: account, actor: actor} do
+      policies = for _ <- 1..3, do: policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", limit: "2")
+
+      assert %{
+               "data" => data,
+               "metadata" => %{
+                 "count" => count,
+                 "limit" => limit,
+                 "next_page" => next_page,
+                 "prev_page" => prev_page
+               }
+             } = json_response(conn, 200)
+
+      assert limit == 2
+      assert count == 3
+      refute is_nil(next_page)
+      assert is_nil(prev_page)
+
+      data_ids = Enum.map(data, & &1["id"]) |> MapSet.new()
+      policy_ids = Enum.map(policies, & &1.id) |> MapSet.new()
+
+      assert MapSet.subset?(data_ids, policy_ids)
+    end
+
+    test "filters by group_id", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group)
+      _other = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", group_id: group.id)
+
+      assert %{"data" => [data]} = json_response(conn, 200)
+      assert data["id"] == policy.id
+    end
+
+    test "filters by resource_id", %{conn: conn, account: account, actor: actor} do
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(account: account, resource: resource)
+      _other = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", resource_id: resource.id)
+
+      assert %{"data" => [data]} = json_response(conn, 200)
+      assert data["id"] == policy.id
+    end
+
+    test "rejects 16-byte UUID filter values", %{conn: conn, actor: actor} do
+      conn = authorize_conn(conn, actor)
+
+      for filter <- ["group_id", "resource_id"],
+          value <- ["warehouse worker", URI.decode("%5CVf%C2%8E%C2%8C%F2%A9%A1%B8F%F4%8F%B8%8B")] do
+        response = get(conn, "/policies", %{filter => value, "limit" => "45"})
+
+        assert %{"status" => 400} = json_response(response, 400)
+      end
+    end
+
+    test "rejects a malformed group_id filter value", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", group_id: "not-a-uuid")
+
+      assert %{"status" => 400} = json_response(conn, 400)
+    end
+
+    test "rejects a malformed resource_id filter value", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies", resource_id: "not-a-uuid")
+
+      assert %{"status" => 400} = json_response(conn, 400)
+    end
+  end
+
+  describe "show/2" do
+    test "returns error when not authorized", %{conn: conn, account: account} do
+      policy = policy_fixture(account: account)
+      conn = get(conn, "/policies/#{policy.id}")
+      assert %{"type" => "about:blank", "status" => 401, "title" => "Unauthorized"} =
+               json_response(conn, 401)
+    end
+
+    test "returns a single policy", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies/#{policy.id}")
+
+      assert json_response(conn, 200) == %{
+               "data" => %{
+                 "id" => policy.id,
+                 "group_id" => policy.group_id,
+                 "resource_id" => policy.resource_id,
+                 "description" => policy.description,
+                 "flow_log_uploads_enabled" => true,
+                 "is_disabled" => false,
+                 "postures" => nil,
+                 "require_attestation" => false,
+                 "conditions" => []
+               }
+             }
+    end
+
+    test "renders conditions for a policy", %{conn: conn, account: account, actor: actor} do
+      policy =
+        policy_with_conditions_fixture(%{
+          account: account,
+          conditions: [
+            %{property: :remote_ip, operator: :is_in_cidr, values: ["10.0.0.0/8"]}
+          ]
+        })
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies/#{policy.id}")
+
+      assert json_response(conn, 200)["data"]["conditions"] == [
+               %{
+                 "property" => "remote_ip",
+                 "operator" => "is_in_cidr",
+                 "values" => ["10.0.0.0/8"]
+               }
+             ]
+    end
+
+    test "returns nil group_id for orphaned policy", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+      policy = Repo.update!(Ecto.Changeset.change(policy, group_id: nil))
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies/#{policy.id}")
+
+      assert json_response(conn, 200)["data"]["group_id"] == nil
+    end
+
+    test "returns not found when policy does not exist", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> get("/policies/#{Ecto.UUID.generate()}")
+
+      assert %{"type" => "about:blank", "status" => 404, "title" => "Not Found"} =
+               json_response(conn, 404)
+    end
+  end
+
+  describe "create/2" do
+    test "returns error when not authorized", %{conn: conn} do
+      conn = post(conn, "/policies", %{})
+      assert %{"type" => "about:blank", "status" => 401, "title" => "Unauthorized"} =
+               json_response(conn, 401)
+    end
+
+    test "returns error on empty params/body", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies")
+
+      assert resp = json_response(conn, 400)
+      assert %{"type" => "about:blank", "status" => 400, "title" => "Bad Request"} = resp
+    end
+
+    test "returns error on invalid attrs", %{conn: conn, actor: actor} do
+      attrs = %{}
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert %{
+               "status" => 422,
+               "validation_errors" => %{
+                 "group_id" => ["can't be blank"],
+                 "resource_id" => ["can't be blank"]
+               }
+             } = json_response(conn, 422)
+    end
+
+    test "returns validation error for malformed group_id value", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: %{"group_id" => "<no value>", "resource_id" => resource.id})
+
+      assert %{
+               "status" => 422,
+               "validation_errors" => %{"group_id" => ["is invalid"]}
+             } = json_response(conn, 422)
+    end
+
+    test "creates a policy with valid attrs", %{conn: conn, account: account, actor: actor} do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "description" => "test policy"
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+
+      assert resp["data"]["group_id"] == attrs["group_id"]
+      assert resp["data"]["resource_id"] == attrs["resource_id"]
+      assert resp["data"]["conditions"] == []
+    end
+
+    test "creates an enabled policy by default", %{conn: conn, account: account, actor: actor} do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{"group_id" => group.id, "resource_id" => resource.id}
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert %{"data" => %{"id" => id, "is_disabled" => false}} = json_response(conn, 201)
+
+      assert %Policy{is_disabled: false} = Repo.get_by(Policy, id: id, account_id: account.id)
+    end
+
+    test "creates a disabled policy", %{conn: conn, account: account, actor: actor} do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "is_disabled" => true
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert %{"data" => %{"id" => id, "is_disabled" => true}} = json_response(conn, 201)
+
+      assert %Policy{is_disabled: true} = Repo.get_by(Policy, id: id, account_id: account.id)
+    end
+
+    test "creates an enabled policy when is_disabled is false", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "is_disabled" => false
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert %{"data" => %{"id" => id, "is_disabled" => false}} = json_response(conn, 201)
+
+      assert %Policy{is_disabled: false} = Repo.get_by(Policy, id: id, account_id: account.id)
+    end
+
+    test "creates a policy with conditions", %{conn: conn, account: account, actor: actor} do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "conditions" => [
+          %{"property" => "remote_ip_location_region", "operator" => "is_in", "values" => ["US"]}
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+
+      assert resp["data"]["conditions"] == [
+               %{
+                 "property" => "remote_ip_location_region",
+                 "operator" => "is_in",
+                 "values" => ["US"]
+               }
+             ]
+    end
+
+    test "creates a policy that requires attestation", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      trust_anchor_fixture(account: account)
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{"group_id" => group.id, "resource_id" => resource.id, "require_attestation" => true}
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 201)["data"]["require_attestation"] == true
+    end
+
+    test "rejects require_attestation when the account has no trust anchors", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{"group_id" => group.id, "resource_id" => resource.id, "require_attestation" => true}
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 422)
+    end
+
+    test "rejects the removed device_attested condition", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "conditions" => [
+          %{"property" => "device_attested", "operator" => "is", "values" => ["true"]}
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 422)
+    end
+
+    test "creates a policy with auth_provider_id and time conditions", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+      provider_id = Ecto.UUID.generate()
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "conditions" => [
+          %{"property" => "auth_provider_id", "operator" => "is_in", "values" => [provider_id]},
+          %{
+            "property" => "current_utc_datetime",
+            "operator" => "is_in_day_of_week_time_ranges",
+            "values" => ["M/09:00-17:00/America/New_York"]
+          }
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+
+      assert resp["data"]["conditions"] == [
+               %{
+                 "property" => "auth_provider_id",
+                 "operator" => "is_in",
+                 "values" => [provider_id]
+               },
+               %{
+                 "property" => "current_utc_datetime",
+                 "operator" => "is_in_day_of_week_time_ranges",
+                 "values" => ["M/09:00-17:00/America/New_York"]
+               }
+             ]
+    end
+
+    test "rejects duplicate values within a condition", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+      provider_id = Ecto.UUID.generate()
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "conditions" => [
+          %{
+            "property" => "auth_provider_id",
+            "operator" => "is_in",
+            "values" => [provider_id, provider_id]
+          }
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 422)["title"] == "Unprocessable Content"
+    end
+
+    test "rejects more than one condition per property", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "conditions" => [
+          %{"property" => "remote_ip_location_region", "operator" => "is_in", "values" => ["US"]},
+          %{"property" => "remote_ip_location_region", "operator" => "is_not_in", "values" => ["US"]}
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 422)["validation_errors"] == %{
+               "base" => ["must not contain more than one condition per property"]
+             }
+    end
+
+    test "returns validation error for invalid condition", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "conditions" => [
+          %{"property" => "remote_ip", "operator" => "is_in", "values" => ["10.0.0.0/8"]}
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 422)["title"] == "Unprocessable Content"
+    end
+
+    test "sets group_idp_id when creating policy for synced group", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      synced_group = synced_group_fixture(account: account, idp_id: "synced_group_create_123")
+
+      attrs = %{
+        "group_id" => synced_group.id,
+        "resource_id" => resource.id
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert json_response(conn, 201)["data"]["group_id"] == synced_group.id
+
+      assert policy =
+               Repo.get_by(Portal.Policy, group_id: synced_group.id, resource_id: resource.id)
+
+      assert policy.group_idp_id == "synced_group_create_123"
+    end
+
+    test "returns not found when referenced resource does not exist", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => Ecto.UUID.generate()
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert %{"type" => "about:blank", "status" => 404, "title" => "Not Found"} =
+               json_response(conn, 404)
+    end
+
+    test "returns forbidden when internet resource is not enabled for the account", %{conn: conn} do
+      account = account_fixture()
+      actor = api_client_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert %{
+               "type" => "about:blank",
+               "status" => 403,
+               "detail" => "Internet resource is not enabled for this account"
+             } = json_response(conn, 403)
+    end
+
+    test "creates an internet resource policy when the feature is enabled", %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = api_client_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+      assert resp["data"]["resource_id"] == resource.id
+      assert resp["data"]["group_id"] == group.id
+      assert resp["data"]["flow_log_uploads_enabled"] == false
+    end
+
+    test "creates a policy with flow log uploads disabled", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "flow_log_uploads_enabled" => false
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+      assert resp["data"]["flow_log_uploads_enabled"] == false
+    end
+
+    test "defaults flow_log_uploads_enabled to true", %{conn: conn, account: account, actor: actor} do
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+      assert resp["data"]["flow_log_uploads_enabled"] == true
+    end
+
+    test "allows flow_log_uploads_enabled for an internet resource policy", %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = api_client_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+      group = group_fixture(account: account)
+
+      attrs = %{
+        "group_id" => group.id,
+        "resource_id" => resource.id,
+        "flow_log_uploads_enabled" => true
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> post("/policies", policy: attrs)
+
+      assert resp = json_response(conn, 201)
+      assert resp["data"]["flow_log_uploads_enabled"] == true
+    end
+  end
+
+  describe "update/2" do
+    test "returns error when not authorized", %{conn: conn, account: account} do
+      policy = policy_fixture(account: account)
+      conn = put(conn, "/policies/#{policy.id}", %{})
+      assert %{"type" => "about:blank", "status" => 401, "title" => "Unauthorized"} =
+               json_response(conn, 401)
+    end
+
+    test "returns error on empty params/body", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}")
+
+      assert resp = json_response(conn, 400)
+      assert %{"type" => "about:blank", "status" => 400, "title" => "Bad Request"} = resp
+    end
+
+    test "returns not found when policy does not exist", %{conn: conn, actor: actor} do
+      attrs = %{"description" => "updated"}
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{Ecto.UUID.generate()}", policy: attrs)
+
+      assert %{"type" => "about:blank", "status" => 404, "title" => "Not Found"} =
+               json_response(conn, 404)
+    end
+
+    test "updates a policy", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+
+      attrs = %{"description" => "updated policy description"}
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: attrs)
+
+      assert resp = json_response(conn, 200)
+
+      assert resp["data"]["description"] == attrs["description"]
+    end
+
+    test "enables flow_log_uploads_enabled on update", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account, flow_log_uploads_enabled: false)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"flow_log_uploads_enabled" => true})
+
+      assert resp = json_response(conn, 200)
+      assert resp["data"]["flow_log_uploads_enabled"] == true
+    end
+
+    test "enables flow_log_uploads_enabled on an internet resource policy", %{
+      conn: conn
+    } do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = api_client_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+      policy = policy_fixture(account: account, resource: resource, flow_log_uploads_enabled: false)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"flow_log_uploads_enabled" => true})
+
+      assert resp = json_response(conn, 200)
+      assert resp["data"]["flow_log_uploads_enabled"] == true
+    end
+
+    test "preserves enabled flow logs when an internet resource_id is unchanged", %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = api_client_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+      policy = policy_fixture(account: account, resource: resource, flow_log_uploads_enabled: true)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}",
+          policy: %{"resource_id" => resource.id, "description" => "updated"}
+        )
+
+      assert resp = json_response(conn, 200)
+      assert resp["data"]["flow_log_uploads_enabled"] == true
+    end
+
+    test "disables flow log uploads when moving a policy onto the internet resource", %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = api_client_fixture(account: account)
+      internet_resource = internet_resource_fixture(account: account)
+      policy = policy_fixture(account: account, flow_log_uploads_enabled: true)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"resource_id" => internet_resource.id})
+
+      assert resp = json_response(conn, 200)
+      assert resp["data"]["flow_log_uploads_enabled"] == false
+    end
+
+    test "keeps flow log uploads enabled when explicitly enabled while moving a policy onto the internet resource",
+         %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = api_client_fixture(account: account)
+      internet_resource = internet_resource_fixture(account: account)
+      policy = policy_fixture(account: account, flow_log_uploads_enabled: true)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}",
+          policy: %{
+            "resource_id" => internet_resource.id,
+            "flow_log_uploads_enabled" => true
+          }
+        )
+
+      assert resp = json_response(conn, 200)
+      assert resp["data"]["flow_log_uploads_enabled"] == true
+    end
+
+    test "preserves conditions when conditions are omitted", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      policy =
+        policy_with_conditions_fixture(%{
+          account: account,
+          conditions: [%{property: :remote_ip, operator: :is_in_cidr, values: ["10.0.0.0/8"]}]
+        })
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"description" => "updated"})
+
+      assert resp = json_response(conn, 200)
+      assert resp["data"]["description"] == "updated"
+
+      assert resp["data"]["conditions"] == [
+               %{
+                 "property" => "remote_ip",
+                 "operator" => "is_in_cidr",
+                 "values" => ["10.0.0.0/8"]
+               }
+             ]
+    end
+
+    test "updates a policy's conditions", %{conn: conn, account: account, actor: actor} do
+      policy =
+        policy_with_conditions_fixture(%{
+          account: account,
+          conditions: [%{property: :remote_ip, operator: :is_in_cidr, values: ["10.0.0.0/8"]}]
+        })
+
+      attrs = %{
+        "conditions" => [
+          %{"property" => "client_verified", "operator" => "is", "values" => ["true"]}
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: attrs)
+
+      assert json_response(conn, 200)["data"]["conditions"] == [
+               %{
+                 "property" => "client_verified",
+                 "operator" => "is",
+                 "values" => ["true"]
+               }
+             ]
+    end
+
+    test "updates a policy to require attestation", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      trust_anchor_fixture(account: account)
+
+      policy =
+        policy_with_conditions_fixture(%{
+          account: account,
+          conditions: [%{property: :client_verified, operator: :is, values: ["true"]}]
+        })
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"require_attestation" => true})
+
+      data = json_response(conn, 200)["data"]
+      assert data["require_attestation"] == true
+      assert data["conditions"] == [%{"property" => "client_verified", "operator" => "is", "values" => ["true"]}]
+    end
+
+    test "rejects more than one condition per property on update", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      policy = policy_fixture(account: account)
+
+      attrs = %{
+        "conditions" => [
+          %{"property" => "remote_ip_location_region", "operator" => "is_in", "values" => ["US"]},
+          %{"property" => "remote_ip_location_region", "operator" => "is_not_in", "values" => ["US"]}
+        ]
+      }
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: attrs)
+
+      assert json_response(conn, 422)["validation_errors"] == %{
+               "base" => ["must not contain more than one condition per property"]
+             }
+    end
+
+    test "returns validation error for invalid group_id value", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      policy = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"group_id" => "<no value>"})
+
+      assert %{
+               "status" => 422,
+               "validation_errors" => %{"group_id" => ["is invalid"]}
+             } = json_response(conn, 422)
+    end
+
+    test "updates group_idp_id when changing to a synced group", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      policy = policy_fixture(account: account)
+      synced_group = synced_group_fixture(account: account, idp_id: "synced_group_123")
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"group_id" => synced_group.id})
+
+      assert json_response(conn, 200)["data"]["group_id"] == synced_group.id
+
+      assert updated_policy = Repo.get_by(Portal.Policy, id: policy.id)
+      assert updated_policy.group_idp_id == "synced_group_123"
+    end
+
+    test "clears group_idp_id when changing to a non-synced group", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      policy = policy_fixture(account: account)
+      policy = Repo.update!(Ecto.Changeset.change(policy, group_idp_id: "old_synced_id"))
+      static_group = group_fixture(account: account, type: :static, idp_id: nil)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"group_id" => static_group.id})
+
+      assert json_response(conn, 200)["data"]["group_id"] == static_group.id
+
+      assert updated_policy = Repo.get_by(Portal.Policy, id: policy.id)
+      assert updated_policy.group_idp_id == nil
+    end
+  end
+
+  describe "delete/2" do
+    test "returns error when not authorized", %{conn: conn, account: account} do
+      policy = policy_fixture(account: account)
+      conn = delete(conn, "/policies/#{policy.id}", %{})
+      assert %{"type" => "about:blank", "status" => 401, "title" => "Unauthorized"} =
+               json_response(conn, 401)
+    end
+
+    test "returns not found when policy does not exist", %{conn: conn, actor: actor} do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> delete("/policies/#{Ecto.UUID.generate()}")
+
+      assert %{"type" => "about:blank", "status" => 404, "title" => "Not Found"} =
+               json_response(conn, 404)
+    end
+
+    test "deletes a policy", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> delete("/policies/#{policy.id}")
+
+      assert json_response(conn, 200) == %{
+               "data" => %{
+                 "id" => policy.id,
+                 "group_id" => policy.group_id,
+                 "resource_id" => policy.resource_id,
+                 "description" => policy.description,
+                 "flow_log_uploads_enabled" => true,
+                 "is_disabled" => false,
+                 "postures" => nil,
+                 "require_attestation" => false,
+                 "conditions" => []
+               }
+             }
+
+      refute Repo.get_by(Policy, id: policy.id, account_id: policy.account_id)
+    end
+  end
+
+  describe "update/2 is_disabled" do
+    test "disables a policy", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"is_disabled" => true})
+
+      assert %{"data" => %{"id" => id, "is_disabled" => true}} = json_response(conn, 200)
+      assert id == policy.id
+
+      assert %Policy{is_disabled: true} =
+               Repo.get_by(Policy, id: policy.id, account_id: policy.account_id)
+    end
+
+    test "disabling an already-disabled policy is idempotent", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      policy = disabled_policy_fixture(%{account: account})
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"is_disabled" => true})
+
+      assert %{"data" => %{"id" => id, "is_disabled" => true}} = json_response(conn, 200)
+      assert id == policy.id
+
+      assert %Policy{is_disabled: true} =
+               Repo.get_by(Policy, id: policy.id, account_id: policy.account_id)
+    end
+
+    test "enables a disabled policy", %{conn: conn, account: account, actor: actor} do
+      policy = disabled_policy_fixture(%{account: account})
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put("/policies/#{policy.id}", policy: %{"is_disabled" => false})
+
+      assert %{"data" => %{"id" => id, "is_disabled" => false}} = json_response(conn, 200)
+      assert id == policy.id
+
+      assert %Policy{is_disabled: false} =
+               Repo.get_by(Policy, id: policy.id, account_id: policy.account_id)
+    end
+  end
+  @postures %{
+    "and" => [
+      %{"field" => "intune.compliance_state", "op" => "is", "value" => "compliant"},
+      %{"not" => %{"field" => "intune.jail_broken", "op" => "is", "value" => true}}
+    ]
+  }
+
+  describe "postures" do
+    import Portal.DevicePostureFixtures
+
+    setup do
+      account = device_posture_account_fixture()
+      actor = api_client_fixture(account: account)
+      resource = resource_fixture(account: account)
+      group = group_fixture(account: account)
+      %{account: account, actor: actor, resource: resource, group: group}
+    end
+
+    defp post_policy(conn, actor, attrs) do
+      conn
+      |> authorize_conn(actor)
+      |> put_req_header("content-type", "application/json")
+      |> post("/policies", policy: attrs)
+    end
+
+    defp put_policy(conn, actor, policy, attrs) do
+      conn
+      |> authorize_conn(actor)
+      |> put_req_header("content-type", "application/json")
+      |> put("/policies/#{policy.id}", policy: attrs)
+    end
+
+    test "creates a policy with postures", %{conn: conn, account: account, actor: actor, resource: resource, group: group} do
+      attrs = %{"group_id" => group.id, "resource_id" => resource.id, "postures" => @postures}
+
+      assert %{"data" => %{"id" => id, "postures" => postures}} = json_response(post_policy(conn, actor, attrs), 201)
+      assert postures == @postures
+      assert %Policy{postures: %Portal.Policies.Postures{}} = Repo.get_by(Policy, id: id, account_id: account.id)
+    end
+
+    test "rejects postures the parser refuses", %{conn: conn, actor: actor, resource: resource, group: group} do
+      postures = %{"and" => [%{"field" => "jamf.serial", "op" => "is", "value" => "x"}]}
+      attrs = %{"group_id" => group.id, "resource_id" => resource.id, "postures" => postures}
+
+      assert %{"status" => 422, "validation_errors" => %{"postures" => errors}} =
+               json_response(post_policy(conn, actor, attrs), 422)
+      assert errors != []
+    end
+
+    test "rejects a malformed posture node with a 422", %{conn: conn, actor: actor, resource: resource, group: group} do
+      leaf = %{"field" => "intune.compliance_state", "op" => "is", "value" => "compliant", "rows" => %{}}
+      attrs = %{"group_id" => group.id, "resource_id" => resource.id, "postures" => %{"and" => [leaf]}}
+
+      assert %{"status" => 422, "validation_errors" => %{"postures" => messages}} =
+               json_response(post_policy(conn, actor, attrs), 422)
+
+      assert Enum.any?(messages, &(&1 =~ "PolicyPostureNode"))
+    end
+
+    test "refuses conditions while policy conditions are off for the account", %{conn: conn} do
+      account = account_fixture(features: %{policy_conditions: false})
+      actor = api_client_fixture(account: account)
+      conn = conn |> authorize_conn(actor) |> put_req_header("content-type", "application/json")
+      condition = %{"property" => "remote_ip_location_region", "operator" => "is_in", "values" => ["US"]}
+
+      attrs = %{
+        "group_id" => group_fixture(account: account).id,
+        "resource_id" => resource_fixture(account: account).id,
+        "conditions" => [condition]
+      }
+
+      assert %{"status" => 403, "detail" => "Policy conditions are not enabled for this account"} =
+               conn |> post("/policies", policy: attrs) |> json_response(403)
+
+      assert %{"data" => %{"conditions" => []}} =
+               conn |> post("/policies", policy: %{attrs | "conditions" => []}) |> json_response(201)
+
+      policy =
+        policy_with_conditions_fixture(%{
+          account: account,
+          conditions: [%{property: :client_verified, operator: :is, values: ["true"]}]
+        })
+
+      assert %{"status" => 403} =
+               conn |> put("/policies/#{policy.id}", policy: %{"conditions" => [condition]}) |> json_response(403)
+
+      assert %{"data" => %{"description" => "Kept"}} =
+               conn |> put("/policies/#{policy.id}", policy: %{"description" => "Kept"}) |> json_response(200)
+
+      assert %{"data" => %{"conditions" => []}} =
+               conn |> put("/policies/#{policy.id}", policy: %{"conditions" => []}) |> json_response(200)
+    end
+
+    test "refuses postures while device posture is off for the account", %{conn: conn} do
+      account = account_fixture()
+      actor = api_client_fixture(account: account)
+      attrs = %{"group_id" => group_fixture(account: account).id, "resource_id" => resource_fixture(account: account).id}
+
+      assert %{"status" => 403, "detail" => "Device posture is not enabled for this account"} =
+               json_response(post_policy(conn, actor, Map.put(attrs, "postures", @postures)), 403)
+
+      assert %{"data" => %{"postures" => nil}} = json_response(post_policy(conn, actor, attrs), 201)
+
+      policy = policy_fixture(account: account)
+
+      assert %{"status" => 403} = json_response(put_policy(conn, actor, policy, %{"postures" => @postures}), 403)
+      assert %{"data" => %{"postures" => nil}} = json_response(put_policy(conn, actor, policy, %{"postures" => nil}), 200)
+    end
+
+    test "missing and false entitlements reject PUT and PATCH while preserving stored postures", %{conn: conn} do
+      for feature <- [nil, false] do
+        account = account_fixture(features: %{device_posture: feature})
+        actor = api_client_fixture(account: account)
+        policy = policy_fixture(account: account, postures: @postures)
+        conn = conn |> authorize_conn(actor) |> put_req_header("content-type", "application/json")
+
+        for method <- [:put, :patch] do
+          response = apply(Phoenix.ConnTest, :dispatch, [conn, @endpoint, method, "/policies/#{policy.id}", %{policy: %{postures: @postures}}])
+          assert %{"status" => 403, "detail" => "Device posture is not enabled for this account"} = json_response(response, 403)
+        end
+
+        saved = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+        assert Portal.Policies.Postures.to_map(saved.postures) == @postures
+        assert %{"data" => %{"postures" => nil}} =
+                 conn |> patch("/policies/#{policy.id}", policy: %{postures: nil}) |> json_response(200)
+      end
+    end
+
+    test "updates and clears postures", %{conn: conn, account: account, actor: actor, resource: resource, group: group} do
+      policy = policy_fixture(account: account, group: group, resource: resource)
+
+      assert %{"data" => %{"postures" => postures}} = json_response(put_policy(conn, actor, policy, %{"postures" => @postures}), 200)
+      assert postures == @postures
+      assert %Policy{postures: %Portal.Policies.Postures{}} = Repo.get_by(Policy, id: policy.id, account_id: account.id)
+
+      assert %{"data" => %{"postures" => nil}} = json_response(put_policy(conn, actor, policy, %{"postures" => nil}), 200)
+      assert %Policy{postures: nil} = Repo.get_by(Policy, id: policy.id, account_id: account.id)
+    end
+
+    test "PATCH replaces the expression and omitted postures are preserved", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account, postures: @postures)
+      replacement = %{"field" => "firezone.last_seen_version", "op" => "gte", "value" => "@latest"}
+      conn = conn |> authorize_conn(actor) |> put_req_header("content-type", "application/json")
+
+      assert %{"data" => %{"postures" => ^replacement}} =
+               conn |> patch("/policies/#{policy.id}", policy: %{postures: replacement}) |> json_response(200)
+
+      assert %{"data" => %{"postures" => ^replacement}} =
+               conn |> put("/policies/#{policy.id}", policy: %{description: "Keep postures"}) |> json_response(200)
+
+      assert %{"data" => %{"postures" => nil}} =
+               conn |> patch("/policies/#{policy.id}", policy: %{postures: nil}) |> json_response(200)
+    end
+
+    test "rejects invalid updates without changing stored postures", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account, postures: @postures)
+
+      for invalid <- [
+            %{"field" => "intune.enrolled", "op" => "gt", "value" => true},
+            %{"and" => []},
+            Enum.reduce(1..11, @postures, fn _, inner -> %{"not" => inner} end)
+          ] do
+        assert %{"status" => 422} = json_response(put_policy(conn, actor, policy, %{"postures" => invalid}), 422)
+        saved = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+        assert Portal.Policies.Postures.to_map(saved.postures) == @postures
+      end
+    end
+
+    test "renders postures on show and list", %{conn: conn, account: account, actor: actor, resource: resource, group: group} do
+      policy = policy_fixture(account: account, group: group, resource: resource, postures: @postures)
+
+      conn = conn |> authorize_conn(actor) |> put_req_header("content-type", "application/json")
+      assert %{"data" => %{"postures" => postures}} = json_response(get(conn, "/policies/#{policy.id}"), 200)
+      assert postures == @postures
+      assert %{"data" => [%{"postures" => listed}]} = json_response(get(conn, "/policies"), 200)
+      assert listed == @postures
+    end
+  end
+end

@@ -1,0 +1,554 @@
+defmodule Portal.PolicyAuthorizationTest do
+  use Portal.DataCase, async: true
+
+  import Ecto.Changeset
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.DeviceFixtures
+  import Portal.GroupFixtures
+  import Portal.MembershipFixtures
+  import Portal.PolicyAuthorizationFixtures
+  import Portal.PolicyFixtures
+  import Portal.ResourceFixtures
+  import Portal.SiteFixtures
+  import Portal.TokenFixtures
+
+  alias Portal.PolicyAuthorization
+
+  @valid_ip {100, 64, 0, 1}
+  @valid_user_agent "Mozilla/5.0"
+  @valid_gateway_ip {100, 64, 0, 2}
+
+  describe "changeset/1 association constraints" do
+    test "enforces account association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            account_id: Ecto.UUID.generate(),
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :account_id,
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{account: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces token association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: Ecto.UUID.generate(),
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{token: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces policy association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: Ecto.UUID.generate(),
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{policy: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces client association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: Ecto.UUID.generate(),
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{client: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces gateway association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: Ecto.UUID.generate(),
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{gateway: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces resource association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: Ecto.UUID.generate(),
+            token_id: token.id,
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{resource: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces membership association constraint" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:error, changeset} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: Ecto.UUID.generate(),
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert %{membership: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "allows nil membership for Everyone group policies" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:ok, pa} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: nil,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert pa.membership_id == nil
+    end
+
+    test "allows valid associations" do
+      account = account_fixture()
+      actor = actor_fixture(account: account)
+      client = client_fixture(account: account, actor: actor)
+      site = site_fixture(account: account)
+      gateway = gateway_fixture(account: account, site: site)
+      resource = resource_fixture(account: account, site: site)
+      group = group_fixture(account: account)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+      membership = membership_fixture(account: account, actor: actor, group: group)
+      token = client_token_fixture(account: account, actor: actor)
+
+      {:ok, pa} =
+        %PolicyAuthorization{}
+        |> cast(
+          %{
+            policy_id: policy.id,
+            initiating_device_id: client.id,
+            receiving_device_id: gateway.id,
+            resource_id: resource.id,
+            token_id: token.id,
+            membership_id: membership.id,
+            initiator_remote_ip: @valid_ip,
+            initiator_user_agent: @valid_user_agent,
+            receiver_remote_ip: @valid_gateway_ip,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          },
+          [
+            :policy_id,
+            :initiating_device_id,
+            :receiving_device_id,
+            :resource_id,
+            :token_id,
+            :membership_id,
+            :initiator_remote_ip,
+            :initiator_user_agent,
+            :receiver_remote_ip,
+            :expires_at
+          ]
+        )
+        |> put_assoc(:account, account)
+        |> PolicyAuthorization.changeset()
+        |> Repo.insert()
+
+      assert pa.account_id == account.id
+      assert pa.policy_id == policy.id
+      assert pa.initiating_device_id == client.id
+      assert pa.receiving_device_id == gateway.id
+      assert pa.resource_id == resource.id
+      assert pa.token_id == token.id
+      assert pa.membership_id == membership.id
+    end
+  end
+
+  describe "deletes cascading from the rows a pool authorization depends on" do
+    setup do
+      account = account_fixture()
+      group = group_fixture(account: account)
+      owner = actor_fixture(account: account)
+      membership_fixture(account: account, actor: owner, group: group)
+      member = client_fixture(account: account, actor: owner)
+      initiator = client_fixture(account: account)
+      pool = actor_group_pool_resource_fixture(account: account, group: group)
+
+      %{
+        account: account,
+        group: group,
+        owner: owner,
+        member: member,
+        initiator: initiator,
+        pool: pool
+      }
+    end
+
+    test "deleting the receiving device deletes the authorization", %{
+      account: account,
+      member: member,
+      initiator: initiator,
+      pool: pool
+    } do
+      authorization =
+        policy_authorization_fixture(account: account, resource: pool, client: initiator, gateway: member)
+
+      Repo.delete!(member)
+
+      refute Repo.get_by(PolicyAuthorization, id: authorization.id)
+    end
+
+    test "deleting the initiating device deletes the authorization", %{
+      account: account,
+      member: member,
+      initiator: initiator,
+      pool: pool
+    } do
+      authorization =
+        policy_authorization_fixture(account: account, resource: pool, client: initiator, gateway: member)
+
+      Repo.delete!(initiator)
+
+      refute Repo.get_by(PolicyAuthorization, id: authorization.id)
+    end
+
+    test "deleting the pool deletes the authorization", %{
+      account: account,
+      member: member,
+      initiator: initiator,
+      pool: pool
+    } do
+      authorization =
+        policy_authorization_fixture(account: account, resource: pool, client: initiator, gateway: member)
+
+      Repo.delete!(pool)
+
+      refute Repo.get_by(PolicyAuthorization, id: authorization.id)
+    end
+
+    test "deleting the actor deletes the authorizations of their devices", %{
+      account: account,
+      owner: owner,
+      member: member,
+      initiator: initiator,
+      pool: pool
+    } do
+      inbound =
+        policy_authorization_fixture(account: account, resource: pool, client: initiator, gateway: member)
+
+      outbound =
+        policy_authorization_fixture(account: account, resource: pool, client: member, gateway: initiator)
+
+      Repo.delete!(owner)
+
+      refute Repo.get_by(PolicyAuthorization, id: inbound.id)
+      refute Repo.get_by(PolicyAuthorization, id: outbound.id)
+    end
+
+    test "deleting the group deletes its memberships, and the authorizations they granted", %{
+      account: account,
+      group: group,
+      owner: owner,
+      member: member,
+      initiator: initiator,
+      pool: pool
+    } do
+      membership = Repo.get_by!(Portal.Membership, actor_id: owner.id, group_id: group.id)
+
+      authorization =
+        policy_authorization_fixture(
+          account: account,
+          resource: pool,
+          client: initiator,
+          gateway: member,
+          membership: membership
+        )
+
+      Repo.delete!(group)
+
+      refute Repo.get_by(Portal.Membership, id: membership.id)
+      refute Repo.get_by(PolicyAuthorization, id: authorization.id)
+    end
+  end
+end

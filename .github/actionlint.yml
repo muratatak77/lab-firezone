@@ -1,0 +1,17 @@
+self-hosted-runner:
+  labels:
+    - macos-14-xlarge
+    - macos-15-xlarge
+    - macos-26-xlarge
+    - ubuntu-22.04-arm-xlarge
+    - ubuntu-22.04-xlarge
+    - ubuntu-24.04-xlarge
+    - ubuntu-latest-xlarge
+    - windows-2022-xlarge
+    - windows-2025-xlarge
+    - windows-latest-xlarge
+paths:
+  # actionlint does not know `concurrency.queue` yet.
+  .github/workflows/_{apt,rpm}.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

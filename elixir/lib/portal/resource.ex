@@ -1,0 +1,607 @@
+defmodule Portal.Resource do
+  use Ecto.Schema
+  import Ecto.Changeset
+  import Portal.Changeset
+  alias Portal.Authentication
+  alias __MODULE__.Database
+
+  @primary_key false
+  @foreign_key_type :binary_id
+  @timestamps_opts [type: :utc_datetime_usec]
+
+  @type filter :: %{
+          protocol: :tcp | :udp | :icmp,
+          ports: [Portal.Types.Int4Range.t()]
+        }
+
+  @self_device_pool_name "My devices"
+
+  @type t :: %__MODULE__{
+          id: Ecto.UUID.t(),
+          address: String.t(),
+          address_description: String.t() | nil,
+          name: String.t(),
+          type: :cidr | :ip | :dns | :internet | :device_pool,
+          device_membership_criteria: Portal.Resource.DeviceMembershipCriteria.t() | nil,
+          ip_stack: :ipv4_only | :ipv6_only | :dual,
+          filters: [filter()],
+          account_id: Ecto.UUID.t(),
+          site_id: Ecto.UUID.t() | nil,
+          inserted_at: DateTime.t(),
+          updated_at: DateTime.t()
+        }
+
+  schema "resources" do
+    belongs_to :account, Portal.Account, primary_key: true
+    field :id, :binary_id, primary_key: true, autogenerate: true
+
+    field :address, :string
+    field :address_description, :string
+    field :name, :string
+
+    field :type, Ecto.Enum, values: [:cidr, :ip, :dns, :internet, :device_pool]
+
+    field :device_membership_criteria, Portal.Resource.DeviceMembershipCriteria
+
+    field :ip_stack, Ecto.Enum, values: [:ipv4_only, :ipv6_only, :dual]
+
+    embeds_many :filters, Filter, on_replace: :delete, primary_key: false do
+      field :protocol, Ecto.Enum, values: [tcp: 6, udp: 17, icmp: 1]
+      field :ports, {:array, Portal.Types.Int4Range}, default: []
+    end
+
+    belongs_to :site, Portal.Site
+
+    has_many :policies, Portal.Policy, references: :id
+    has_many :groups, through: [:policies, :group]
+
+    timestamps()
+  end
+
+  def changeset(%Ecto.Changeset{} = changeset) do
+    fields = ~w[address address_description name type ip_stack site_id]a
+
+    changeset
+    |> trim_change(fields)
+    |> validate_length(:name, min: 1, max: 255)
+    |> validate_length(:address_description, min: 1, max: 255)
+    |> maybe_put_default_ip_stack()
+    |> validate_device_pool_site_id()
+    |> validate_device_membership_criteria()
+    |> validate_address_format()
+    |> check_constraint(:device_membership_criteria,
+      name: :resources_device_membership_criteria_matches_type,
+      message: "must be set for device pools and empty for other types"
+    )
+    |> check_constraint(:ip_stack,
+      name: :resources_ip_stack_not_null,
+      message:
+        "IP stack must be one of 'dual', 'ipv4_only', 'ipv6_only' for DNS resources or NULL for others"
+    )
+    |> check_constraint(:address,
+      name: :require_resources_address,
+      message: "must be set for cidr, ip, and dns Resources and empty for other types"
+    )
+    |> cast_embed(:filters, with: &filter_changeset/2)
+    |> assoc_constraint(:site)
+    |> assoc_constraint(:account)
+    |> unique_constraint(:name,
+      name: :resources_account_id_name_index,
+      message: "resource with this name already exists"
+    )
+    |> unique_constraint(:ipv4, name: :resources_account_id_ipv4_index)
+    |> unique_constraint(:ipv6, name: :resources_account_id_ipv6_index)
+    |> unique_constraint(:type,
+      name: :unique_internet_resource_per_account,
+      message: "Internet resource already exists for this account"
+    )
+  end
+
+  @doc """
+  Attributes of the `My devices` pool every account gets at creation: a device
+  pool holding each actor's own devices, reached at `<slug>.firezone.network`,
+  see `Portal.Device.fqdn/1`.
+  """
+  @spec self_device_pool_attrs() :: map()
+  def self_device_pool_attrs do
+    %{
+      type: :device_pool,
+      device_membership_criteria: Portal.Resource.DeviceMembershipCriteria.own_devices(),
+      name: @self_device_pool_name
+    }
+  end
+
+  @doc """
+  Validates that the Resource type and its Site agree with each other.
+
+  The Internet Resource belongs to the system managed Internet Site, every other
+  Resource belongs to a Site managed by the account. The Site is only looked up
+  when the pairing can change, so unrelated updates do not hit the database.
+  """
+  @spec validate_site_matches_type(Ecto.Changeset.t(), Authentication.Subject.t()) ::
+          Ecto.Changeset.t()
+  def validate_site_matches_type(
+        %Ecto.Changeset{} = changeset,
+        %Authentication.Subject{} = subject
+      ) do
+    type = get_field(changeset, :type)
+    site_id = get_field(changeset, :site_id)
+
+    if is_nil(type) or is_nil(site_id) or not site_pairing_changed?(changeset) do
+      changeset
+    else
+      validate_site_pairing(changeset, type, Database.fetch_site(site_id, subject))
+    end
+  end
+
+  defp site_pairing_changed?(changeset) do
+    Map.has_key?(changeset.changes, :type) or Map.has_key?(changeset.changes, :site_id)
+  end
+
+  defp validate_site_pairing(changeset, :internet, %Portal.Site{managed_by: :system}) do
+    changeset
+  end
+
+  defp validate_site_pairing(changeset, :internet, _site) do
+    add_error(changeset, :site_id, "must be the Internet Site for an Internet Resource")
+  end
+
+  defp validate_site_pairing(changeset, _type, %Portal.Site{managed_by: :system}) do
+    add_error(changeset, :site_id, "cannot be the Internet Site")
+  end
+
+  defp validate_site_pairing(changeset, _type, _site), do: changeset
+
+  defp validate_address_format(changeset) do
+    if has_errors?(changeset, :type) or has_errors?(changeset, :address) do
+      changeset
+    else
+      changeset
+      |> maybe_force_address_revalidation()
+      |> validate_address_has_no_port()
+      |> validate_address_by_type()
+    end
+  end
+
+  defp maybe_force_address_revalidation(changeset) do
+    if Map.has_key?(changeset.changes, :type) do
+      case fetch_field(changeset, :address) do
+        {_, address} when not is_nil(address) ->
+          force_change(changeset, :address, address)
+
+        _ ->
+          changeset
+      end
+    else
+      changeset
+    end
+  end
+
+  defp validate_address_by_type(changeset) do
+    case fetch_field(changeset, :type) do
+      {_, :dns} -> changeset |> validate_dns_address() |> validate_not_reserved_domain()
+      {_, :cidr} -> validate_cidr_address(changeset)
+      {_, :ip} -> validate_ip_address(changeset)
+      {_, :internet} -> put_change(changeset, :address, nil)
+      {_, :device_pool} -> put_change(changeset, :address, nil)
+      _ -> changeset
+    end
+  end
+
+  # TLD constants for DNS validation
+  @common_tlds ~w[
+    com org net edu gov mil biz info name mobi pro
+    ac ad ae af ag ai al am ao ar as at au aw ax az
+    ba bb bd be bf bg bh bi bj bm bn bo br bs bt bv bw by bz
+    ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz
+    de dj dk dm do dz ec ee eg er es et eu fi fj fk fm fo fr
+    ga gb gd ge gf gg gh gi gl gm gn gp gq gr gt gu gw gy hk
+    hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp
+    ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly
+    ma mc md me mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz
+    na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py
+    qa re ro rs ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz
+    tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug uk us uy uz
+    va vc ve vg vi vn vu wf ws ye yt za zm zw
+  ]
+
+  @prohibited_tlds ~w[localhost]
+
+  defp validate_dns_address(changeset) do
+    changeset
+    |> validate_length(:address, min: 1, max: 253)
+    |> validate_not_an_ip_address()
+    |> validate_contains_only_valid_dns_characters()
+    |> validate_dns_parts()
+  end
+
+  defp validate_not_an_ip_address(changeset) do
+    changeset
+    |> validate_change(:address, fn field, address ->
+      cond do
+        String.match?(address, ~r/^(\d+\.){3}\d+(\/$\d+)?$/) ->
+          [{field, "IP addresses are not allowed, use an IP Resource instead"}]
+
+        String.match?(
+          address,
+          ~r/^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(\/\d+)?$|^::([0-9a-fA-F]{0,4}:){0,6}[0-9a-fA-F]{0,4}(\/\d+)?$/
+        ) ->
+          [{field, "IP addresses are not allowed, use an IP Resource instead"}]
+
+        true ->
+          []
+      end
+    end)
+  end
+
+  defp validate_contains_only_valid_dns_characters(changeset) do
+    changeset
+    |> validate_format(
+      :address,
+      ~r/^(?:[a-zA-Z0-9\p{L}_*?](?:[a-zA-Z0-9\p{L}_\-*?]*[a-zA-Z0-9\p{L}_*?])?)(?:\.(?:[a-zA-Z0-9\p{L}_*?](?:[a-zA-Z0-9\p{L}_\-*?]*[a-zA-Z0-9\p{L}_*?])?))*$/u,
+      message:
+        "must be a valid hostname (letters, digits, hyphens, underscores, dots; wildcards *, ?, ** allowed)"
+    )
+  end
+
+  defp validate_dns_parts(changeset) do
+    changeset
+    |> validate_change(:address, fn field, dns_address ->
+      parts = String.split(dns_address, ".")
+
+      {tld, domain_parts} =
+        case Enum.reverse(parts) do
+          [tld | rest] -> {String.downcase(tld), rest}
+          [] -> {"", []}
+        end
+
+      cond do
+        Enum.any?(parts, &(String.length(&1) > 63)) ->
+          [{field, "each label must not exceed 63 characters"}]
+
+        String.contains?(tld, ["*", "?"]) ->
+          [{field, "TLD cannot contain wildcards"}]
+
+        tld in @prohibited_tlds ->
+          [
+            {field,
+             "#{tld} cannot be used as a TLD. Try adding a DNS alias to /etc/hosts on the Gateway(s) instead"}
+          ]
+
+        Enum.any?(domain_parts, fn part -> String.contains?(part, "**") and part != "**" end) ->
+          [{field, "wildcard pattern must not contain ** in the middle of a label"}]
+
+        Enum.all?(parts, &(&1 == "*")) ->
+          [{field, "wildcard pattern must include a valid domain"}]
+
+        tld in @common_tlds and Enum.all?(domain_parts, &String.match?(&1, ~r/^[\*\?]+$/)) ->
+          [{field, "domain for IANA TLDs cannot consist solely of wildcards"}]
+
+        true ->
+          []
+      end
+    end)
+  end
+
+  defp validate_not_reserved_domain(changeset) do
+    validate_change(changeset, :address, fn field, address ->
+      address = String.downcase(address)
+      domain = Portal.Device.domain()
+
+      if address == domain or String.ends_with?(address, "." <> domain) do
+        [{field, "#{domain} is reserved for Firezone"}]
+      else
+        []
+      end
+    end)
+  end
+
+  defp validate_cidr_address(changeset) do
+    changeset
+    |> validate_no_malformed_brackets()
+    |> validate_and_normalize_cidr(:address)
+    |> validate_not_full_tunnel(
+      ipv4_message: "please use the Internet Resource for full-tunnel traffic",
+      ipv6_message: "please use the Internet Resource for full-tunnel traffic"
+    )
+    |> validate_not_loopback()
+    |> validate_not_in_private_range()
+  end
+
+  defp validate_ip_address(changeset) do
+    changeset
+    |> validate_no_malformed_brackets()
+    |> validate_and_normalize_ip(:address)
+    |> validate_not_full_tunnel(
+      ipv4_message: "cannot contain all IPv4 addresses",
+      ipv6_message: "cannot contain all IPv6 addresses"
+    )
+    |> validate_not_loopback()
+    |> validate_not_in_private_range()
+  end
+
+  defp validate_not_full_tunnel(changeset, opts) do
+    changeset
+    |> validate_not_in_cidr(:address, %Postgrex.INET{address: {0, 0, 0, 0}, netmask: 32},
+      message: opts[:ipv4_message]
+    )
+    |> validate_not_in_cidr(
+      :address,
+      %Postgrex.INET{address: {0, 0, 0, 0, 0, 0, 0, 0}, netmask: 128},
+      message: opts[:ipv6_message]
+    )
+  end
+
+  defp validate_not_loopback(changeset) do
+    changeset
+    |> validate_not_in_cidr(:address, %Postgrex.INET{address: {127, 0, 0, 0}, netmask: 8},
+      message: "cannot contain loopback addresses"
+    )
+    |> validate_not_in_cidr(
+      :address,
+      %Postgrex.INET{address: {0, 0, 0, 0, 0, 0, 0, 1}, netmask: 128},
+      message: "cannot contain loopback addresses"
+    )
+  end
+
+  defp validate_not_in_private_range(changeset) do
+    if has_errors?(changeset, :address) do
+      changeset
+    else
+      address = get_field(changeset, :address)
+
+      if address in ["0.0.0.0/0", "::/0"] do
+        changeset
+      else
+        changeset
+        |> validate_not_in_cidr(:address, Portal.Device.reserved_ipv4_cidr())
+        |> validate_not_in_cidr(:address, Portal.Device.reserved_ipv6_cidr())
+      end
+    end
+  end
+
+  defp validate_address_has_no_port(changeset) do
+    validate_change(changeset, :address, fn :address, address ->
+      cond do
+        # Bracketed IPv6 with port: [2001:db8::1]:8080
+        String.match?(address, ~r/\]:\d+$/) ->
+          [{:address, "cannot contain a port number"}]
+
+        # Single colon indicates a port (e.g., example.com:8080, 192.168.1.1:8080)
+        # IPv6 addresses have multiple colons so they're allowed
+        String.contains?(address, ":") and not String.match?(address, ~r/:.*:/) ->
+          [{:address, "cannot contain a port number"}]
+
+        true ->
+          []
+      end
+    end)
+  end
+
+  defp validate_no_malformed_brackets(changeset) do
+    validate_change(changeset, :address, fn :address, address ->
+      has_open = String.contains?(address, "[")
+      has_close = String.contains?(address, "]")
+
+      if has_open != has_close do
+        [{:address, "has mismatched brackets"}]
+      else
+        []
+      end
+    end)
+  end
+
+  defp validate_device_pool_site_id(changeset) do
+    case fetch_field(changeset, :type) do
+      {_, :device_pool} ->
+        put_change(changeset, :site_id, nil)
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp validate_device_membership_criteria(changeset) do
+    case fetch_field(changeset, :type) do
+      {_, :device_pool} -> validate_required(changeset, [:device_membership_criteria])
+      _ -> put_change(changeset, :device_membership_criteria, nil)
+    end
+  end
+
+  defp maybe_put_default_ip_stack(changeset) do
+    current_type = get_field(changeset, :type)
+    original_type = Map.get(changeset.data, :type, nil)
+
+    cond do
+      current_type == :dns ->
+        put_default_value(changeset, :ip_stack, :dual)
+
+      original_type == :dns ->
+        put_change(changeset, :ip_stack, nil)
+
+      true ->
+        changeset
+    end
+  end
+
+  defp filter_changeset(struct, attrs) do
+    struct
+    |> cast(attrs, [:protocol, :ports])
+    |> validate_required([:protocol])
+    |> validate_ports(attrs)
+  end
+
+  # Validates the raw port tokens rather than the cast value, since the cast
+  # parser silently strips a leading "-" (turning "-1" into "1").
+  defp validate_ports(changeset, attrs) do
+    if Keyword.has_key?(changeset.errors, :ports) do
+      changeset
+    else
+      apply_port_validation(changeset, parse_port_ranges(port_tokens(attrs)))
+    end
+  end
+
+  defp apply_port_validation(changeset, :error) do
+    add_error(changeset, :ports, "must be between 1 and 65535")
+  end
+
+  defp apply_port_validation(changeset, {:ok, ranges}) do
+    cond do
+      Enum.any?(ranges, fn {lower, upper} -> lower < 1 or upper > 65_535 end) ->
+        add_error(changeset, :ports, "must be between 1 and 65535")
+
+      port_ranges_overlap?(ranges) ->
+        add_error(changeset, :ports, "port ranges must not overlap")
+
+      true ->
+        changeset
+    end
+  end
+
+  defp port_tokens(attrs) do
+    case Map.fetch(attrs, :ports) do
+      {:ok, ports} -> ports
+      :error -> Map.get(attrs, "ports", [])
+    end
+    |> List.wrap()
+    |> Enum.map(&to_string/1)
+  end
+
+  defp parse_port_ranges(tokens) do
+    tokens
+    |> Enum.reduce_while({:ok, []}, fn token, {:ok, acc} ->
+      case Regex.run(~r/^\s*(\d+)\s*(?:-\s*(\d+))?\s*$/, token) do
+        [_, lower] -> {:cont, {:ok, [port_range(lower, lower) | acc]}}
+        [_, lower, ""] -> {:cont, {:ok, [port_range(lower, lower) | acc]}}
+        [_, lower, upper] -> {:cont, {:ok, [port_range(lower, upper) | acc]}}
+        nil -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, ranges} -> {:ok, Enum.reverse(ranges)}
+      :error -> :error
+    end
+  end
+
+  defp port_range(lower, upper), do: {String.to_integer(lower), String.to_integer(upper)}
+
+  defp port_ranges_overlap?(ranges) do
+    ranges
+    |> Enum.sort_by(fn {lower, _upper} -> lower end)
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.any?(fn [{_lower1, upper1}, {lower2, _upper2}] -> lower2 <= upper1 end)
+  end
+
+  # Utility functions moved from Portal.Resources
+
+  @doc """
+    Matches a fully-qualified domain name against a DNS-style wildcard pattern.
+
+    Supports the same wildcard tokens that `:dns` resource addresses are validated
+    against:
+
+      * `**` — zero or more labels (with dots)
+      * `*`  — zero or more characters within a single label (no dots)
+      * `?`  — exactly one character within a single label (no dots)
+
+    Comparison is case-insensitive, mirroring DNS semantics.
+  """
+  @spec matches_dns_pattern?(String.t(), String.t()) :: boolean()
+  def matches_dns_pattern?(pattern, fqdn) when is_binary(pattern) and is_binary(fqdn) do
+    Regex.match?(pattern_to_regex(pattern), String.downcase(fqdn))
+  end
+
+  @doc """
+    This does two things:
+    1. Filters out resources that are not compatible with the given client or gateway version.
+    2. Converts DNS resource addresses back to the pre-1.2.0 format if the client or gateway version is < 1.2.0.
+  """
+  # Version can be nil when derive_version/1 fails to parse the user agent
+  def adapt_resource_for_version(resource, nil), do: resource
+
+  def adapt_resource_for_version(
+        %{type: :device_pool} = resource,
+        %Portal.Device{type: :client} = client
+      ) do
+    if Portal.Version.client_supports_device_pools?(client) do
+      adapt_resource_for_version(resource, client.last_seen_version)
+    else
+      nil
+    end
+  end
+
+  def adapt_resource_for_version(resource, %Portal.Device{type: :client} = client) do
+    adapt_resource_for_version(resource, client.last_seen_version)
+  end
+
+  def adapt_resource_for_version(resource, client_or_gateway_version) do
+    cond do
+      # internet resources require client and gateway >= 1.3.0
+      resource.type == :internet and Version.match?(client_or_gateway_version, "< 1.3.0") ->
+        nil
+
+      # non-internet resource, pass as-is
+      Version.match?(client_or_gateway_version, ">= 1.2.0") ->
+        resource
+
+      # we need convert dns resource addresses back to pre-1.2.0 format
+      true ->
+        resource.address
+        |> String.codepoints()
+        |> map_resource_address()
+        |> case do
+          {:cont, address} -> %{resource | address: address}
+          :drop -> nil
+        end
+    end
+  end
+
+  defp map_resource_address(address, acc \\ "")
+
+  defp map_resource_address(["*", "*" | rest], ""),
+    do: map_resource_address(rest, "*")
+
+  defp map_resource_address(["*", "*" | _rest], _acc),
+    do: :drop
+
+  defp map_resource_address(["*" | rest], ""),
+    do: map_resource_address(rest, "?")
+
+  defp map_resource_address(["*" | _rest], _acc),
+    do: :drop
+
+  defp map_resource_address(["?" | _rest], _acc),
+    do: :drop
+
+  defp map_resource_address([char | rest], acc),
+    do: map_resource_address(rest, acc <> char)
+
+  defp map_resource_address([], acc),
+    do: {:cont, acc}
+
+  defp pattern_to_regex(pattern) do
+    body =
+      ~r/\*\*|\*|\?|[^*?]+/
+      |> Regex.scan(String.downcase(pattern))
+      |> Enum.map_join(fn
+        ["**"] -> ".*"
+        ["*"] -> "[^.]*"
+        ["?"] -> "[^.]"
+        [literal] -> Regex.escape(literal)
+      end)
+
+    Regex.compile!("\\A" <> body <> "\\z")
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    alias Portal.Safe
+
+    @spec fetch_site(Ecto.UUID.t(), Portal.Authentication.Subject.t()) :: Portal.Site.t() | nil
+    def fetch_site(site_id, subject) do
+      from(s in Portal.Site, where: s.id == ^site_id)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+  end
+end

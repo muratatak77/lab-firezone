@@ -1,0 +1,2099 @@
+# credo:disable-for-this-file Credo.Check.Warning.CrossModuleDatabaseCall
+defmodule PortalWeb.Resources do
+  use PortalWeb, :live_view
+
+  alias PortalWeb.Policies.Components, as: PolicyComponents
+
+  alias PortalWeb.Resources.Components, as: ResourceComponents
+
+  alias Portal.Changes.Change
+  alias Portal.Presence
+  alias Portal.PubSub
+  alias Portal.Resource
+  alias Phoenix.LiveView.AsyncResult
+  alias __MODULE__.Database
+  alias PortalWeb.Policies.Postures
+
+  @device_search_refill_threshold 5
+
+  def mount(_params, _session, socket) do
+    subject = socket.assigns.subject
+
+    if connected?(socket) do
+      :ok = PubSub.Changes.subscribe(socket.assigns.account.id, :resources)
+      :ok = Presence.Devices.Account.subscribe(socket.assigns.account.id)
+    end
+
+    socket =
+      socket
+      |> assign(stale: false)
+      |> assign(page_title: "Resources")
+      |> assign_async(:resources_count, fn -> {:ok, %{resources_count: Database.count_resources(subject)}} end)
+      |> assign(
+        selected_resource: nil,
+        selected_resource_pool_member_ids: [],
+        selected_resource_pool_devices: [],
+        selected_resource_pool_group_ids: nil,
+        pool_group_ids: nil,
+        devices_expanded_id: nil,
+        online_ids: MapSet.new(),
+        online_site_ids: MapSet.new(),
+        selected_groups: [],
+        policy_authorizations: [],
+        policy_authorizations_page: 1,
+        policy_authorizations_has_next: false,
+        policy_authorizations_expanded_id: nil,
+        internet_resource: nil,
+        resources: [],
+        resources_metadata: %Portal.Repo.OffsetPaginator.Metadata{},
+        resource_policy_counts: %{},
+        device_pool_members: %{}
+      )
+      |> assign(resource_state_assigns(socket))
+      |> LiveTable.assign_live_table("resources",
+        query_module: Database,
+        sortable_fields: [
+          {:resources, :name},
+          {:resources, :address}
+        ],
+        loader: &load_resources/2
+      )
+
+    {:ok, socket}
+  end
+
+  def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+
+    case Database.get_resource(id, socket.assigns.subject) do
+      nil ->
+        redirect_to_resources_index(socket, "Resource does not exist.")
+
+      resource ->
+        page = parse_page(params)
+        tab = parse_show_tab(params, resource)
+
+        groups = Database.list_groups_for_resource(resource, socket.assigns.subject)
+
+        {policy_authorizations, has_next_page} =
+          Database.list_policy_authorizations_for_resource(resource, socket.assigns.subject, page)
+
+        filter_site = filter_site_from_params(params, socket.assigns.subject)
+
+        pool_devices = Database.list_pool_members(resource, socket.assigns.subject)
+        pool_member_ids = Enum.map(pool_devices, & &1.id)
+        pool_group_ids = Database.existing_pool_group_ids([resource], socket.assigns.subject)
+
+        {:noreply,
+         socket
+         |> assign(
+           filter_site: filter_site,
+           selected_resource: resource,
+           selected_resource_pool_member_ids: pool_member_ids,
+           selected_resource_pool_devices: pool_devices,
+           selected_resource_pool_group_ids: pool_group_ids,
+           devices_expanded_id: nil,
+           selected_groups: groups,
+           policy_authorizations: policy_authorizations,
+           policy_authorizations_page: page,
+           policy_authorizations_has_next: has_next_page
+         )
+         |> assign(show_resource_state_assigns(socket, tab))}
+    end
+  end
+
+  def handle_params(params, uri, %{assigns: %{live_action: :new}} = socket) do
+    sites = Database.all_sites(socket.assigns.subject)
+    changeset = Database.new_resource(socket.assigns.subject)
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+
+    {:noreply,
+     socket
+     |> assign(filter_site: nil, selected_resource: nil, selected_groups: [])
+     |> assign(new_resource_state_assigns(socket, to_form(changeset), sites))}
+  end
+
+  def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :edit}} = socket) do
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+
+    case Database.get_resource(id, socket.assigns.subject) do
+      nil ->
+        redirect_to_resources_index(socket, "Resource does not exist.")
+
+      %{type: :internet} ->
+        {:noreply, push_patch(socket, to: resource_show_path(socket, id))}
+
+      resource ->
+        sites = Database.all_sites(socket.assigns.subject)
+        changeset = Database.change_resource(resource, socket.assigns.subject)
+        selected_devices = Database.list_pool_members(resource, socket.assigns.subject)
+
+        {:noreply,
+         socket
+         |> assign(filter_site: nil, selected_resource: resource, selected_groups: [])
+         |> assign(
+           edit_resource_state_assigns(
+             socket,
+             to_form(changeset),
+             sites,
+             resource,
+             selected_devices
+           )
+         )}
+    end
+  end
+
+  def handle_params(params, uri, socket) do
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+
+    # The site only labels the filter notice, so the static render goes without it.
+    filter_site = if connected?(socket), do: filter_site_from_params(params, socket.assigns.subject)
+
+    {:noreply,
+     socket
+     |> assign(filter_site: filter_site, selected_resource: nil, selected_groups: [])
+     |> assign(resource_state_assigns(socket))}
+  end
+
+  defp resource_state_assigns(socket, overrides \\ []) do
+    [
+      resource_panel: base_resource_panel(socket, overrides),
+      resource_form: base_resource_form(nil, []),
+      resource_grant: base_resource_grant(socket),
+      resource_ui: base_resource_ui()
+    ]
+  end
+
+  defp show_resource_state_assigns(socket, tab),
+    do: resource_state_assigns(socket, tab: tab)
+
+  defp new_resource_state_assigns(socket, resource_form, sites) do
+    [
+      resource_panel: base_resource_panel(socket, view: :new_form),
+      resource_form:
+        base_resource_form(resource_form, sites,
+          pool_counts: Database.pool_counts(socket.assigns.subject, nil)
+        ),
+      resource_grant: base_resource_grant(socket),
+      resource_ui: base_resource_ui()
+    ]
+  end
+
+  defp edit_resource_state_assigns(socket, resource_form, sites, resource, selected_devices) do
+    [
+      resource_panel: base_resource_panel(socket, view: :edit_form),
+      resource_form:
+        base_resource_form(resource_form, sites,
+          active_protocols: Enum.map(resource.filters, & &1.protocol),
+          selected_devices: selected_devices,
+          pool_counts: Database.pool_counts(socket.assigns.subject, stored_group_id(resource))
+        ),
+      resource_grant: base_resource_grant(socket),
+      resource_ui: base_resource_ui()
+    ]
+  end
+
+  defp stored_group_id(%{device_membership_criteria: criteria}) do
+    case Resource.DeviceMembershipCriteria.group_id(criteria) do
+      {:ok, group_id} -> group_id
+      :error -> nil
+    end
+  end
+
+  defp base_resource_panel(socket, overrides \\ []) do
+    connect_params = Map.get(socket.private, :connect_params, %{})
+
+    Enum.into(
+      overrides,
+      %{
+        view: :list,
+        tab: :groups,
+        timezone: Map.get(connect_params, "timezone", "UTC")
+      }
+    )
+  end
+
+  defp base_resource_form(resource_form, sites, overrides \\ []) do
+    Enum.into(
+      overrides,
+      %{
+        form: resource_form,
+        sites: sites,
+        address_description_changed?: false,
+        active_protocols: [],
+        filters_dropdown_open?: false,
+        selected_devices: [],
+        pool_counts: %{},
+        device_search: "",
+        device_search_results: nil,
+        device_search_online_only?: false,
+        device_search_recently_seen?: false,
+        device_search_refilling?: false,
+        device_search_loading?: false
+      }
+    )
+  end
+
+  defp base_resource_grant(socket, overrides \\ []) do
+    Enum.into(
+      overrides,
+      %{
+        available_groups: [],
+        providers: [],
+        postures: Postures.for_account(socket.assigns.account),
+        timezone: base_resource_panel(socket).timezone,
+        grant_selected_group_ids: [],
+        grant_form: nil,
+        grant_search: "",
+        location_search: "",
+        location_operator: "is_in",
+        location_values: [],
+        ip_range_operator: "is_in_cidr",
+        ip_range_values: [],
+        ip_range_input: "",
+        auth_provider_operator: "is_in",
+        auth_provider_values: [],
+        active_conditions: [],
+        conditions_dropdown_open: false,
+        tod_values: [],
+        tod_adding?: false,
+        tod_pending: %{"on" => "", "off" => "", "days" => []},
+        tod_pending_error: nil
+      }
+    )
+  end
+
+  defp base_resource_ui(overrides \\ []) do
+    Enum.into(
+      overrides,
+      %{
+        confirm_remove_group_id: nil,
+        group_actions_open_id: nil,
+        confirm_delete_resource: false
+      }
+    )
+  end
+
+  defp merge_state(socket, key, attrs) do
+    update(socket, key, &Map.merge(&1, Map.new(attrs)))
+  end
+
+  @spec valid_tod_range?(String.t(), String.t()) :: boolean()
+  defp valid_tod_range?(on, off) do
+    with [on_h, on_m | _] <- String.split(on, ":"),
+         [off_h, off_m | _] <- String.split(off, ":"),
+         {on_h, ""} <- Integer.parse(on_h),
+         {on_m, ""} <- Integer.parse(on_m),
+         {off_h, ""} <- Integer.parse(off_h),
+         {off_m, ""} <- Integer.parse(off_m) do
+      on_h * 60 + on_m < off_h * 60 + off_m
+    else
+      _ -> false
+    end
+  end
+
+  defp filter_site_from_params(params, subject) do
+    with %{"resources_filter" => %{"site_id" => site_id}} <- params do
+      Database.get_site(site_id, subject)
+    else
+      _ -> nil
+    end
+  end
+
+  defp parse_page(params) do
+    case Integer.parse(Map.get(params, "page", "1")) do
+      {n, ""} when n >= 1 -> n
+      _ -> 1
+    end
+  end
+
+  defp parse_show_tab(params, resource) do
+    default = if ResourceComponents.lists_devices?(resource), do: "devices", else: "groups"
+
+    case Map.get(params, "tab", default) do
+      "devices" ->
+        if ResourceComponents.lists_devices?(resource), do: :devices, else: :groups
+
+      tab when tab in ~w[groups authorizations] ->
+        String.to_existing_atom(tab)
+
+      _ ->
+        String.to_existing_atom(default)
+    end
+  end
+
+  defp redirect_to_resources_index(socket, message) do
+    {:noreply,
+     socket
+     |> put_flash(:error, message)
+     |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources"))}
+  end
+
+  defp resources_index_path(socket),
+    do: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources")
+
+  defp new_resource_path(socket),
+    do: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/new")
+
+  defp resource_show_path(socket, resource_id),
+    do: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/#{resource_id}")
+
+  defp edit_resource_path(socket, resource_id),
+    do: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/#{resource_id}/edit")
+
+  defp cancel_resource_form_path(socket) do
+    case socket.assigns.resource_panel.view do
+      :edit_form -> resource_show_path(socket, socket.assigns.selected_resource.id)
+      _ -> resources_index_path(socket)
+    end
+  end
+
+  defp load_resources(subject, list_opts) do
+    list_opts = Keyword.put(list_opts, :preload, [:site])
+
+    with {:ok, resources, metadata} <- Database.list_resources(subject, list_opts) do
+      internet_resource =
+        if Portal.Account.internet_resource_enabled?(subject.account) do
+          Database.get_internet_resource(subject)
+        end
+
+      all_resources =
+        if internet_resource, do: [internet_resource | resources], else: resources
+
+      resource_policy_counts = Database.count_policies_for_resources(all_resources, subject)
+      device_pool_members = Database.pool_member_ids_for_resources(all_resources)
+      pool_group_ids = Database.existing_pool_group_ids(all_resources, subject)
+
+      {:ok,
+       %{
+         resources: resources,
+         internet_resource: internet_resource,
+         resource_policy_counts: resource_policy_counts,
+         device_pool_members: device_pool_members,
+         pool_group_ids: pool_group_ids,
+         online_ids: online_ids(subject.account.id),
+         online_site_ids: Presence.Devices.online_site_ids(subject.account.id),
+         resources_metadata: metadata
+       }}
+    end
+  end
+
+  def render(assigns) do
+    ~H"""
+    <div class="relative flex flex-col h-full overflow-hidden">
+      <Page.page_header>
+        <:icon>
+          <Core.icon name="ri-server-line" class="w-16 h-16 text-brand" />
+        </:icon>
+        <:title>Resources</:title>
+        <:description>
+          Network endpoints accessible through Firezone.
+        </:description>
+        <:action>
+          <Navigation.docs_action show_label size="md" path="/deploy/resources" />
+          <Form.button style="primary" icon="ri-add-line" phx-click="open_new_form">
+            New Resource
+          </Form.button>
+        </:action>
+        <:stats>
+          <.async_result :let={count} assign={@resources_count}>
+            <:loading><Core.badge type="primary">Loading...</Core.badge></:loading>
+            <Core.dual_badge type="primary">
+              <:left>{count}</:left>
+              <:right>Total</:right>
+            </Core.dual_badge>
+          </.async_result>
+        </:stats>
+      </Page.page_header>
+
+      <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+        <LiveTable.live_table
+          stale={@stale}
+          id="resources"
+          loading={@loading_by_table_id["resources"]}
+          query_error={@query_error_by_table_id["resources"]}
+          rows={@resources}
+          row_id={&"resource-#{&1.id}"}
+          row_click={fn r -> ~p"/#{@account}/resources/#{r.id}?#{@query_params}" end}
+          row_selected={fn r -> not is_nil(@selected_resource) and r.id == @selected_resource.id end}
+          filters={@filters_by_table_id["resources"]}
+          filter={@filter_form_by_table_id["resources"]}
+          ordered_by={@order_by_table_id["resources"]}
+          metadata={@resources_metadata}
+          class="flex-1 min-h-0"
+        >
+          <:prepend_rows :if={not is_nil(@internet_resource)}>
+            <tr
+              class={[
+                "border-b border-border cursor-pointer transition-colors group",
+                "bg-violet-50/60 dark:bg-violet-950/20",
+                if(
+                  not is_nil(@selected_resource) and
+                    @selected_resource.id == @internet_resource.id,
+                  do: "border-l-4 border-l-brand",
+                  else: "hover:bg-violet-100/60 dark:hover:bg-violet-900/20"
+                )
+              ]}
+              phx-click="table_row_click"
+              phx-value-path={~p"/#{@account}/resources/#{@internet_resource.id}"}
+            >
+              <td class="px-4 py-3">
+                <div class="flex items-center gap-2">
+                  <Core.icon name="ri-global-line" class="w-5 h-5 text-link" />
+                  <div class="font-semibold transition-colors text-heading group-hover:text-brand">
+                    Internet Resource
+                  </div>
+                  <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-violet-200/70 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+                    system
+                  </span>
+                </div>
+                <div class="text-xs text-subtle mt-0.5">
+                  Network traffic outside defined resources
+                </div>
+              </td>
+              <td class="px-4 py-3">
+                <span class={ResourceType.type_badge_class(:internet)}>
+                  {ResourceType.resource_type_label(:internet)}
+                </span>
+              </td>
+              <td class="px-4 py-3 hidden lg:table-cell">
+                <span class="font-mono text-xs text-heading">0.0.0.0/0, ::/0</span>
+              </td>
+              <td class="px-4 py-3">
+                <% count = Map.get(@resource_policy_counts, @internet_resource.id, 0) %>
+                <Navigation.link
+                  :if={count > 0}
+                  navigate={
+                    ~p"/#{@account}/policies?policies_filter[resource_id]=#{@internet_resource.id}"
+                  }
+                >
+                  <span class="inline-flex items-center justify-center w-6 h-6 rounded text-xs font-semibold tabular-nums bg-brand-wash text-heading transition-colors hover:bg-brand/40">
+                    {count}
+                  </span>
+                </Navigation.link>
+                <span
+                  :if={count == 0}
+                  class="inline-flex items-center justify-center w-6 h-6 rounded text-xs font-semibold tabular-nums bg-neutral-status-light text-body"
+                >
+                  0
+                </span>
+              </td>
+              <td class="px-4 py-3 text-body text-xs">Internet</td>
+              <td class="px-4 py-3">
+                <ResourceComponents.resource_status_badge resource={@internet_resource} online_site_ids={@online_site_ids} />
+              </td>
+            </tr>
+          </:prepend_rows>
+          <:notice :if={@filter_site} type="info">
+            Viewing Resources for Site <strong>{@filter_site.name}</strong>.
+            <Navigation.link navigate={~p"/#{@account}/resources"}>
+              View all resources
+            </Navigation.link>
+          </:notice>
+          <:col :let={resource} field={{:resources, :name}} label="Name">
+            <div class="font-medium text-heading group-hover:text-brand transition-colors">
+              {resource.name}
+            </div>
+            <div class={[
+              "text-xs mt-0.5 truncate max-w-xs",
+              if(resource.address_description,
+                do: "text-subtle",
+                else: "text-subtle italic"
+              )
+            ]}>
+              {resource.address_description || "No Address Description"}
+            </div>
+          </:col>
+          <:col :let={resource} label="Type" class="w-32">
+            <span class={ResourceType.type_badge_class(resource.type)}>
+              {ResourceType.resource_type_label(resource.type)}
+            </span>
+          </:col>
+          <:col
+            :let={resource}
+            field={{:resources, :address}}
+            label="Address"
+            class="hidden lg:table-cell"
+          >
+            <span
+              :if={resource.type not in [:internet, :device_pool]}
+              class="font-mono text-xs text-heading"
+            >
+              {resource.address}
+            </span>
+            <span
+              :if={resource.type == :internet}
+              class="font-mono text-xs text-heading"
+            >
+              0.0.0.0/0, ::/0
+            </span>
+            <span
+              :if={resource.type == :device_pool}
+              class="font-mono text-xs italic text-subtle"
+            >
+              Multiple Addresses
+            </span>
+          </:col>
+          <:col :let={resource} label="Policies" class="w-20">
+            <% count = Map.get(@resource_policy_counts, resource.id, 0) %>
+            <Navigation.link
+              :if={count > 0}
+              navigate={~p"/#{@account}/policies?policies_filter[resource_id]=#{resource.id}"}
+            >
+              <span class="inline-flex items-center justify-center w-6 h-6 rounded text-xs font-semibold tabular-nums bg-brand-wash text-heading transition-colors hover:bg-brand/40">
+                {count}
+              </span>
+            </Navigation.link>
+            <span
+              :if={count == 0}
+              class="inline-flex items-center justify-center w-6 h-6 rounded text-xs font-semibold tabular-nums bg-neutral-status-light text-body"
+            >
+              0
+            </span>
+          </:col>
+          <:col :let={resource} label="Site">
+            <Navigation.link
+              :if={resource.site}
+              navigate={~p"/#{@account}/sites/#{resource.site}"}
+              class="text-xs text-body hover:text-heading transition-colors"
+            >
+              {resource.site.name}
+            </Navigation.link>
+            <span :if={is_nil(resource.site)} class="text-xs text-subtle italic">
+              {ResourceComponents.nil_site_label(resource)}
+            </span>
+          </:col>
+          <:col :let={resource} label="Status" class="w-32">
+            <ResourceComponents.resource_status_badge
+              resource={resource}
+              online_site_ids={@online_site_ids}
+              pool_member_ids={Map.get(@device_pool_members, resource.id, [])}
+              online_ids={@online_ids}
+              pool_group_ids={@pool_group_ids}
+            />
+          </:col>
+          <:empty>
+            <div class="flex flex-col items-center gap-3 py-16">
+              <div class="w-9 h-9 rounded-lg border border-border bg-raised flex items-center justify-center">
+                <Core.icon name="ri-server-line" class="w-5 h-5 text-subtle" />
+              </div>
+              <div class="text-center">
+                <p class="text-sm font-medium text-heading">No resources yet</p>
+                <p class="text-xs text-subtle mt-0.5">
+                  Create a Resource to represent an asset or service.
+                </p>
+              </div>
+              <Navigation.link
+                patch={LiveTable.live_table_path(assigns, ~p"/#{@account}/resources/new")}
+                class="flex items-center gap-1 px-2.5 py-1 rounded text-xs border border-border-strong text-body hover:text-heading hover:border-border-emphasis bg-surface transition-colors"
+              >
+                <Core.icon name="ri-add-line" class="w-3 h-3" /> Add a Resource
+              </Navigation.link>
+            </div>
+          </:empty>
+        </LiveTable.live_table>
+      </div>
+      <ResourceComponents.panel_shell open={
+        not is_nil(@selected_resource) or @resource_panel.view in [:new_form, :edit_form]
+      }>
+        <%= if @resource_panel.view in [:new_form, :edit_form] do %>
+          <ResourceComponents.resource_form_panel
+            account={@account}
+            subject={@subject}
+            resource={@selected_resource}
+            panel_view={@resource_panel.view}
+            form_state={resource_form_panel_state(assigns)}
+          />
+        <% end %>
+
+        <%= if @selected_resource && @resource_panel.view not in [:new_form, :edit_form] do %>
+          <ResourceComponents.resource_details_panel
+            account={@account}
+            resource={@selected_resource}
+            pool_member_ids={@selected_resource_pool_member_ids}
+            pool_devices={@selected_resource_pool_devices}
+            pool_group_ids={@selected_resource_pool_group_ids}
+            devices_expanded_id={@devices_expanded_id}
+            online_ids={@online_ids}
+            online_site_ids={@online_site_ids}
+            groups={@selected_groups}
+            policy_authorizations={@policy_authorizations}
+            policy_authorizations_page={@policy_authorizations_page}
+            policy_authorizations_has_next={@policy_authorizations_has_next}
+            policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+            panel_view={@resource_panel.view}
+            tab={@resource_panel.tab}
+            grant_state={resource_grant_panel_state(assigns)}
+            ui_state={resource_panel_ui_state(assigns)}
+          />
+        <% end %>
+      </ResourceComponents.panel_shell>
+    </div>
+    """
+  end
+
+  def handle_event(event, params, socket)
+      when event in [
+             "paginate",
+             "order_by",
+             "filter",
+             "reload",
+             "table_row_click",
+             "change_limit"
+           ],
+      do: LiveTable.handle_live_table_event(event, params, socket)
+
+  def handle_event("close_panel", _params, socket) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources"))}
+  end
+
+  def handle_event("open_new_form", _params, socket) do
+    {:noreply, push_patch(socket, to: new_resource_path(socket))}
+  end
+
+  def handle_event(
+        "open_edit_form",
+        _params,
+        %{assigns: %{selected_resource: %{type: :internet}}} = socket
+      ) do
+    {:noreply, socket}
+  end
+
+  def handle_event(
+        "open_edit_form",
+        _params,
+        %{assigns: %{selected_resource: %Resource{} = resource}} = socket
+      ) do
+    {:noreply, push_patch(socket, to: edit_resource_path(socket, resource.id))}
+  end
+
+  def handle_event("open_edit_form", _params, %{assigns: %{selected_resource: nil}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("cancel_resource_form", _params, socket) do
+    {:noreply, push_patch(socket, to: cancel_resource_form_path(socket))}
+  end
+
+  def handle_event(
+        "switch_resource_tab",
+        %{"tab" => tab},
+        %{assigns: %{selected_resource: %Resource{} = resource}} = socket
+      ) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/#{resource}", tab: tab))}
+  end
+
+  def handle_event(
+        "switch_resource_tab",
+        _params,
+        %{assigns: %{selected_resource: nil}} = socket
+      ) do
+    {:noreply, socket}
+  end
+
+  def handle_event(
+        "change_policy_authorizations_page",
+        %{"page" => page},
+        %{assigns: %{selected_resource: %Resource{} = resource}} = socket
+      ) do
+    {:noreply,
+     push_patch(socket,
+       to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/#{resource.id}", tab: "authorizations", page: page)
+     )}
+  end
+
+  def handle_event(
+        "change_policy_authorizations_page",
+        _params,
+        %{assigns: %{selected_resource: nil}} = socket
+      ) do
+    {:noreply, socket}
+  end
+
+  def handle_event("toggle_policy_authorization_row", %{"id" => id}, socket) do
+    expanded =
+      if socket.assigns.policy_authorizations_expanded_id == id, do: nil, else: id
+
+    {:noreply, assign(socket, policy_authorizations_expanded_id: expanded)}
+  end
+
+  def handle_event("toggle_pool_device_row", %{"id" => id}, socket) do
+    expanded =
+      if socket.assigns.devices_expanded_id == id, do: nil, else: id
+
+    {:noreply, assign(socket, devices_expanded_id: expanded)}
+  end
+
+  def handle_event("change_resource_form", %{"resource" => attrs} = payload, socket) do
+    address_description_changed? =
+      socket.assigns.resource_form.address_description_changed? ||
+        payload["_target"] == ["resource", "address_description"]
+
+    attrs = ResourceComponents.map_filters_form_attrs(attrs)
+
+    changeset =
+      if socket.assigns.resource_panel.view == :new_form do
+        Database.new_resource(socket.assigns.subject, attrs)
+      else
+        Database.change_resource(socket.assigns.selected_resource, socket.assigns.subject, attrs)
+      end
+      |> Map.put(:action, :validate)
+
+    {:noreply,
+     socket
+     |> merge_state(:resource_form,
+       form: to_form(changeset),
+       address_description_changed?: address_description_changed?,
+       pool_counts: Database.pool_counts(socket.assigns.subject, attrs["group_id"])
+     )}
+  end
+
+  def handle_event("submit_resource_form", %{"resource" => attrs}, socket) do
+    attrs = ResourceComponents.map_filters_form_attrs(attrs)
+
+    if socket.assigns.resource_panel.view == :new_form do
+      case Database.create_resource(
+             attrs,
+             socket.assigns.resource_form.selected_devices,
+             socket.assigns.subject
+           ) do
+        {:ok, resource} ->
+          socket = put_flash(socket, :success, "Resource #{resource.name} created successfully")
+
+          {:noreply,
+           socket
+           |> LiveTable.reload_live_table!("resources")
+           |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/#{resource.id}"))}
+
+        {:error, changeset} ->
+          changeset = Map.put(changeset, :action, :validate)
+          {:noreply, merge_state(socket, :resource_form, form: to_form(changeset))}
+      end
+    else
+      resource = socket.assigns.selected_resource
+
+      case Database.update_resource(
+             resource,
+             attrs,
+             socket.assigns.resource_form.selected_devices,
+             socket.assigns.subject
+           ) do
+        {:ok, updated_resource} ->
+          socket =
+            put_flash(socket, :success, "Resource #{updated_resource.name} updated successfully")
+
+          {:noreply,
+           socket
+           |> LiveTable.reload_live_table!("resources")
+           |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources/#{updated_resource.id}"))}
+
+        {:error, changeset} ->
+          changeset = Map.put(changeset, :action, :validate)
+          {:noreply, merge_state(socket, :resource_form, form: to_form(changeset))}
+      end
+    end
+  end
+
+  def handle_event("handle_keydown", %{"key" => "Escape"}, socket)
+      when socket.assigns.resource_panel.view in [:new_form, :edit_form] do
+    {:noreply, push_patch(socket, to: cancel_resource_form_path(socket))}
+  end
+
+  def handle_event("handle_keydown", %{"key" => "Escape"}, socket)
+      when not is_nil(socket.assigns.selected_resource) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources"))}
+  end
+
+  def handle_event("handle_keydown", _params, socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("add_resource_filter", %{"protocol" => protocol}, socket) do
+    protocol = String.to_existing_atom(protocol)
+    active = socket.assigns.resource_form.active_protocols
+
+    {:noreply,
+     merge_state(socket, :resource_form,
+       active_protocols: if(protocol in active, do: active, else: active ++ [protocol]),
+       filters_dropdown_open?: false
+     )}
+  end
+
+  def handle_event("remove_resource_filter", %{"protocol" => protocol}, socket) do
+    protocol = String.to_existing_atom(protocol)
+
+    {:noreply,
+     merge_state(socket, :resource_form,
+       active_protocols: List.delete(socket.assigns.resource_form.active_protocols, protocol)
+     )}
+  end
+
+  def handle_event("toggle_resource_filters_dropdown", _params, socket) do
+    {:noreply,
+     merge_state(socket, :resource_form,
+       filters_dropdown_open?: !socket.assigns.resource_form.filters_dropdown_open?
+     )}
+  end
+
+  def handle_event("close_resource_filters_dropdown", _params, socket) do
+    {:noreply, merge_state(socket, :resource_form, filters_dropdown_open?: false)}
+  end
+
+  def handle_event("focus_device_search", _params, socket) do
+    {:noreply, run_device_search(socket, page: 1)}
+  end
+
+  def handle_event("blur_device_search", _params, socket) do
+    {:noreply,
+     socket
+     |> cancel_async(:device_search)
+     |> merge_state(:resource_form, device_search_results: nil, device_search_loading?: false)}
+  end
+
+  def handle_event("search_device", %{"device_search" => search}, socket) do
+    socket = merge_state(socket, :resource_form, device_search: search)
+    {:noreply, run_device_search(socket, page: 1)}
+  end
+
+  def handle_event("device_search_page", %{"page" => page}, socket) do
+    case Integer.parse(page) do
+      {page, ""} -> {:noreply, run_device_search(socket, page: page)}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("toggle_device_search_filter", %{"filter" => filter}, socket) do
+    case device_search_filter_key(filter) do
+      nil ->
+        {:noreply, socket}
+
+      key ->
+        enabled? = !Map.fetch!(socket.assigns.resource_form, key)
+        socket = merge_state(socket, :resource_form, [{key, enabled?}])
+        {:noreply, run_device_search(socket, page: 1)}
+    end
+  end
+
+  def handle_event("add_device", %{"device_id" => device_id}, socket) do
+    case Database.get_device(device_id, socket.assigns.subject) do
+      nil ->
+        {:noreply, socket}
+
+      device ->
+        form = socket.assigns.resource_form
+        selected = Enum.uniq_by([device | form.selected_devices], & &1.id)
+        socket = merge_state(socket, :resource_form, selected_devices: selected)
+
+        # Re-running the search is a full scan on large accounts, so backfill the page from the
+        # reserve fetched with it and only top the reserve up in the background once it runs out.
+        case take_device_search_result(form.device_search_results, device.id) do
+          nil ->
+            {:noreply, socket}
+
+          results ->
+            socket
+            |> merge_state(:resource_form, device_search_results: results)
+            |> maybe_refill_device_search()
+            |> then(&{:noreply, &1})
+        end
+    end
+  end
+
+  def handle_event("remove_device", %{"device_id" => device_id}, socket) do
+    form = socket.assigns.resource_form
+    selected = Enum.reject(form.selected_devices, &(&1.id == device_id))
+
+    socket = merge_state(socket, :resource_form, selected_devices: selected)
+    {:noreply, run_device_search(socket, page: current_device_search_page(form))}
+  end
+
+  def handle_event("open_grant_form", _params, socket) do
+    resource = socket.assigns.selected_resource
+    existing_ids = Enum.map(socket.assigns.selected_groups, & &1.group.id)
+    available = Database.list_available_groups(resource, existing_ids, socket.assigns.subject)
+    providers = Database.list_providers(socket.assigns.subject)
+
+    {:noreply,
+     socket
+     |> merge_state(:resource_panel, view: :grant_form)
+     |> assign(
+       resource_grant:
+         base_resource_grant(socket,
+           available_groups: available,
+           providers: providers,
+           grant_form: ResourceComponents.to_grant_form(resource)
+         )
+     )
+     |> assign(resource_ui: base_resource_ui())}
+  end
+
+  def handle_event("close_grant_form", _params, socket) do
+    {:noreply,
+     socket
+     |> merge_state(:resource_panel, view: :list)
+     |> assign(resource_grant: base_resource_grant(socket))
+     |> assign(resource_ui: base_resource_ui())}
+  end
+
+  def handle_event("search_grant_groups", %{"value" => search}, socket) do
+    {:noreply, merge_state(socket, :resource_grant, grant_search: search)}
+  end
+
+  def handle_event("update_location_search", %{"_location_search" => search}, socket) do
+    {:noreply, merge_state(socket, :resource_grant, location_search: search)}
+  end
+
+  def handle_event("change_location_operator", %{"operator" => op}, socket) do
+    {:noreply, merge_state(socket, :resource_grant, location_operator: op)}
+  end
+
+  def handle_event("change_ip_range_operator", %{"operator" => op}, socket) do
+    {:noreply, merge_state(socket, :resource_grant, ip_range_operator: op)}
+  end
+
+  def handle_event("update_ip_range_input", %{"_ip_range_input" => value}, socket) do
+    {:noreply, merge_state(socket, :resource_grant, ip_range_input: value)}
+  end
+
+  def handle_event("add_ip_range_value", _params, socket) do
+    value = String.trim(socket.assigns.resource_grant.ip_range_input)
+
+    if value != "" and value not in socket.assigns.resource_grant.ip_range_values do
+      {:noreply,
+       merge_state(socket, :resource_grant,
+         ip_range_values: socket.assigns.resource_grant.ip_range_values ++ [value],
+         ip_range_input: ""
+       )}
+    else
+      {:noreply, merge_state(socket, :resource_grant, ip_range_input: "")}
+    end
+  end
+
+  def handle_event("remove_ip_range_value", %{"value" => value}, socket) do
+    {:noreply,
+     merge_state(socket, :resource_grant,
+       ip_range_values: List.delete(socket.assigns.resource_grant.ip_range_values, value)
+     )}
+  end
+
+  def handle_event("change_auth_provider_operator", %{"operator" => op}, socket) do
+    {:noreply, merge_state(socket, :resource_grant, auth_provider_operator: op)}
+  end
+
+  def handle_event("toggle_auth_provider_value", %{"id" => id}, socket) do
+    values = socket.assigns.resource_grant.auth_provider_values
+
+    updated =
+      if id in values do
+        List.delete(values, id)
+      else
+        values ++ [id]
+      end
+
+    {:noreply, merge_state(socket, :resource_grant, auth_provider_values: updated)}
+  end
+
+  def handle_event("toggle_location_value", %{"code" => code}, socket) do
+    values = socket.assigns.resource_grant.location_values
+
+    updated =
+      if code in values do
+        List.delete(values, code)
+      else
+        values ++ [code]
+      end
+
+    {:noreply, merge_state(socket, :resource_grant, location_values: updated)}
+  end
+
+  def handle_event("start_add_tod_range", _params, socket) do
+    {:noreply,
+     merge_state(socket, :resource_grant,
+       tod_adding?: true,
+       tod_pending: %{"on" => "", "off" => "", "days" => []}
+     )}
+  end
+
+  def handle_event("cancel_tod_range", _params, socket) do
+    {:noreply,
+     merge_state(socket, :resource_grant,
+       tod_adding?: false,
+       tod_pending: %{"on" => "", "off" => "", "days" => []},
+       tod_pending_error: nil
+     )}
+  end
+
+  def handle_event("toggle_tod_pending_day", %{"day" => day}, socket) do
+    {:noreply,
+     update(socket, :resource_grant, fn grant ->
+       days = grant.tod_pending["days"]
+       updated = if day in days, do: List.delete(days, day), else: days ++ [day]
+       Map.put(grant, :tod_pending, Map.put(grant.tod_pending, "days", updated))
+     end)}
+  end
+
+  def handle_event("confirm_tod_range", _params, socket) do
+    pending = socket.assigns.resource_grant.tod_pending
+    on = pending["on"] || ""
+    off = pending["off"] || ""
+    days = pending["days"] || []
+
+    cond do
+      days == [] or on == "" or off == "" ->
+        {:noreply, merge_state(socket, :resource_grant, tod_pending_error: "Must choose day, on-time, and off-time")}
+
+      not valid_tod_range?(on, off) ->
+        {:noreply, merge_state(socket, :resource_grant, tod_pending_error: "End time must be after start time")}
+
+      true ->
+        {:noreply,
+         update(socket, :resource_grant, fn grant ->
+           grant
+           |> Map.put(:tod_values, grant.tod_values ++ [pending])
+           |> Map.put(:tod_adding?, false)
+           |> Map.put(:tod_pending, %{"on" => "", "off" => "", "days" => []})
+           |> Map.put(:tod_pending_error, nil)
+         end)}
+    end
+  end
+
+  def handle_event("remove_tod_range", %{"index" => index}, socket) do
+    index = String.to_integer(index)
+
+    {:noreply,
+     update(socket, :resource_grant, fn grant ->
+       Map.put(grant, :tod_values, List.delete_at(grant.tod_values, index))
+     end)}
+  end
+
+  def handle_event("change_tod_pending", params, socket) do
+    {:noreply,
+     update(socket, :resource_grant, fn grant ->
+       updates =
+         Map.take(params, ["_tod_on", "_tod_off"])
+         |> Map.new(fn
+           {"_tod_on", v} -> {"on", v}
+           {"_tod_off", v} -> {"off", v}
+         end)
+
+       grant
+       |> Map.put(:tod_pending, Map.merge(grant.tod_pending, updates))
+       |> Map.put(:tod_pending_error, nil)
+     end)}
+  end
+
+  def handle_event("change_tod_timezone", params, socket) do
+    timezone = get_in(params, ["policy", "conditions", "current_utc_datetime", "timezone"])
+    {:noreply, merge_state(socket, :resource_grant, timezone: timezone)}
+  end
+
+  def handle_event("toggle_grant_group", %{"group_id" => group_id}, socket) do
+    selected = socket.assigns.resource_grant.grant_selected_group_ids
+
+    updated =
+      if group_id in selected do
+        List.delete(selected, group_id)
+      else
+        selected ++ [group_id]
+      end
+
+    {:noreply, merge_state(socket, :resource_grant, grant_selected_group_ids: updated)}
+  end
+
+  def handle_event("postures_" <> _rest = event, params, socket) do
+    {:noreply,
+     update(socket, :resource_grant, fn grant ->
+       Map.update!(grant, :postures, &Postures.handle_event(event, params, &1))
+     end)}
+  end
+
+  def handle_event("submit_grant", params, socket) do
+    resource = socket.assigns.selected_resource
+    selected_group_ids = socket.assigns.resource_grant.grant_selected_group_ids
+    policy_params = Map.get(params, "policy", %{})
+
+    condition_attrs =
+      policy_params
+      |> PolicyComponents.map_condition_params(empty_values: :drop)
+      |> PolicyComponents.maybe_drop_unsupported_conditions(socket)
+      |> Postures.maybe_drop_unsupported(socket.assigns.resource_grant.postures)
+
+    result =
+      Enum.reduce_while(selected_group_ids, :ok, fn group_id, :ok ->
+        attrs =
+          Map.merge(condition_attrs, %{
+            "resource_id" => resource.id,
+            "group_id" => group_id
+          })
+
+        case Database.insert_policy(attrs, socket.assigns.subject) do
+          {:ok, _policy} -> {:cont, :ok}
+          {:error, changeset} -> {:halt, {:error, changeset}}
+        end
+      end)
+
+    case result do
+      :ok ->
+        groups = Database.list_groups_for_resource(resource, socket.assigns.subject)
+
+        {:noreply,
+         socket
+         |> assign(selected_groups: groups)
+         |> merge_state(:resource_panel, view: :list)
+         |> assign(resource_grant: base_resource_grant(socket))
+         |> assign(resource_ui: base_resource_ui())
+         |> LiveTable.reload_live_table!("resources")}
+
+      {:error, changeset} ->
+        {:noreply,
+         merge_state(socket, :resource_grant, grant_form: to_form(changeset, as: :policy))}
+    end
+  end
+
+  def handle_event("toggle_group_actions", %{"group_id" => id}, socket) do
+    current = socket.assigns.resource_ui.group_actions_open_id
+
+    {:noreply,
+     merge_state(socket, :resource_ui,
+       group_actions_open_id: if(current == id, do: nil, else: id)
+     )}
+  end
+
+  def handle_event("close_group_actions", _params, socket) do
+    {:noreply, merge_state(socket, :resource_ui, group_actions_open_id: nil)}
+  end
+
+  def handle_event("disable_policy", %{"group_id" => group_id}, socket) do
+    result =
+      Database.disable_policy_for_group(
+        socket.assigns.selected_resource,
+        group_id,
+        socket.assigns.subject
+      )
+
+    apply_group_state_change(socket, result)
+  end
+
+  def handle_event("enable_policy", %{"group_id" => group_id}, socket) do
+    result =
+      Database.enable_policy_for_group(
+        socket.assigns.selected_resource,
+        group_id,
+        socket.assigns.subject
+      )
+
+    apply_group_state_change(socket, result)
+  end
+
+  def handle_event(
+        "confirm_delete_resource",
+        _params,
+        %{assigns: %{selected_resource: %{type: :internet}}} = socket
+      ) do
+    {:noreply, socket}
+  end
+
+  def handle_event("confirm_delete_resource", _params, socket) do
+    {:noreply, merge_state(socket, :resource_ui, confirm_delete_resource: true)}
+  end
+
+  def handle_event("cancel_delete_resource", _params, socket) do
+    {:noreply, merge_state(socket, :resource_ui, confirm_delete_resource: false)}
+  end
+
+  def handle_event("delete_resource", _params, socket) do
+    resource = socket.assigns.selected_resource
+
+    case Database.delete_resource(resource, socket.assigns.subject) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> put_flash(:success, "Resource \"#{resource.name}\" was deleted.")
+         |> LiveTable.reload_live_table!("resources")
+         |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/resources"))}
+
+      {:error, _} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Could not delete resource.")
+         |> merge_state(:resource_ui, confirm_delete_resource: false)}
+    end
+  end
+
+  def handle_event("confirm_remove_group", %{"group_id" => group_id}, socket) do
+    {:noreply,
+     merge_state(socket, :resource_ui,
+       confirm_remove_group_id: group_id,
+       group_actions_open_id: nil
+     )}
+  end
+
+  def handle_event("cancel_remove_group", _params, socket) do
+    {:noreply, merge_state(socket, :resource_ui, confirm_remove_group_id: nil)}
+  end
+
+  def handle_event("remove_group_access", %{"group_id" => group_id}, socket) do
+    result =
+      Database.delete_policy_for_group(
+        socket.assigns.selected_resource,
+        group_id,
+        socket.assigns.subject
+      )
+
+    apply_group_removal(socket, result)
+  end
+
+  def handle_event("toggle_conditions_dropdown", _params, socket) do
+    {:noreply,
+     merge_state(socket, :resource_grant,
+       conditions_dropdown_open: !socket.assigns.resource_grant.conditions_dropdown_open
+     )}
+  end
+
+  def handle_event("add_condition", %{"type" => type}, socket) do
+    type = String.to_existing_atom(type)
+
+    {:noreply,
+     merge_state(socket, :resource_grant,
+       active_conditions: socket.assigns.resource_grant.active_conditions ++ [type],
+       conditions_dropdown_open: false
+     )}
+  end
+
+  def handle_event("remove_condition", %{"type" => type}, socket) do
+    type = String.to_existing_atom(type)
+
+    {:noreply,
+     merge_state(socket, :resource_grant,
+       active_conditions: List.delete(socket.assigns.resource_grant.active_conditions, type)
+     )}
+  end
+
+  def handle_info(%Change{op: :insert, struct: %Resource{type: type}} = change, socket)
+      when type != :internet do
+    {:noreply,
+     socket
+     |> update(:resources_count, fn
+       %AsyncResult{ok?: true} = ar -> AsyncResult.ok(ar, ar.result + 1)
+       ar -> ar
+     end)
+     |> mark_stale_if_unreflected(change)}
+  end
+
+  def handle_info(%Change{op: :delete, old_struct: %Resource{type: type}} = change, socket)
+      when type != :internet do
+    {:noreply,
+     socket
+     |> update(:resources_count, fn
+       %AsyncResult{ok?: true} = ar -> AsyncResult.ok(ar, max(ar.result - 1, 0))
+       ar -> ar
+     end)
+     |> mark_stale_if_unreflected(change)}
+  end
+
+  def handle_info(%Change{old_struct: %Resource{}} = change, socket) do
+    {:noreply, mark_stale_if_unreflected(socket, change)}
+  end
+
+  def handle_info(%Change{struct: %Resource{}} = change, socket) do
+    {:noreply, mark_stale_if_unreflected(socket, change)}
+  end
+
+  def handle_info(%Phoenix.Socket.Broadcast{event: event}, socket)
+      when event in ["presence_diff", "presence_state"] do
+    {:noreply,
+     assign(socket,
+       online_ids: online_ids(socket.assigns.account.id),
+       online_site_ids: Presence.Devices.online_site_ids(socket.assigns.account.id)
+     )}
+  end
+
+  def handle_info(_, socket) do
+    {:noreply, socket}
+  end
+
+  def handle_async(:device_search, {:ok, results}, socket) do
+    selected = socket.assigns.resource_form.selected_devices
+
+    socket
+    |> merge_state(:resource_form,
+      device_search_results: without_selected_devices(results, selected),
+      device_search_loading?: false
+    )
+    |> then(&{:noreply, &1})
+  end
+
+  def handle_async(:device_search, {:exit, _reason}, socket),
+    do: {:noreply, merge_state(socket, :resource_form, device_search_loading?: false)}
+
+  def handle_async(:device_search_refill, {:ok, {key, fresh}}, socket) do
+    socket = merge_state(socket, :resource_form, device_search_refilling?: false)
+    form = socket.assigns.resource_form
+
+    if form.device_search_results && key == device_search_key(form) do
+      results = merge_device_search_refill(form.device_search_results, fresh, form.selected_devices)
+
+      # Devices added while the top-up was running may have used up the reserve again.
+      socket
+      |> merge_state(:resource_form, device_search_results: results)
+      |> maybe_refill_device_search()
+      |> then(&{:noreply, &1})
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_async(:device_search_refill, {:exit, _reason}, socket),
+    do: {:noreply, merge_state(socket, :resource_form, device_search_refilling?: false)}
+
+  defp device_search_filter_key("online_only"), do: :device_search_online_only?
+  defp device_search_filter_key("recently_seen"), do: :device_search_recently_seen?
+  defp device_search_filter_key(_filter), do: nil
+
+  defp take_device_search_result(%{devices: devices} = results, device_id) do
+    case Enum.split_with(devices, &(&1.id == device_id)) do
+      {[], _devices} ->
+        nil
+
+      {_taken, devices} ->
+        {fill, reserve} = Enum.split(results.reserve, 1)
+        %{results | devices: devices ++ fill, reserve: reserve, total: results.total - 1}
+    end
+  end
+
+  defp take_device_search_result(_results, _device_id), do: nil
+
+  defp maybe_refill_device_search(socket) do
+    form = socket.assigns.resource_form
+    results = form.device_search_results
+    shown_through = (results.page - 1) * results.page_size + length(results.devices)
+
+    # Top up once the reserve is running low and more devices exist past it, or when the page
+    # emptied out while earlier pages still have devices (the last one on the last page was added).
+    # A top-up already in flight is left to finish rather than restarted on every add.
+    low_reserve? =
+      length(results.reserve) <= @device_search_refill_threshold and
+        results.total > shown_through + length(results.reserve)
+
+    if not form.device_search_refilling? and (low_reserve? or (results.devices == [] and results.total > 0)) do
+      key = device_search_key(form)
+      subject = socket.assigns.subject
+
+      socket
+      |> merge_state(:resource_form, device_search_refilling?: true)
+      |> start_async(:device_search_refill, fn ->
+        {key, Database.search_devices(form.device_search, subject, form.selected_devices, device_search_opts(form))}
+      end)
+    else
+      socket
+    end
+  end
+
+  # The results were closed (or the search cleared) while the refill was running.
+  defp merge_device_search_refill(results, fresh, _selected) when is_nil(results) or is_nil(fresh),
+    do: results
+
+  # The page shifted (e.g. its last device was added), so show the fresh results as they are.
+  defp merge_device_search_refill(%{page: page}, %{page: fresh_page} = fresh, _selected)
+       when page != fresh_page,
+       do: fresh
+
+  defp merge_device_search_refill(%{devices: devices} = results, fresh, selected_devices) do
+    hidden_ids = MapSet.new(devices ++ selected_devices, & &1.id)
+    pool = Enum.reject(fresh.devices ++ fresh.reserve, &MapSet.member?(hidden_ids, &1.id))
+    {fill, reserve} = Enum.split(pool, results.page_size - length(devices))
+
+    %{results | devices: devices ++ fill, reserve: reserve, total: fresh.total}
+  end
+
+  defp device_search_key(form) do
+    page = current_device_search_page(form)
+    {form.device_search, form.device_search_online_only?, form.device_search_recently_seen?, page}
+  end
+
+  defp device_search_opts(form, opts \\ []) do
+    Keyword.merge(opts,
+      online_only: form.device_search_online_only?,
+      recently_seen: form.device_search_recently_seen?,
+      page: Keyword.get(opts, :page, current_device_search_page(form))
+    )
+  end
+
+  defp current_device_search_page(%{device_search_results: %{page: page}}), do: page
+  defp current_device_search_page(_form), do: 1
+
+  defp run_device_search(socket, opts) do
+    form = socket.assigns.resource_form
+
+    subject = socket.assigns.subject
+    socket = cancel_async(socket, :device_search_refill)
+
+    if form.device_search in [nil, ""] and not form.device_search_online_only? and
+         not form.device_search_recently_seen? do
+      socket
+      |> cancel_async(:device_search)
+      |> merge_state(:resource_form,
+        device_search_results: nil,
+        device_search_loading?: false,
+        device_search_refilling?: false
+      )
+    else
+      # The search scans every device in the account, so run it off the LiveView process and
+      # drop any search still in flight: typing then never queues up behind stale searches.
+      socket
+      |> cancel_async(:device_search)
+      |> merge_state(:resource_form, device_search_loading?: true, device_search_refilling?: false)
+      |> start_async(:device_search, fn ->
+        Database.search_devices(form.device_search, subject, form.selected_devices, device_search_opts(form, opts))
+      end)
+    end
+  end
+
+  # Devices may have been added from the previous results while this search was running.
+  defp without_selected_devices(%{devices: devices, reserve: reserve, total: total} = results, selected) do
+    selected_ids = MapSet.new(selected, & &1.id)
+    keep? = &(not MapSet.member?(selected_ids, &1.id))
+    {devices, dropped} = Enum.split_with(devices, keep?)
+    {reserve, dropped_reserve} = Enum.split_with(reserve, keep?)
+
+    %{results | devices: devices, reserve: reserve, total: total - length(dropped) - length(dropped_reserve)}
+  end
+
+  defp without_selected_devices(results, _selected), do: results
+
+  defp online_ids(account_id) do
+    account_id
+    |> Presence.Devices.online_ids()
+    |> MapSet.new()
+  end
+
+  defp resource_filter_ports(nil), do: %{}
+
+  defp resource_filter_ports(%Phoenix.HTML.Form{source: nil}), do: %{}
+
+  defp resource_filter_ports(%Phoenix.HTML.Form{source: source}) do
+    source
+    |> Ecto.Changeset.get_field(:filters, [])
+    |> Map.new(fn f -> {f.protocol, Enum.join(f.ports, ", ")} end)
+  end
+
+  defp resource_filter_ports(_), do: %{}
+
+  defp resource_filter_errors(nil), do: %{}
+
+  defp resource_filter_errors(%Phoenix.HTML.Form{source: nil}), do: %{}
+
+  defp resource_filter_errors(%Phoenix.HTML.Form{source: %Ecto.Changeset{} = source}) do
+    source
+    |> Ecto.Changeset.get_change(:filters, [])
+    |> Enum.flat_map(fn filter ->
+      protocol = Ecto.Changeset.get_field(filter, :protocol)
+
+      case Keyword.get(filter.errors, :ports) do
+        {msg, _opts} -> [{protocol, msg}]
+        nil -> []
+      end
+    end)
+    |> Map.new()
+  end
+
+  defp resource_filter_errors(_), do: %{}
+
+  defp resource_form_panel_state(assigns) do
+    %{
+      resource_form: assigns.resource_form.form,
+      resource_form_sites: assigns.resource_form.sites,
+      resource_form_active_protocols: assigns.resource_form.active_protocols,
+      resource_form_filters_dropdown_open: assigns.resource_form.filters_dropdown_open?,
+      resource_form_selected_devices: assigns.resource_form.selected_devices,
+      resource_form_pool_counts: assigns.resource_form.pool_counts,
+      resource_form_device_search: assigns.resource_form.device_search,
+      resource_form_device_search_results: assigns.resource_form.device_search_results,
+      resource_form_device_search_online_only: assigns.resource_form.device_search_online_only?,
+      resource_form_device_search_recently_seen: assigns.resource_form.device_search_recently_seen?,
+      resource_form_device_search_loading: assigns.resource_form.device_search_loading?,
+      filter_ports: resource_filter_ports(assigns.resource_form.form),
+      filter_errors: resource_filter_errors(assigns.resource_form.form)
+    }
+  end
+
+  defp resource_grant_panel_state(assigns) do
+    assigns.resource_grant
+  end
+
+  defp resource_panel_ui_state(assigns) do
+    assigns.resource_ui
+  end
+
+  defp mark_stale_if_unreflected(socket, change) do
+    LiveTable.mark_stale_unless_reflected(socket, "resources", socket.assigns.resources, change)
+  end
+
+  defp apply_group_state_change(socket, {:error, _}) do
+    {:noreply, put_flash(socket, :error, "Could not update group access.")}
+  end
+
+  defp apply_group_state_change(socket, result) do
+    socket =
+      socket
+      |> refresh_selected_groups()
+      |> merge_state(:resource_ui, group_actions_open_id: nil)
+      |> maybe_put_stale_flash(result, "Group access state has changed.")
+
+    {:noreply, socket}
+  end
+
+  defp apply_group_removal(socket, {:error, _}) do
+    {:noreply,
+     socket
+     |> put_flash(:error, "Could not remove group access.")
+     |> merge_state(:resource_ui, confirm_remove_group_id: nil)}
+  end
+
+  defp apply_group_removal(socket, result) do
+    socket =
+      socket
+      |> refresh_selected_groups()
+      |> merge_state(:resource_ui, confirm_remove_group_id: nil, group_actions_open_id: nil)
+      |> LiveTable.reload_live_table!("resources")
+      |> maybe_put_stale_flash(result, "Group access no longer exists.")
+
+    {:noreply, socket}
+  end
+
+  defp refresh_selected_groups(socket) do
+    groups =
+      Database.list_groups_for_resource(socket.assigns.selected_resource, socket.assigns.subject)
+
+    assign(socket, selected_groups: groups)
+  end
+
+  defp maybe_put_stale_flash(socket, nil, message) do
+    put_flash(socket, :error, message)
+  end
+
+  defp maybe_put_stale_flash(socket, _result, _message) do
+    socket
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    import Ecto.Changeset
+    import Portal.Repo.Query
+    alias Portal.Safe
+    alias Portal.Resource
+    alias Portal.Policy
+    alias Portal.PolicyAuthorization
+    alias Portal.ClientToken
+    alias Portal.Actor
+    alias Portal.Device
+    alias Portal.Site
+    alias Portal.Group
+    alias Portal.Directory
+    alias PortalWeb.Resources.Components
+
+    @update_fields ~w[address address_description name type device_membership_criteria ip_stack site_id]a
+
+    defdelegate get_device(device_id, subject), to: Components.Database
+    defdelegate search_devices(search_term, subject, selected_devices, opts), to: Components.Database
+
+    def all_sites(subject) do
+      from(s in Site, as: :sites)
+      |> where([sites: s], s.managed_by != :system)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+    end
+
+    def new_resource(subject, attrs \\ %{}, device_ids \\ []) do
+      changeset =
+        %Resource{}
+        |> cast(normalize_pool_attrs(attrs, device_ids), @update_fields)
+        |> put_change(:account_id, subject.account.id)
+        |> Resource.changeset()
+        |> Resource.validate_site_matches_type(subject)
+
+      case get_field(changeset, :type) do
+        :device_pool ->
+          validate_required(changeset, [:name])
+
+        _ ->
+          validate_required(changeset, [:name, :address])
+      end
+    end
+
+    def create_resource(attrs, selected_devices, subject) do
+      changeset =
+        new_resource(subject, attrs, Enum.map(selected_devices, & &1.id))
+        |> maybe_validate_required_fields()
+
+      with {:ok, _validated_devices} <-
+             Components.Database.validate_selected_devices(selected_devices, subject),
+           {:ok, resource} <- Safe.scoped(changeset, subject) |> Safe.insert() do
+        {:ok, resource}
+      else
+        {:error, %Ecto.Changeset{} = cs} ->
+          {:error, cs}
+
+        {:error, :invalid_devices} ->
+          {:error, add_error(changeset, :name, "one or more selected devices are invalid")}
+
+        {:error, :unauthorized} ->
+          {:error, add_error(changeset, :name, "you are not authorized to perform this action")}
+      end
+    end
+
+    defp maybe_validate_required_fields(changeset) do
+      case get_field(changeset, :type) do
+        :device_pool ->
+          validate_required(changeset, [:name])
+
+        _ ->
+          validate_required(changeset, [:site_id])
+      end
+    end
+
+    def change_resource(resource, subject, attrs \\ %{}, device_ids \\ []) do
+      changeset =
+        resource
+        |> cast(normalize_pool_attrs(attrs, device_ids), @update_fields)
+        |> Resource.changeset()
+        |> Resource.validate_site_matches_type(subject)
+
+      case get_field(changeset, :type) do
+        :device_pool ->
+          validate_required(changeset, [:name, :type])
+
+        _ ->
+          validate_required(changeset, [:name, :type, :site_id])
+      end
+    end
+
+    # The form's "Members" choice and the picked devices become the membership criteria.
+    defp normalize_pool_attrs(%{"type" => "device_pool", "members" => "own_devices"} = attrs, _ids) do
+      put_criteria(attrs, Resource.DeviceMembershipCriteria.own_devices())
+    end
+
+    defp normalize_pool_attrs(%{"type" => "device_pool", "members" => "listed"} = attrs, ids) do
+      put_criteria(attrs, Resource.DeviceMembershipCriteria.devices(ids))
+    end
+
+    defp normalize_pool_attrs(%{"type" => "device_pool", "members" => "all_devices"} = attrs, _ids) do
+      put_criteria(attrs, Resource.DeviceMembershipCriteria.all_devices())
+    end
+
+    defp normalize_pool_attrs(%{"type" => "device_pool", "members" => "actor_group"} = attrs, _ids) do
+      case Ecto.UUID.cast(attrs["group_id"]) do
+        {:ok, group_id} -> put_criteria(attrs, Resource.DeviceMembershipCriteria.actor_group(group_id))
+        :error -> Map.put(attrs, "device_membership_criteria", nil)
+      end
+    end
+
+    defp normalize_pool_attrs(attrs, _device_ids), do: attrs
+
+    defp put_criteria(attrs, criteria) do
+      Map.put(attrs, "device_membership_criteria", Resource.DeviceMembershipCriteria.to_map(criteria))
+    end
+
+    def update_resource(resource, attrs, selected_devices, subject) do
+      changeset = change_resource(resource, subject, attrs, Enum.map(selected_devices, & &1.id))
+
+      with {:ok, _validated_devices} <-
+             Components.Database.validate_selected_devices(selected_devices, subject),
+           {:ok, updated_resource} <- Safe.scoped(changeset, subject) |> Safe.update() do
+        {:ok, updated_resource}
+      else
+        {:error, %Ecto.Changeset{} = cs} ->
+          {:error, cs}
+
+        {:error, :invalid_devices} ->
+          {:error, add_error(changeset, :name, "one or more selected devices are invalid")}
+
+        {:error, :unauthorized} ->
+          {:error, add_error(changeset, :name, "you are not authorized to perform this action")}
+      end
+    end
+
+    def list_pool_members(%Resource{} = resource, subject) do
+      device_ids =
+        case Resource.DeviceMembershipCriteria.device_ids(resource.device_membership_criteria) do
+          {:ok, ids} -> ids
+          :error -> []
+        end
+
+      from(c in Device, as: :devices)
+      |> where([devices: d], d.type == :client)
+      |> where([devices: d], d.id in ^device_ids)
+      |> preload(:actor)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> case do
+        {:error, _} ->
+          []
+
+        devices ->
+          Portal.Presence.Devices.preload_presence(devices)
+      end
+    end
+
+    def get_resource(id, subject) do
+      from(r in Resource, as: :resources)
+      |> where([resources: r], r.id == ^id)
+      |> preload(:site)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    def get_site(id, subject) do
+      from(s in Site, as: :sites)
+      |> where([sites: s], s.id == ^id)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    def get_internet_resource(subject) do
+      from(r in Resource, as: :resources)
+      |> where([resources: r], r.type == :internet)
+      |> preload(:site)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    def count_resources(subject) do
+      from(r in Resource, as: :resources)
+      |> where([resources: r], r.type != :internet)
+      |> Safe.scoped(subject)
+      |> Safe.aggregate(:count)
+    end
+
+    def list_resources(subject, opts \\ []) do
+      from(resources in Resource, as: :resources)
+      |> where([resources: r], r.type != :internet)
+      |> Safe.scoped(subject)
+      |> Safe.list_offset(__MODULE__, opts)
+    end
+
+    def count_policies_for_resources(resources, subject) do
+      ids = resources |> Enum.map(& &1.id) |> Enum.uniq()
+
+      from(p in Policy, as: :policies)
+      |> where([policies: p], p.resource_id in ^ids)
+      |> where([policies: p], p.is_disabled == false)
+      |> group_by([policies: p], p.resource_id)
+      |> select([policies: p], {p.resource_id, count(p.id)})
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> case do
+        {:error, _} -> %{}
+        counts -> Map.new(counts)
+      end
+    end
+
+    def pool_member_ids_for_resources(resources) do
+      for resource <- resources,
+          {:ok, device_ids} <-
+            [Resource.DeviceMembershipCriteria.device_ids(resource.device_membership_criteria)],
+          into: %{},
+          do: {resource.id, device_ids}
+    end
+
+    # Counts with the same rule the portal authorizes by, so the badge and the pool agree.
+    def pool_counts(subject, group_id) do
+      counts = %{
+        own_devices: count_criteria_devices(Resource.DeviceMembershipCriteria.own_devices(), subject),
+        all_devices: count_criteria_devices(Resource.DeviceMembershipCriteria.all_devices(), subject)
+      }
+
+      case Ecto.UUID.cast(group_id) do
+        {:ok, id} ->
+          Map.put(counts, :actor_group, count_criteria_devices(Resource.DeviceMembershipCriteria.actor_group(id), subject))
+
+        :error ->
+          counts
+      end
+    end
+
+    defp count_criteria_devices(criteria, subject) do
+      from(d in Portal.Device, as: :devices)
+      |> where([devices: d], d.type == :client)
+      |> Resource.DeviceMembershipCriteria.where_members(
+        criteria,
+        Resource.DeviceMembershipCriteria.scope(criteria, subject)
+      )
+      |> Safe.scoped(subject)
+      |> Safe.aggregate(:count)
+    end
+
+    def existing_pool_group_ids(resources, subject) do
+      group_ids =
+        for resource <- resources,
+            {:ok, group_id} <-
+              [Resource.DeviceMembershipCriteria.group_id(resource.device_membership_criteria)],
+            do: group_id
+
+      if group_ids == [] do
+        MapSet.new()
+      else
+        from(g in Group, as: :groups)
+        |> where([groups: g], g.id in ^group_ids)
+        |> select([groups: g], g.id)
+        |> Safe.scoped(subject)
+        |> Safe.all()
+        |> case do
+          {:error, _reason} -> MapSet.new()
+          ids -> MapSet.new(ids)
+        end
+      end
+    end
+
+    def list_groups_for_resource(resource, subject) do
+      from(g in Group, as: :groups)
+      |> join(:inner, [groups: g], p in Policy,
+        on:
+          p.group_id == g.id and p.account_id == g.account_id and
+            p.resource_id == ^resource.id,
+        as: :policies
+      )
+      |> join(:left, [groups: g], d in Directory,
+        on: d.id == g.directory_id and d.account_id == g.account_id,
+        as: :directory
+      )
+      |> select([groups: g, directory: d, policies: p], %{
+        group: g,
+        directory_type: d.type,
+        policy_id: p.id,
+        policy_is_disabled: p.is_disabled
+      })
+      |> order_by([policies: p], asc: p.is_disabled)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> case do
+        {:error, _} -> []
+        rows -> rows
+      end
+    end
+
+    @page_size 25
+
+    @spec list_policy_authorizations_for_resource(
+            Portal.Resource.t(),
+            Portal.Authentication.Subject.t(),
+            non_neg_integer()
+          ) :: {[map()], boolean()}
+    def list_policy_authorizations_for_resource(resource, subject, page \\ 1) do
+      offset = (page - 1) * @page_size
+
+      from(pa in PolicyAuthorization, as: :policy_authorizations)
+      |> where([policy_authorizations: pa], pa.resource_id == ^resource.id)
+      |> join(:inner, [policy_authorizations: pa], p in Policy,
+        on: p.id == pa.policy_id and p.account_id == pa.account_id,
+        as: :policies
+      )
+      |> join(:left, [policies: p], g in Group,
+        on: g.id == p.group_id and g.account_id == p.account_id,
+        as: :groups
+      )
+      |> join(:inner, [policy_authorizations: pa], t in ClientToken,
+        on: t.id == pa.token_id and t.account_id == pa.account_id,
+        as: :tokens
+      )
+      |> join(:left, [tokens: t], a in Actor,
+        on: a.id == t.actor_id and a.account_id == t.account_id,
+        as: :actors
+      )
+      |> join(:left, [policy_authorizations: pa], id in Device,
+        on: id.id == pa.initiating_device_id and id.account_id == pa.account_id,
+        as: :initiating_devices
+      )
+      |> join(:left, [policy_authorizations: pa], rd in Device,
+        on: rd.id == pa.receiving_device_id and rd.account_id == pa.account_id,
+        as: :receiving_devices
+      )
+      |> select(
+        [policy_authorizations: pa, groups: g, actors: a, initiating_devices: id, receiving_devices: rd],
+        %{
+          authorization: pa,
+          group: g,
+          actor: a,
+          initiating_device: id,
+          receiving_device: rd
+        }
+      )
+      |> order_by([policy_authorizations: pa], desc: pa.inserted_at, desc: pa.id)
+      |> limit(^(@page_size + 1))
+      |> offset(^offset)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> case do
+        {:error, _} ->
+          {[], false}
+
+        rows ->
+          has_next = length(rows) > @page_size
+          {Enum.take(rows, @page_size), has_next}
+      end
+    end
+
+    def list_available_groups(_resource, existing_group_ids, subject) do
+      from(g in Group, as: :groups)
+      |> where([groups: g], g.id not in ^existing_group_ids)
+      |> join(:left, [groups: g], d in Directory,
+        on: d.id == g.directory_id and d.account_id == g.account_id,
+        as: :directory
+      )
+      |> select([groups: g, directory: d], %{group: g, directory_type: d.type})
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> case do
+        {:error, _} -> []
+        rows -> rows
+      end
+    end
+
+    def insert_policy(attrs, subject) do
+      changeset =
+        %Portal.Policy{}
+        |> cast(attrs, ~w[description group_id resource_id flow_log_uploads_enabled require_attestation postures]a)
+        |> validate_required(~w[group_id resource_id]a)
+        |> cast_embed(:conditions, with: &Portal.Policies.Condition.changeset/3)
+        |> Portal.Policy.changeset()
+        |> put_change(:account_id, subject.account.id)
+        |> populate_group_idp_id(subject)
+        |> Portal.Policy.default_flow_log_uploads_for_internet_resource(attrs, subject)
+
+      Safe.scoped(changeset, subject)
+      |> Safe.insert()
+    end
+
+    def delete_resource(resource, subject) do
+      Safe.scoped(resource, subject)
+      |> Safe.delete()
+    end
+
+    def delete_policy_for_group(resource, group_id, subject) do
+      with %Policy{} = policy <- fetch_policy_for_group(resource, group_id, subject) do
+        Safe.scoped(policy, subject) |> Safe.delete()
+      end
+    end
+
+    def disable_policy_for_group(resource, group_id, subject) do
+      with %Policy{} = policy <- fetch_policy_for_group(resource, group_id, subject, state: :enabled) do
+        set_policy_is_disabled(policy, subject, true)
+      end
+    end
+
+    def enable_policy_for_group(resource, group_id, subject) do
+      with %Policy{} = policy <-
+             fetch_policy_for_group(resource, group_id, subject, state: :disabled) do
+        set_policy_is_disabled(policy, subject, false)
+      end
+    end
+
+    def list_providers(subject) do
+      [
+        Portal.Userpass.AuthProvider,
+        Portal.EmailOTP.AuthProvider,
+        Portal.OIDC.AuthProvider,
+        Portal.Google.AuthProvider,
+        Portal.GitHub.AuthProvider,
+        Portal.Entra.AuthProvider,
+        Portal.Okta.AuthProvider
+      ]
+      |> Enum.flat_map(fn schema ->
+        from(p in schema, where: not p.is_disabled)
+        |> Safe.scoped(subject)
+        |> Safe.all()
+      end)
+    end
+
+    defp populate_group_idp_id(changeset, subject) do
+      case get_change(changeset, :group_id) do
+        nil ->
+          changeset
+
+        group_id ->
+          idp_id =
+            from(g in Group, where: g.id == ^group_id, select: g.idp_id)
+            |> Safe.scoped(subject)
+            |> Safe.one()
+
+          put_change(changeset, :group_idp_id, idp_id)
+      end
+    end
+
+    def cursor_fields do
+      [
+        {:resources, :asc, :name},
+        {:resources, :asc, :inserted_at},
+        {:resources, :asc, :id}
+      ]
+    end
+
+    def filters do
+      [
+        %Portal.Repo.Filter{
+          name: :name_or_address,
+          title: "Name or Address",
+          type: {:string, :websearch},
+          fun: &filter_by_name_fts_or_address/2
+        },
+        %Portal.Repo.Filter{
+          name: :site_id,
+          type: {:string, :uuid},
+          values: [],
+          fun: &filter_by_site_id/2
+        },
+        %Portal.Repo.Filter{
+          name: :type,
+          title: "Type",
+          type: :string,
+          values: [
+            {"DNS", "dns"},
+            {"IP", "ip"},
+            {"CIDR", "cidr"},
+            {"Device Pool", "device_pool"}
+          ],
+          fun: &filter_by_type/2
+        }
+      ]
+    end
+
+    def filter_by_name_fts_or_address(queryable, name_or_address) do
+      {queryable,
+       dynamic(
+         [resources: resources],
+         fulltext_search(resources.name, ^name_or_address) or
+           fulltext_search(resources.address, ^name_or_address)
+       )}
+    end
+
+    def filter_by_site_id(queryable, site_id) do
+      {queryable, dynamic([resources: r], r.site_id == ^site_id)}
+    end
+
+    def filter_by_type(queryable, type) do
+      {queryable, dynamic([resources: r], r.type == ^String.to_existing_atom(type))}
+    end
+
+    defp fetch_policy_for_group(resource, group_id, subject, opts \\ []) do
+      from(p in Policy, as: :policies)
+      |> where([policies: p], p.resource_id == ^resource.id and p.group_id == ^group_id)
+      |> filter_policy_state(opts[:state])
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    defp filter_policy_state(query, :enabled),
+      do: where(query, [policies: p], p.is_disabled == false)
+
+    defp filter_policy_state(query, :disabled),
+      do: where(query, [policies: p], p.is_disabled == true)
+
+    defp filter_policy_state(query, _), do: query
+
+    defp set_policy_is_disabled(policy, subject, is_disabled) do
+      Ecto.Changeset.change(policy, %{is_disabled: is_disabled})
+      |> Safe.scoped(subject)
+      |> Safe.update()
+    end
+  end
+end

@@ -1,0 +1,180 @@
+# Firezone Android client
+
+This README contains instructions for building and testing the Android client
+locally.
+
+## Dev Setup
+
+### Quick setup (recommended)
+
+Requires [Rust](https://www.rust-lang.org/tools/install) and
+[mise](https://mise.jdx.dev/getting-started.html) to be installed.
+
+```bash
+mise run setup
+mise run build
+```
+
+This installs Java, Android SDK/NDK, Rust cross-compilation targets, and
+creates `local.properties`. See `mise-tasks/setup.sh` for details.
+
+To install on a connected device or emulator:
+
+```bash
+mise run install-phone     # connected hardware device
+mise run install-emulator  # creates/boots an emulator and launches the app
+```
+
+Both tasks build only the cargo target matching the device's ABI (detected via
+`adb` for `install-phone`, host arch for `install-emulator`), which is roughly
+4x faster than the default all-ABI build.
+
+### Wireless ADB
+
+Useful when your USB connection is flaky. Both flows give you a regular `adb`
+connection, after which `mise run install-phone` works normally.
+
+**Android 11+** (native pairing, persists across reboots):
+
+1. On the device: Settings → Developer options → Wireless debugging → enable.
+1. Tap "Pair device with pairing code" — note the IP, port, and 6-digit code.
+1. On the host:
+
+   ```bash
+   adb pair <ip>:<pair-port> <code>     # one-off pairing
+   adb connect <ip>:<connect-port>      # port shown on the main wireless screen
+   ```
+
+**Android 10 and older** (USB seed required, resets on reboot):
+
+1. Connect once over USB and confirm `adb devices` lists the phone.
+1. Switch the device's adb daemon to TCP and connect:
+
+   ```bash
+   adb tcpip 5555
+   adb connect <phone-ip>:5555    # Settings → About phone → Status for the IP
+   ```
+
+1. Disconnect USB. The connection persists until the phone reboots, after which
+   you'll need to repeat the USB seed step.
+
+### Manual setup
+
+If you'd rather not use `mise run setup`:
+
+1. Install Rust, JDK 17, and the Android SDK (via
+   [Android Studio](https://developer.android.com/studio) or `sdkmanager`).
+1. Install the NDK version pinned as `ndkVersion` in `app/build.gradle.kts` via
+   Android Studio's SDK Manager or `sdkmanager "ndk;<version>"`.
+1. Create `local.properties` with `sdk.dir=/path/to/Android/Sdk`.
+1. Add the Rust cross-compilation targets to the toolchain pinned in
+   `rust/rust-toolchain.toml`:
+
+   ```
+   rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+   ```
+
+1. Run `./gradlew assembleDebug` to verify.
+
+If you get errors about `cargo` not being found, make sure `~/.cargo/bin` is on
+the `PATH` of whatever launches the build; the Gradle task invokes `cargo`
+directly. For example:
+
+```
+# ~/.zprofile or ~/.bash_profile
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+## Running against a mock
+
+Debug builds can stand in for connlib, the portal, or both, so the UI can be
+driven without a gateway, a portal or a granted VPN permission. They are two
+boolean extras on the normal launch, read by `MainActivity` before anything
+that depends on them:
+
+| Extra            | What it stands in for                                                         |
+| ---------------- | ----------------------------------------------------------------------------- |
+| `mockTunnel`     | connlib: the session reports the fixtures the end-to-end tests assert against |
+| `skipPortalAuth` | the portal: signing in answers its own request instead of opening a browser   |
+
+In Android Studio, put them in **Run → Edit Configurations → Launch Flags** on
+the app configuration:
+
+```
+--ez mockTunnel true --ez skipPortalAuth true
+```
+
+Or by hand:
+
+```bash
+adb shell am start -n dev.firezone.android/.core.presentation.MainActivity \
+  --ez mockTunnel true --ez skipPortalAuth true
+```
+
+Either extra can be set to `false` to exercise the real half: `mockTunnel true
+skipPortalAuth false` runs the mocked tunnel against a real sign-in.
+
+## Managed test device
+
+The `managed-device:*` tasks drive the test Device Policy Controller in `dpc/`
+by broadcast, which puts an attached emulator into every state an X.509-managed
+device can be in without a human at the screen: a certificate the app may use,
+one installed without a grant, several to tell apart, or nothing installed at
+all. A corporate-owned device whose policy names the certificate for the app is
+`policy-alias`: the DPC answers the KeyChain itself, and nothing is asked of the
+user or configured in the app. The ungranted certificate under a required
+`managed-config` is what a personally-owned device carrying a work profile looks
+like, and it is what sends the app to the certificate screen. To see the user
+tell certificates apart, install a second one under another alias, from any
+PKCS#12 with `--file`.
+
+```bash
+mise run //kotlin/android:managed-device:provision
+mise run //kotlin/android:managed-device:install-certificate --no-grant
+mise run //kotlin/android:managed-device:managed-config --certificate true
+mise run //kotlin/android:managed-device:policy-alias --alias firezone-client
+```
+
+`provision` makes the DPC the owner of the device, or of a work profile with
+`--work-profile`; a device owner can only be set on an emulator that carries no
+accounts, so pick an image without Play Services. The certificate comes from
+the shared X.509 tasks, so issue one first:
+
+```bash
+mise run //:x509:create-ca
+mise run //:x509:gen-certificate device
+```
+
+`reset` gives the device back.
+
+## Release Setup
+
+We release from GitHub CI, so this shouldn't be necessary. But if you're looking
+to test the `release` variant locally:
+
+1. Download the keystore from 1Pass and save to `app/.signing/keystore.jks` dir.
+1. Now you can execute the `*Release` tasks with:
+
+```shell
+export KEYSTORE_PATH="$(pwd)/app/.signing/keystore.jks"
+HISTCONTROL=ignorespace # prevents saving the next line in shell history
+ KEYSTORE_PASSWORD='keystore_password' KEYSTORE_KEY_PASSWORD='keystore_key_password' ./gradlew assembleRelease
+```
+
+## Logs
+
+To stream colored logcat from the connected device/emulator:
+
+```
+mise run logcat
+```
+
+Set `ANDROID_SERIAL` to disambiguate when multiple devices/emulators are
+connected. Pass a tag filterspec after `--` to narrow the output, e.g. just the
+Rust `connlib` tag:
+
+```
+mise run logcat -- 'connlib:V *:S'
+```
+
+This will show logs of all levels from the `connlib` tag and silence logs from other tags (`*:S`).

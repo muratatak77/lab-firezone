@@ -1,0 +1,9 @@
+avoid-breaking-exported-api = false # We don't publish anything to crates.io, hence we don't need to worry about breaking Rust API changes.
+disallowed-methods = [
+  { path = "tracing::subscriber::set_global_default", reason = "Does not init `LogTracer`, use `firezone_logging::init` instead." },
+  { path = "anyhow::Error::is", reason = "Does not check entire source chain, use `any_is` instead" },
+  { path = "anyhow::Error::downcast_ref", reason = "Does not check entire source chain, use `any_downcast_ref` instead" },
+  { path = "anyhow::Error::downcast_mut", reason = "Does not check entire source chain, use `any_downcast_ref` instead" },
+  { path = "anyhow::Error::downcast", reason = "Does not check entire source chain, use `any_downcast_ref` instead" },
+  { path = "anyhow::Error::root_cause", reason = "Does not check entire source chain, use `any_downcast_ref` instead" },
+]

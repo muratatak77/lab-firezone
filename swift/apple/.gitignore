@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+build/
+DerivedData/
+xcuserdata/
+**/*.xcuserstate
+Firezone/xcconfig/dynamic_build_number.xcconfig
+FirezoneNetworkExtension/Connlib/Generated/

@@ -1,0 +1,2366 @@
+defmodule PortalWeb.Policies.Components do
+  use PortalWeb, :component_library
+  alias PortalWeb.Policies.{Database, Postures}
+  alias PortalWeb.Policies.PostureComponents
+
+  @days_of_week [
+    {"M", "Monday"},
+    {"T", "Tuesday"},
+    {"W", "Wednesday"},
+    {"R", "Thursday"},
+    {"F", "Friday"},
+    {"S", "Saturday"},
+    {"U", "Sunday"}
+  ]
+
+  def maybe_drop_unsupported_conditions(attrs, socket) do
+    if Portal.Account.policy_conditions_enabled?(socket.assigns.account) do
+      attrs
+    else
+      Map.delete(attrs, "conditions")
+    end
+  end
+
+  def map_condition_params(attrs, opts) do
+    Map.update(attrs, "conditions", %{}, fn conditions ->
+      for {property, condition_attrs} <- conditions,
+          maybe_filter(condition_attrs, opts),
+          condition_attrs = map_condition_values(condition_attrs),
+          into: %{} do
+        {property, condition_attrs}
+      end
+    end)
+  end
+
+  defp maybe_filter(%{"values" => values}, empty_values: :drop) when is_list(values) do
+    not (values
+         |> List.wrap()
+         |> Enum.reject(fn value -> value in [nil, ""] end)
+         |> Enum.empty?())
+  end
+
+  defp maybe_filter(%{"values" => values}, empty_values: :drop) when is_map(values) do
+    not (values
+         |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+         |> Enum.empty?())
+  end
+
+  defp maybe_filter(%{}, empty_values: :drop) do
+    false
+  end
+
+  defp maybe_filter(_condition_attrs, _opts) do
+    true
+  end
+
+  defp map_condition_values(
+         %{
+           "operator" => "is_in_day_of_week_time_ranges",
+           "timezone" => timezone
+         } = condition_attrs
+       ) do
+    Map.update(condition_attrs, "values", [], fn values ->
+      day_ranges =
+        values
+        |> Enum.sort_by(fn {idx, _} -> String.to_integer(idx) end)
+        |> Enum.flat_map(fn
+          {_idx, %{"on" => on, "off" => off, "days" => days}}
+          when is_binary(on) and on != "" and is_binary(off) and off != "" ->
+            days
+            |> List.wrap()
+            |> Enum.filter(&(&1 in ["M", "T", "W", "R", "F", "S", "U"]))
+            |> Enum.map(&{&1, "#{on}-#{off}"})
+
+          _ ->
+            []
+        end)
+
+      day_ranges
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Enum.sort_by(fn {day, _} -> day_of_week_index(day) end)
+      |> Enum.map(fn {day, ranges} -> "#{day}/#{Enum.join(ranges, ",")}/#{timezone}" end)
+    end)
+  end
+
+  defp map_condition_values(condition_attrs) do
+    condition_attrs
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, default: nil
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :subject, :any, required: true
+  attr :panel, :map, required: true
+  attr :conditions_state, :map, required: true
+  attr :postures, :map, required: true
+  attr :confirm_state, :map, required: true
+  attr :policy_authorizations, :list, default: []
+  attr :policy_authorizations_page, :integer, default: 1
+  attr :policy_authorizations_has_next, :boolean, default: false
+  attr :policy_authorizations_expanded_id, :string, default: nil
+
+  def policy_panel(assigns) do
+    cs = assigns.conditions_state
+
+    assigns =
+      assign(assigns, :form_conditions_state, %{
+        timezone: cs.panel_timezone,
+        location_search: cs.panel_location_search,
+        location_operator: cs.panel_location_operator,
+        location_values: cs.panel_location_values,
+        ip_range_operator: cs.panel_ip_range_operator,
+        ip_range_values: cs.panel_ip_range_values,
+        ip_range_input: cs.panel_ip_range_input,
+        auth_provider_operator: cs.panel_auth_provider_operator,
+        auth_provider_values: cs.panel_auth_provider_values,
+        tod_values: cs.panel_tod_values,
+        tod_adding: cs.panel_tod_adding,
+        tod_pending: cs.panel_tod_pending,
+        tod_pending_error: cs.panel_tod_pending_error
+      })
+
+    ~H"""
+    <div
+      id="policy-panel"
+      class={[
+        "absolute inset-y-0 right-0 z-10 flex flex-col w-full lg:w-3/4 xl:w-2/3",
+        "bg-elevated border-l border-border-strong",
+        "shadow-[-4px_0px_20px_rgba(0,0,0,0.07)]",
+        "transition-transform duration-200 ease-in-out",
+        if(@policy || @panel.panel_view in [:edit_form, :new_form],
+          do: "translate-x-0",
+          else: "translate-x-full"
+        )
+      ]}
+      phx-window-keydown="handle_keydown"
+      phx-key="Escape"
+    >
+      <.policy_form_view
+        :if={@panel.panel_view == :new_form}
+        account={@account}
+        subject={@subject}
+        providers={@providers}
+        disabled_providers={@disabled_providers}
+        x509_auth_provider_id={@x509_auth_provider_id}
+        has_trust_anchors?={@has_trust_anchors?}
+        panel_form={@panel.panel_form}
+        panel_selected_resource={@panel.panel_selected_resource}
+        panel_active_conditions={@conditions_state.panel_active_conditions}
+        panel_conditions_dropdown_open={@conditions_state.panel_conditions_dropdown_open}
+        conditions_state={@form_conditions_state}
+        postures={@postures}
+        mode={:new}
+      />
+
+      <.policy_form_view
+        :if={@panel.panel_view == :edit_form}
+        account={@account}
+        subject={@subject}
+        providers={@providers}
+        disabled_providers={@disabled_providers}
+        x509_auth_provider_id={@x509_auth_provider_id}
+        has_trust_anchors?={@has_trust_anchors?}
+        panel_form={@panel.panel_form}
+        panel_selected_resource={@panel.panel_selected_resource}
+        panel_active_conditions={@conditions_state.panel_active_conditions}
+        panel_conditions_dropdown_open={@conditions_state.panel_conditions_dropdown_open}
+        conditions_state={@form_conditions_state}
+        postures={@postures}
+        mode={:edit}
+      />
+
+      <Form.modal
+        :if={@panel.panel_view == :edit_form and @confirm_state.confirm_breaking_change}
+        id="policy-breaking-change-modal"
+        on_close="cancel_policy_breaking_change"
+        on_cancel="cancel_policy_breaking_change"
+        on_confirm="save_policy_breaking_change"
+      >
+        <:title>Save these changes?</:title>
+        <:body>
+          <p>
+            Existing connections using this policy will be reset.
+          </p>
+        </:body>
+        <:cancel_button>Cancel</:cancel_button>
+        <:confirm_button>Save Changes</:confirm_button>
+      </Form.modal>
+
+      <.policy_details_view
+        :if={@policy && @panel.panel_view == :list}
+        account={@account}
+        policy={@policy}
+        connected_posture_providers={@postures.connected}
+        providers={@providers}
+        disabled_providers={@disabled_providers}
+        x509_auth_provider_id={@x509_auth_provider_id}
+        has_trust_anchors?={@has_trust_anchors?}
+        tab={@panel.panel_tab}
+        confirm_disable_policy={@confirm_state.confirm_disable_policy}
+        confirm_delete_policy={@confirm_state.confirm_delete_policy}
+        policy_authorizations={@policy_authorizations}
+        policy_authorizations_page={@policy_authorizations_page}
+        policy_authorizations_has_next={@policy_authorizations_has_next}
+        policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+      />
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :subject, :any, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :panel_form, :any, default: nil
+  attr :panel_selected_resource, :any, default: nil
+  attr :panel_active_conditions, :list, default: []
+  attr :panel_conditions_dropdown_open, :boolean, default: false
+  attr :conditions_state, :map, required: true
+  attr :mode, :atom, required: true
+
+  attr :postures, :map, required: true
+
+  def policy_form_view(assigns) do
+    ~H"""
+    <div class="flex flex-col h-full overflow-hidden">
+      <.policy_form_header mode={@mode} />
+      <.form
+        id="policy-form"
+        for={@panel_form}
+        phx-submit="submit_policy_form"
+        phx-change="change_policy_form"
+        class="flex flex-col flex-1 min-h-0 overflow-hidden"
+      >
+        <.policy_form_body
+          account={@account}
+          mode={@mode}
+          subject={@subject}
+          providers={@providers}
+          disabled_providers={@disabled_providers}
+          x509_auth_provider_id={@x509_auth_provider_id}
+          has_trust_anchors?={@has_trust_anchors?}
+          panel_form={@panel_form}
+          panel_selected_resource={@panel_selected_resource}
+          panel_active_conditions={@panel_active_conditions}
+          panel_conditions_dropdown_open={@panel_conditions_dropdown_open}
+          conditions_state={@conditions_state}
+          postures={@postures}
+        />
+        <.policy_form_actions mode={@mode} postures={@postures} />
+      </.form>
+    </div>
+    """
+  end
+
+  attr :mode, :atom, required: true
+
+  def policy_form_header(assigns) do
+    ~H"""
+    <div class="shrink-0 px-5 pt-4 pb-3 border-b border-border bg-elevated">
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-sm font-semibold text-heading">
+          {if @mode == :new, do: "Add Policy", else: "Edit Policy"}
+        </h2>
+        <Form.icon_button icon="ri-close-line" title="Close (Esc)" phx-click="cancel_policy_form" />
+      </div>
+    </div>
+    """
+  end
+
+  attr :mode, :atom, required: true
+  attr :account, :any, required: true
+  attr :subject, :any, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :panel_form, :any, default: nil
+  attr :panel_selected_resource, :any, default: nil
+  attr :panel_active_conditions, :list, default: []
+  attr :panel_conditions_dropdown_open, :boolean, default: false
+  attr :conditions_state, :map, required: true
+
+  attr :postures, :map, required: true
+
+  def policy_form_body(assigns) do
+    ~H"""
+    <div class="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+      <.policy_form_error panel_form={@panel_form} />
+      <.policy_fields
+        mode={@mode}
+        panel_form={@panel_form}
+        panel_selected_resource={@panel_selected_resource}
+        subject={@subject}
+      />
+      <PostureComponents.policy_restrictions id="policy-postures" account={@account} state={@postures}>
+        <.policy_conditions_section
+          account={@account}
+          mode={@mode}
+          panel_selected_resource={@panel_selected_resource}
+          panel_active_conditions={@panel_active_conditions}
+          panel_conditions_dropdown_open={@panel_conditions_dropdown_open}
+          providers={@providers}
+          disabled_providers={@disabled_providers}
+          x509_auth_provider_id={@x509_auth_provider_id}
+          has_trust_anchors?={@has_trust_anchors?}
+          conditions_state={@conditions_state}
+        />
+      </PostureComponents.policy_restrictions>
+    </div>
+    """
+  end
+
+  attr :panel_form, :any, default: nil
+
+  def policy_form_error(assigns) do
+    ~H"""
+    <div
+      :if={@panel_form.errors[:base]}
+      class="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-error/20 bg-error-light"
+    >
+      <Core.icon name="ri-alert-line" class="w-4 h-4 shrink-0 text-error" />
+      <p class="text-xs text-error">
+        {Core.translate_error(@panel_form.errors[:base])}
+      </p>
+    </div>
+    """
+  end
+
+  attr :mode, :atom, required: true
+  attr :panel_form, :any, default: nil
+  attr :panel_selected_resource, :any, default: nil
+  attr :subject, :any, required: true
+
+  def policy_fields(assigns) do
+    ~H"""
+    <fieldset class="flex flex-col gap-4">
+      <.policy_group_field mode={@mode} panel_form={@panel_form} subject={@subject} />
+      <.policy_resource_field mode={@mode} panel_form={@panel_form} subject={@subject} />
+      <.policy_description_field panel_form={@panel_form} />
+      <.policy_flow_log_uploads_field
+        panel_form={@panel_form}
+        panel_selected_resource={@panel_selected_resource}
+      />
+    </fieldset>
+    """
+  end
+
+  attr :mode, :atom, required: true
+  attr :panel_form, :any, default: nil
+  attr :subject, :any, required: true
+
+  def policy_group_field(assigns) do
+    ~H"""
+    <.live_component
+      module={PortalWeb.Components.Form.SelectWithGroups}
+      id={if @mode == :new, do: "panel_new_policy_group_id", else: "panel_policy_group_id"}
+      label="Group"
+      placeholder="Select Group"
+      field={@panel_form[:group_id]}
+      fetch_option_callback={&Database.fetch_group_option(&1, @subject)}
+      list_options_callback={&Database.list_group_options(&1, @subject)}
+      value={@panel_form[:group_id].value}
+      required
+    >
+      <:options_group :let={options_group}>{options_group}</:options_group>
+      <:option :let={row}>
+        <div class="flex items-center gap-2">
+          <Core.provider_icon provider={Core.provider_type_from_group(row)} size="sm" />
+          <span>{row.group.name}</span>
+        </div>
+      </:option>
+      <:no_options :let={name}>
+        <Core.error data-validation-error-for={name}>No groups available.</Core.error>
+      </:no_options>
+      <:no_search_results>No groups found.</:no_search_results>
+    </.live_component>
+    """
+  end
+
+  attr :mode, :atom, required: true
+  attr :panel_form, :any, default: nil
+  attr :subject, :any, required: true
+
+  def policy_resource_field(assigns) do
+    ~H"""
+    <.live_component
+      module={PortalWeb.Components.Form.SelectWithGroups}
+      id={if @mode == :new, do: "panel_new_policy_resource_id", else: "panel_policy_resource_id"}
+      label="Resource"
+      placeholder="Select Resource"
+      field={@panel_form[:resource_id]}
+      fetch_option_callback={&fetch_policy_resource_option(&1, @subject)}
+      list_options_callback={&list_policy_resource_options(&1, @subject)}
+      on_change={&PortalWeb.Policies.on_panel_resource_change/1}
+      value={@panel_form[:resource_id].value}
+      required
+    >
+      <:options_group :let={group}>{group}</:options_group>
+      <:option :let={resource}>
+        <%= if resource.type == :internet do %>
+          Internet
+        <% else %>
+          {resource.name}
+          <span :if={resource.site_id} class="text-subtle">
+            ({resource.site.name})
+          </span>
+        <% end %>
+      </:option>
+      <:no_options :let={name}>
+        <Core.error data-validation-error-for={name}>No resources available.</Core.error>
+      </:no_options>
+      <:no_search_results>No resources found.</:no_search_results>
+    </.live_component>
+    """
+  end
+
+  defp fetch_policy_resource_option(id, subject) do
+    PortalWeb.Resources.Components.fetch_resource_option(id, subject)
+  end
+
+  defp list_policy_resource_options(search_query_or_nil, subject) do
+    {:ok, grouped_options, metadata} =
+      PortalWeb.Resources.Components.list_resource_options(search_query_or_nil, subject)
+
+    grouped_options = maybe_filter_internet_resource_options(grouped_options, subject.account)
+
+    {:ok, grouped_options, metadata}
+  end
+
+  defp maybe_filter_internet_resource_options(grouped_options, account) do
+    if Portal.Account.internet_resource_enabled?(account) do
+      grouped_options
+    else
+      grouped_options
+      |> Enum.map(&filter_internet_resource_option_group/1)
+      |> Enum.reject(&empty_resource_option_group?/1)
+    end
+  end
+
+  defp filter_internet_resource_option_group({group, options}) do
+    filtered =
+      Enum.reject(options, fn {_id, _name, resource} ->
+        resource.type == :internet
+      end)
+
+    {group, filtered}
+  end
+
+  defp empty_resource_option_group?({_group, options}), do: options == []
+
+  attr :panel_form, :any, default: nil
+
+  def policy_description_field(assigns) do
+    ~H"""
+    <Form.input
+      field={@panel_form[:description]}
+      label="Description"
+      type="textarea"
+      placeholder="Enter an optional reason for creating this policy here."
+      phx-debounce="300"
+    />
+    """
+  end
+
+  attr :panel_form, :any, default: nil
+  attr :panel_selected_resource, :any, default: nil
+
+  def policy_flow_log_uploads_field(assigns) do
+    ~H"""
+    <.flow_log_uploads_toggle
+      form={@panel_form}
+      internet_resource?={internet_resource?(@panel_selected_resource)}
+    />
+    """
+  end
+
+  @doc """
+  The flow-log reporting toggle shared by every form that creates or edits a
+  policy. Callers initialize the form with the appropriate resource-specific
+  default.
+  """
+  attr :form, :any, required: true
+  attr :internet_resource?, :boolean, default: false
+
+  def flow_log_uploads_toggle(assigns) do
+    assigns =
+      assigns
+      |> assign(:checked?, flow_log_uploads_checked?(assigns.form))
+      |> assign(
+        :internet_resource_warning_id,
+        "#{assigns.form[:flow_log_uploads_enabled].id}-internet-resource-warning"
+      )
+
+    ~H"""
+    <div>
+      <div class="flex items-center justify-between py-1">
+        <div>
+          <div class="flex items-center gap-2">
+            <p class="text-xs font-semibold text-body">Flow log reporting</p>
+          </div>
+          <p class="text-xs text-subtle">
+            Report flow logs for connections created by this Policy
+          </p>
+        </div>
+        <input type="hidden" name={@form[:flow_log_uploads_enabled].name} value="false" />
+        <Core.toggle
+          id={@form[:flow_log_uploads_enabled].id}
+          name={@form[:flow_log_uploads_enabled].name}
+          value="true"
+          checked={@checked?}
+          phx-click={
+            @internet_resource? &&
+              JS.toggle_class("hidden", to: "##{@internet_resource_warning_id}")
+          }
+        />
+      </div>
+      <p
+        :if={@internet_resource?}
+        id={@internet_resource_warning_id}
+        class={[
+          "mt-1 items-start gap-1 text-[11px] text-warning",
+          if(@checked?, do: "flex", else: "hidden")
+        ]}
+      >
+        <Core.icon name="ri-error-warning-line" class="mt-px h-3.5 w-3.5 shrink-0" />
+        <span>
+          Enabling flow log collection for the internet resource can result in substantial log volume.
+        </span>
+      </p>
+    </div>
+    """
+  end
+
+  defp flow_log_uploads_checked?(form) do
+    Phoenix.HTML.Form.normalize_value("checkbox", form[:flow_log_uploads_enabled].value)
+  end
+
+  defp internet_resource?(%{type: :internet}), do: true
+  defp internet_resource?(_resource), do: false
+
+  attr :mode, :atom, required: true
+  attr :account, :any, required: true
+  attr :panel_selected_resource, :any, default: nil
+  attr :panel_active_conditions, :list, default: []
+  attr :panel_conditions_dropdown_open, :boolean, default: false
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :conditions_state, :map, required: true
+
+  def policy_conditions_section(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :policy_conditions_enabled?,
+        Portal.Account.policy_conditions_enabled?(assigns.account)
+      )
+
+    ~H"""
+    <div
+      :if={@mode == :new or not is_nil(@panel_selected_resource) or @policy_conditions_enabled? == false}
+      class="border-t border-border pt-4"
+    >
+      <.policy_conditions_header
+        policy_conditions_enabled?={@policy_conditions_enabled?}
+        panel_selected_resource={@panel_selected_resource}
+        panel_active_conditions={@panel_active_conditions}
+        panel_conditions_dropdown_open={@panel_conditions_dropdown_open}
+      />
+      <%= cond do %>
+        <% @policy_conditions_enabled? == false -> %>
+          <Form.upgrade_locked_section
+            account={@account}
+            message="Upgrade your plan to unlock policy conditions."
+            description="Add policy restrictions like IP ranges, identity providers, and time windows."
+            data-locked-section="policy-conditions"
+          >
+            <PostureComponents.conditions_preview />
+          </Form.upgrade_locked_section>
+        <% is_nil(@panel_selected_resource) -> %>
+          <.policy_conditions_placeholder />
+        <% true -> %>
+          <.policy_conditions_cards
+            panel_active_conditions={@panel_active_conditions}
+            providers={@providers}
+            disabled_providers={@disabled_providers}
+            account={@account}
+            x509_auth_provider_id={@x509_auth_provider_id}
+            has_trust_anchors?={@has_trust_anchors?}
+            conditions_state={@conditions_state}
+          />
+      <% end %>
+    </div>
+    """
+  end
+
+  attr :policy_conditions_enabled?, :boolean, default: true
+  attr :panel_selected_resource, :any, default: nil
+  attr :panel_active_conditions, :list, default: []
+  attr :panel_conditions_dropdown_open, :boolean, default: false
+
+  def policy_conditions_header(assigns) do
+    ~H"""
+    <div class="flex items-center justify-between mb-3">
+      <h4 class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+        Conditions
+        <span class="ml-1 font-normal normal-case tracking-normal text-subtle">
+          (optional)
+        </span>
+      </h4>
+      <.policy_conditions_dropdown
+        :if={
+          @policy_conditions_enabled? and
+          not is_nil(@panel_selected_resource) and
+            available_conditions(@panel_selected_resource) -- @panel_active_conditions != []
+        }
+        panel_selected_resource={@panel_selected_resource}
+        panel_active_conditions={@panel_active_conditions}
+        panel_conditions_dropdown_open={@panel_conditions_dropdown_open}
+      />
+    </div>
+    """
+  end
+
+  def policy_conditions_placeholder(assigns) do
+    ~H"""
+    <p class="text-xs text-subtle text-center py-4 rounded-lg border border-dashed border-border">
+      Select a resource above to configure conditions
+    </p>
+    """
+  end
+
+  attr :panel_active_conditions, :list, default: []
+  attr :account, :any, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :conditions_state, :map, required: true
+
+  def policy_conditions_cards(assigns) do
+    ~H"""
+    <p
+      :if={@panel_active_conditions == []}
+      class="text-xs text-subtle text-center py-4 rounded-lg border border-dashed border-border"
+    >
+      No conditions — access is unrestricted
+    </p>
+    <div :if={@panel_active_conditions != []} class="space-y-2">
+      <.grant_condition_card
+        :for={type <- @panel_active_conditions}
+        type={type}
+        account={@account}
+        providers={@providers}
+        disabled_providers={@disabled_providers}
+        x509_auth_provider_id={@x509_auth_provider_id}
+        has_trust_anchors?={@has_trust_anchors?}
+        conditions_state={@conditions_state}
+      />
+    </div>
+    """
+  end
+
+  attr :panel_selected_resource, :any, required: true
+  attr :panel_active_conditions, :list, default: []
+  attr :panel_conditions_dropdown_open, :boolean, default: false
+
+  def policy_conditions_dropdown(assigns) do
+    ~H"""
+    <div class="relative">
+      <button
+        type="button"
+        phx-click="toggle_conditions_dropdown"
+        class="flex items-center gap-1 px-2 py-1 rounded text-[10px] border border-border-strong text-body hover:text-heading hover:border-border-emphasis bg-surface transition-colors"
+      >
+        <Core.icon name="ri-add-line" class="w-2.5 h-2.5" /> Add condition
+      </button>
+      <div :if={@panel_conditions_dropdown_open}>
+        <div class="fixed inset-0 z-10" phx-click="toggle_conditions_dropdown"></div>
+        <div class="absolute right-0 top-full mt-1 z-20 min-w-44 rounded-lg border border-border-strong bg-elevated shadow-lg py-1 overflow-hidden">
+          <button
+            :for={type <- available_conditions(@panel_selected_resource) -- @panel_active_conditions}
+            type="button"
+            phx-click="add_condition"
+            phx-value-type={type}
+            class="w-full text-left px-3 py-1.5 text-xs text-body hover:text-heading hover:bg-raised transition-colors"
+          >
+            {condition_type_label(type)}
+          </button>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :mode, :atom, required: true
+  attr :postures, :map, required: true
+
+  def policy_form_actions(assigns) do
+    ~H"""
+    <Form.panel_footer>
+      <Form.panel_footer_button type="button" phx-click="cancel_policy_form">
+        Cancel
+      </Form.panel_footer_button>
+      <Form.panel_footer_button type="submit" style="primary" disabled={Postures.blocked?(@postures)}>
+        {if @mode == :new, do: "Create Policy", else: "Save Changes"}
+      </Form.panel_footer_button>
+    </Form.panel_footer>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :tab, :atom, default: :overview
+  attr :confirm_disable_policy, :boolean, default: false
+  attr :confirm_delete_policy, :boolean, default: false
+  attr :policy_authorizations, :list, default: []
+  attr :policy_authorizations_page, :integer, default: 1
+  attr :policy_authorizations_has_next, :boolean, default: false
+  attr :policy_authorizations_expanded_id, :string, default: nil
+  attr :connected_posture_providers, :list, default: nil
+
+  def policy_details_view(assigns) do
+    ~H"""
+    <div class="flex flex-col h-full overflow-hidden">
+      <.policy_details_header policy={@policy} />
+      <.policy_details_layout
+        connected_posture_providers={@connected_posture_providers}
+        account={@account}
+        policy={@policy}
+        providers={@providers}
+        disabled_providers={@disabled_providers}
+        x509_auth_provider_id={@x509_auth_provider_id}
+        has_trust_anchors?={@has_trust_anchors?}
+        tab={@tab}
+        confirm_disable_policy={@confirm_disable_policy}
+        confirm_delete_policy={@confirm_delete_policy}
+        policy_authorizations={@policy_authorizations}
+        policy_authorizations_page={@policy_authorizations_page}
+        policy_authorizations_has_next={@policy_authorizations_has_next}
+        policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+      />
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :tab, :atom, default: :overview
+  attr :confirm_disable_policy, :boolean, default: false
+  attr :confirm_delete_policy, :boolean, default: false
+  attr :policy_authorizations, :list, default: []
+  attr :policy_authorizations_page, :integer, default: 1
+  attr :policy_authorizations_has_next, :boolean, default: false
+  attr :policy_authorizations_expanded_id, :string, default: nil
+  attr :connected_posture_providers, :list, default: nil
+
+  def policy_details_layout(assigns) do
+    ~H"""
+    <div class="flex flex-1 min-h-0 divide-x divide-border">
+      <div class="flex-1 flex flex-col overflow-hidden">
+        <div
+          role="tablist"
+          class="flex items-end gap-0 px-5 border-b border-border bg-raised shrink-0"
+        >
+          <button
+            role="tab"
+            aria-selected={@tab == :overview}
+            phx-click="switch_policy_tab"
+            phx-value-tab="overview"
+            class={[
+              "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
+              if(@tab == :overview,
+                do: "border-brand text-brand",
+                else: "border-transparent text-body hover:text-heading"
+              )
+            ]}
+          >
+            Overview
+          </button>
+          <button
+            role="tab"
+            aria-selected={@tab == :authorizations}
+            phx-click="switch_policy_tab"
+            phx-value-tab="authorizations"
+            class={[
+              "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
+              if(@tab == :authorizations,
+                do: "border-brand text-brand",
+                else: "border-transparent text-body hover:text-heading"
+              )
+            ]}
+          >
+            Authorizations
+          </button>
+        </div>
+        <div :if={@tab == :overview} class="flex-1 overflow-y-auto">
+          <.policy_access_mapping account={@account} policy={@policy} />
+          <.policy_conditions_list
+            connected_posture_providers={@connected_posture_providers}
+            account={@account}
+            policy={@policy}
+            providers={@providers}
+            disabled_providers={@disabled_providers}
+            x509_auth_provider_id={@x509_auth_provider_id}
+            has_trust_anchors?={@has_trust_anchors?}
+          />
+        </div>
+        <.policy_authorizations_tab
+          :if={@tab == :authorizations}
+          account={@account}
+          policy={@policy}
+          policy_authorizations={@policy_authorizations}
+          page={@policy_authorizations_page}
+          has_next={@policy_authorizations_has_next}
+          expanded_id={@policy_authorizations_expanded_id}
+        />
+      </div>
+      <.policy_sidebar
+        policy={@policy}
+        confirm_disable_policy={@confirm_disable_policy}
+        confirm_delete_policy={@confirm_delete_policy}
+      />
+    </div>
+    """
+  end
+
+  attr :policy, :any, required: true
+
+  def policy_details_header(assigns) do
+    ~H"""
+    <div class="shrink-0 px-5 py-4 border-b border-border bg-elevated">
+      <div class="flex items-center gap-4">
+        <%!-- Left: title + status + ID --%>
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-2">
+            <h2 class="text-sm font-semibold text-heading truncate">
+              <%= if @policy.group do %>
+                {@policy.group.name} — {@policy.resource.name}
+              <% else %>
+                <span class="text-warning">(Group deleted)</span> — {@policy.resource.name}
+              <% end %>
+            </h2>
+            <.policy_status_badge is_disabled={@policy.is_disabled} />
+          </div>
+          <p class="font-mono text-xs text-subtle mt-0.5 truncate">{@policy.id}</p>
+        </div>
+        <%!-- Right: actions --%>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <Form.button phx-click="open_edit_form" size="sm" icon="ri-pencil-line">
+            Edit
+          </Form.button>
+          <Form.icon_button icon="ri-close-line" title="Close (Esc)" phx-click="close_panel" />
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+
+  def policy_access_mapping(assigns) do
+    ~H"""
+    <div class="px-5 pt-4 pb-4 border-b border-border">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+          Access Mapping
+        </h3>
+      </div>
+      <div class="flex items-stretch gap-2">
+        <.policy_group_mapping_card account={@account} policy={@policy} />
+        <.policy_mapping_arrow />
+        <.policy_resource_mapping_card account={@account} policy={@policy} />
+      </div>
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+
+  def policy_group_mapping_card(assigns) do
+    ~H"""
+    <%= if @policy.group do %>
+      <Navigation.link
+        navigate={~p"/#{@account}/groups/#{@policy.group}"}
+        class="flex-1 flex items-center gap-2.5 px-3 py-2.5 rounded border border-border bg-raised hover:border-border-emphasis hover:bg-surface transition-colors text-left group"
+      >
+        <Core.provider_icon provider={Core.provider_type_from_group(@policy.group)} size="sm" variant="circle" />
+        <div class="min-w-0">
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-0.5">
+            Group
+          </p>
+          <p class="text-sm font-medium text-heading group-hover:text-brand transition-colors truncate">
+            {@policy.group.name}
+          </p>
+        </div>
+      </Navigation.link>
+    <% else %>
+      <div class="flex-1 flex items-center gap-2.5 px-3 py-2.5 rounded border border-warning/30 bg-warning-light">
+        <Core.icon name="ri-error-warning-line" class="w-5 h-5 text-warning shrink-0" />
+        <div class="min-w-0">
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-0.5">
+            Group
+          </p>
+          <p class="text-sm text-warning">Group deleted</p>
+        </div>
+      </div>
+    <% end %>
+    """
+  end
+
+  def policy_mapping_arrow(assigns) do
+    ~H"""
+    <div class="flex items-center shrink-0 text-subtle">
+      <Core.icon name="ri-arrow-right-long-line" class="w-5 h-5" />
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+
+  def policy_resource_mapping_card(assigns) do
+    ~H"""
+    <Navigation.link
+      navigate={~p"/#{@account}/resources/#{@policy.resource_id}"}
+      class="flex-1 flex items-center gap-2.5 px-3 py-2.5 rounded border border-border bg-raised hover:border-border-emphasis hover:bg-surface transition-colors text-left group"
+    >
+      <span class={ResourceType.type_badge_class(@policy.resource.type)}>
+        {@policy.resource.type}
+      </span>
+      <div class="min-w-0">
+        <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-0.5">
+          Resource
+        </p>
+        <p class="text-sm font-medium text-heading group-hover:text-brand transition-colors truncate">
+          {@policy.resource.name}
+        </p>
+        <p class="font-mono text-xs text-subtle truncate">
+          {@policy.resource.address}
+        </p>
+      </div>
+    </Navigation.link>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :connected_posture_providers, :list, default: nil
+
+  def policy_conditions_list(assigns) do
+    ~H"""
+    <div class="px-5 pt-4 pb-4">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+          Conditions
+        </h3>
+      </div>
+      <%= if @policy.conditions == [] do %>
+        <p class="text-xs text-subtle">
+          No conditions — access is always granted to group members.
+        </p>
+      <% else %>
+        <ul class="space-y-2">
+          <.policy_condition_row
+            :for={
+              condition <-
+                Enum.sort_by(
+                  @policy.conditions,
+                  &if(&1.property == :current_utc_datetime, do: 1, else: 0)
+                )
+            }
+            account={@account}
+            condition={condition}
+            providers={@providers}
+            disabled_providers={@disabled_providers}
+            x509_auth_provider_id={@x509_auth_provider_id}
+            has_trust_anchors?={@has_trust_anchors?}
+          />
+        </ul>
+      <% end %>
+      <PostureComponents.postures_summary postures={@policy.postures} connected={@connected_posture_providers} />
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :condition, :map, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+
+  def policy_condition_row(assigns) do
+    ~H"""
+    <li class="flex items-start gap-3 px-3 py-2.5 rounded border border-border bg-raised">
+      <span class={condition_type_badge_class(@condition.property)}>
+        {condition_type_label(@condition.property)}
+      </span>
+      <%= if @condition.property == :current_utc_datetime do %>
+        <.policy_tod_condition_values values={@condition.values} />
+      <% else %>
+        <div class="text-xs text-body flex-1 min-w-0 mt-0.5 space-y-2">
+          <.auth_provider_condition_values
+            :if={@condition.property == :auth_provider_id}
+            values={@condition.values}
+            providers={@providers}
+            disabled_providers={@disabled_providers}
+          />
+          <span :if={@condition.property != :auth_provider_id}>
+            {condition_values_display(@condition, @providers, @account)}
+          </span>
+          <.x509_trust_anchor_warning
+            show?={
+              @condition.property == :auth_provider_id and not @has_trust_anchors? and
+                not is_nil(@x509_auth_provider_id) and
+                @x509_auth_provider_id in @condition.values
+            }
+            account={@account}
+          />
+        </div>
+      <% end %>
+    </li>
+    """
+  end
+
+  attr :values, :list, required: true
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+
+  defp auth_provider_condition_values(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :labels,
+        auth_provider_labels(assigns.values, assigns.providers, assigns.disabled_providers)
+      )
+
+    ~H"""
+    <span class="inline-flex flex-wrap items-center gap-x-1 gap-y-0.5">
+      <Core.intersperse_blocks>
+        <:separator>,</:separator>
+        <:item :for={label <- @labels}>
+          <span :if={label.status == :active}>{label.name}</span>
+          <.unavailable_auth_provider :if={label.status != :active} label={label} />
+        </:item>
+      </Core.intersperse_blocks>
+    </span>
+    """
+  end
+
+  attr :label, :map, required: true
+
+  defp unavailable_auth_provider(assigns) do
+    ~H"""
+    <span
+      class="inline-flex items-center gap-1 text-warning"
+      title={unavailable_auth_provider_hint(@label.status)}
+      data-auth-provider-status={@label.status}
+    >
+      <Core.icon name="ri-error-warning-line" class="w-3 h-3 shrink-0" />
+      {unavailable_auth_provider_name(@label)}
+    </span>
+    """
+  end
+
+  # Conditions store provider IDs without a foreign key, so a value can outlive its provider.
+  @spec auth_provider_labels([String.t()], list(), list()) :: [
+          %{id: String.t(), status: :active | :disabled | :deleted, name: String.t() | nil}
+        ]
+  defp auth_provider_labels(values, providers, disabled_providers) do
+    Enum.map(values, fn id ->
+      cond do
+        provider = Enum.find(providers, &(&1.id == id)) ->
+          %{id: id, status: :active, name: provider.name}
+
+        provider = Enum.find(disabled_providers, &(&1.id == id)) ->
+          %{id: id, status: :disabled, name: provider.name}
+
+        true ->
+          %{id: id, status: :deleted, name: nil}
+      end
+    end)
+  end
+
+  defp unavailable_auth_provider_name(%{status: :disabled, name: name}), do: "#{name} (disabled)"
+  defp unavailable_auth_provider_name(%{status: :deleted}), do: "Deleted provider"
+
+  defp unavailable_auth_provider_hint(:disabled),
+    do: "This provider is disabled. Users can't sign in with it until it is enabled again."
+
+  defp unavailable_auth_provider_hint(:deleted),
+    do: "This provider was deleted. Update this condition to use another provider."
+
+  attr :values, :list, required: true
+
+  def policy_tod_condition_values(assigns) do
+    assigns = assign(assigns, :tod, tod_display_rows(assigns.values))
+
+    ~H"""
+    <div class="flex-1 min-w-0 mt-0.5">
+      <div class="space-y-0.5">
+        <%= for {day, ranges} <- elem(@tod, 1) do %>
+          <div class="flex items-baseline gap-2">
+            <span class="text-[11px] font-medium text-body w-7 shrink-0">
+              {day}
+            </span>
+            <span class="text-xs text-body">{ranges}</span>
+          </div>
+        <% end %>
+      </div>
+      <p class="text-[10px] text-subtle mt-1">{elem(@tod, 0)}</p>
+    </div>
+    """
+  end
+
+  attr :account, :any, required: true
+  attr :policy, :any, required: true
+  attr :policy_authorizations, :list, default: []
+  attr :page, :integer, default: 1
+  attr :has_next, :boolean, default: false
+  attr :expanded_id, :string, default: nil
+
+  def policy_authorizations_tab(assigns) do
+    ~H"""
+    <div class="flex-1 flex flex-col overflow-hidden">
+      <Authorization.authorization_flow_logs_notice account={@account} />
+      <div
+        :if={@policy_authorizations == []}
+        class="flex flex-1 flex-col items-center justify-center gap-2 text-subtle"
+      >
+        <Core.icon name="ri-shield-check-line" class="w-8 h-8" />
+        <p class="text-sm">No recent authorizations</p>
+      </div>
+      <div :if={@policy_authorizations != []} class="flex-1 flex flex-col overflow-hidden">
+        <div class="flex-1 overflow-y-auto">
+          <table class="w-full text-xs">
+            <thead class="sticky top-0 bg-surface z-10">
+              <tr class="border-b border-border text-subtle">
+                <th class="text-left px-4 py-2 font-medium">Actor</th>
+                <th class="text-left px-4 py-2 font-medium">Authorized</th>
+                <th class="text-left px-4 py-2 font-medium">Expires</th>
+                <th class="w-6"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <%= for row <- @policy_authorizations do %>
+                <tr
+                  phx-click="toggle_policy_authorization_row"
+                  phx-keydown="toggle_policy_authorization_row"
+                  phx-key="Enter"
+                  phx-value-id={row.authorization.id}
+                  tabindex="0"
+                  class="border-b border-border hover:bg-raised cursor-pointer focus:outline-none focus:bg-raised"
+                >
+                  <td class="px-4 py-2 text-heading">
+                    {if row.actor, do: row.actor.name, else: "—"}
+                  </td>
+                  <td class="px-4 py-2 text-subtle">
+                    <Core.relative_datetime datetime={row.authorization.inserted_at} />
+                  </td>
+                  <td class="px-4 py-2 text-subtle">
+                    <Core.relative_datetime datetime={row.authorization.expires_at} />
+                  </td>
+                  <td class="px-4 py-2 text-subtle">
+                    <Core.icon
+                      name={
+                        if @expanded_id == row.authorization.id,
+                          do: "ri-arrow-up-s-line",
+                          else: "ri-arrow-down-s-line"
+                      }
+                      class="w-4 h-4"
+                    />
+                  </td>
+                </tr>
+                <tr
+                  :if={@expanded_id == row.authorization.id}
+                  class="border-b border-border bg-raised"
+                >
+                  <td colspan="4" class="px-4 py-3">
+                    <div class="grid grid-cols-2 gap-x-8 gap-y-2 text-xs">
+                      <div>
+                        <p class="text-subtle font-medium mb-1">
+                          {case row.initiating_device && row.initiating_device.type do
+                            :gateway -> "Initiator (Gateway)"
+                            :client -> "Initiator (Device)"
+                            _ -> "Initiator"
+                          end}
+                        </p>
+                        <p class="text-heading">
+                          {if row.initiating_device, do: row.initiating_device.name, else: "—"}
+                        </p>
+                        <p class="text-subtle font-mono mt-0.5">
+                          {if row.authorization.initiator_remote_ip,
+                            do: Portal.Types.INET.to_string(row.authorization.initiator_remote_ip),
+                            else: "—"}
+                        </p>
+                      </div>
+                      <div>
+                        <p class="text-subtle font-medium mb-1">
+                          {case row.receiving_device && row.receiving_device.type do
+                            :gateway -> "Receiver (Gateway)"
+                            :client -> "Receiver (Device)"
+                            _ -> "Receiver"
+                          end}
+                        </p>
+                        <p class="text-heading">
+                          {if row.receiving_device, do: row.receiving_device.name, else: "—"}
+                        </p>
+                        <p class="text-subtle font-mono mt-0.5">
+                          {if row.authorization.receiver_remote_ip,
+                            do: Portal.Types.INET.to_string(row.authorization.receiver_remote_ip),
+                            else: "—"}
+                        </p>
+                      </div>
+                      <div>
+                        <p class="text-subtle font-medium mb-1">Owner</p>
+                        <p class="text-heading">
+                          {if row.actor, do: row.actor.name, else: "—"}
+                        </p>
+                      </div>
+                      <div>
+                        <p class="text-subtle font-medium mb-1">Resource</p>
+                        <Navigation.link
+                          navigate={~p"/#{@account}/resources/#{@policy.resource_id}"}
+                          class="text-brand hover:underline"
+                        >
+                          {@policy.resource.name}
+                        </Navigation.link>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              <% end %>
+            </tbody>
+          </table>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2 border-t border-border shrink-0">
+          <button
+            phx-click="change_policy_authorizations_page"
+            phx-value-page={@page - 1}
+            disabled={@page == 1}
+            class="flex items-center gap-1 text-xs transition-colors disabled:text-disabled disabled:cursor-not-allowed text-body hover:enabled:text-heading"
+          >
+            <Core.icon name="ri-arrow-left-s-line" class="w-4 h-4" /> Previous
+          </button>
+          <span class="text-xs text-subtle">Page {@page}</span>
+          <button
+            phx-click="change_policy_authorizations_page"
+            phx-value-page={@page + 1}
+            disabled={not @has_next}
+            class="flex items-center gap-1 text-xs transition-colors disabled:text-disabled disabled:cursor-not-allowed text-body hover:enabled:text-heading"
+          >
+            Next <Core.icon name="ri-arrow-right-s-line" class="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :policy, :any, required: true
+  attr :confirm_disable_policy, :boolean, default: false
+  attr :confirm_delete_policy, :boolean, default: false
+
+  def policy_sidebar(assigns) do
+    ~H"""
+    <div class="w-1/3 shrink-0 overflow-y-auto p-4 space-y-5">
+      <.policy_details_section
+        policy={@policy}
+      />
+      <div class="border-t border-border"></div>
+      <.policy_actions_section
+        policy={@policy}
+        confirm_disable_policy={@confirm_disable_policy}
+      />
+      <div class="border-t border-border"></div>
+      <.policy_danger_zone confirm_delete_policy={@confirm_delete_policy} />
+    </div>
+    """
+  end
+
+  attr :policy, :any, required: true
+
+  def policy_details_section(assigns) do
+    ~H"""
+    <section>
+      <h3 class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-3">
+        Details
+      </h3>
+      <dl class="space-y-2.5">
+        <div>
+          <dt class="text-[10px] text-subtle mb-0.5">Policy ID</dt>
+          <dd class="font-mono text-[11px] text-body break-all font-medium">
+            {@policy.id}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-[10px] text-subtle mb-0.5">Created</dt>
+          <dd class="text-xs text-body font-medium">
+            <Core.relative_datetime datetime={@policy.inserted_at} />
+          </dd>
+        </div>
+        <div>
+          <dt class="text-[10px] text-subtle mb-0.5">Flow log reporting</dt>
+          <dd class="text-xs text-body font-medium">
+            {if @policy.flow_log_uploads_enabled, do: "Enabled", else: "Disabled"}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-[10px] text-subtle mb-0.5">Device attestation</dt>
+          <dd class="text-xs text-body font-medium">
+            {if @policy.require_attestation, do: "Required", else: "Not required"}
+          </dd>
+        </div>
+        <div :if={@policy.description}>
+          <dt class="text-[10px] text-subtle mb-0.5">Description</dt>
+          <dd class="text-xs text-body font-medium">{@policy.description}</dd>
+        </div>
+      </dl>
+    </section>
+    """
+  end
+
+  attr :policy, :any, required: true
+  attr :confirm_disable_policy, :boolean, default: false
+
+  def policy_actions_section(assigns) do
+    ~H"""
+    <section>
+      <h3 class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-3">
+        Actions
+      </h3>
+      <div class="space-y-2">
+        <Form.action_button
+          :if={!@policy.is_disabled and not @confirm_disable_policy}
+          phx-click="confirm_disable_policy"
+          style="warning"
+          icon="ri-pause-line"
+        >
+          Disable policy
+        </Form.action_button>
+        <div
+          :if={!@policy.is_disabled and @confirm_disable_policy}
+          class="px-3 py-2.5 rounded border border-border bg-raised"
+        >
+          <p class="text-xs font-medium text-heading mb-1">
+            Disable this policy?
+          </p>
+          <p class="text-xs text-body mb-3">
+            This will immediately revoke all access granted by it.
+          </p>
+          <div class="flex items-center gap-1.5">
+            <Form.button type="button" phx-click="cancel_disable_policy" size="xs">
+              Cancel
+            </Form.button>
+            <Form.button type="button" style="primary" phx-click="disable_policy" size="xs">
+              Disable
+            </Form.button>
+          </div>
+        </div>
+        <Form.action_button
+          :if={@policy.is_disabled}
+          phx-click="enable_policy"
+          style="success"
+          icon="ri-play-line"
+        >
+          Enable policy
+        </Form.action_button>
+      </div>
+    </section>
+    """
+  end
+
+  attr :confirm_delete_policy, :boolean, default: false
+
+  def policy_danger_zone(assigns) do
+    ~H"""
+    <section>
+      <h3 class="text-[10px] font-semibold tracking-widest uppercase text-error mb-3">
+        Danger Zone
+      </h3>
+      <button
+        :if={not @confirm_delete_policy}
+        type="button"
+        phx-click="confirm_delete_policy"
+        class="w-full flex items-center gap-2 px-3 py-2 rounded border border-error/20 text-xs text-error hover:bg-error-light transition-colors"
+      >
+        <Core.icon name="ri-delete-bin-line" class="w-4 h-4 shrink-0" /> Delete policy
+      </button>
+      <div
+        :if={@confirm_delete_policy}
+        class="px-3 py-2.5 rounded border border-error/20 bg-error-light"
+      >
+        <p class="text-xs font-medium text-error mb-1">
+          Delete this policy?
+        </p>
+        <p class="text-xs text-error/70 mb-3">
+          All sessions authorized by it will be expired.
+        </p>
+        <div class="flex items-center gap-1.5">
+          <Form.button type="button" phx-click="cancel_delete_policy" size="xs">
+            Cancel
+          </Form.button>
+          <Form.button type="button" phx-click="delete_policy" style="danger" size="xs" class="font-medium">
+            Delete
+          </Form.button>
+        </div>
+      </div>
+    </section>
+    """
+  end
+
+  @spec condition_short_label(atom()) :: String.t()
+  def condition_short_label(:client_verified), do: "Verified"
+  def condition_short_label(:auth_provider_id), do: "Auth"
+  def condition_short_label(:remote_ip_location_region), do: "Location"
+  def condition_short_label(:remote_ip), do: "IP Range"
+  def condition_short_label(:current_utc_datetime), do: "Time"
+  def condition_short_label(_), do: "Condition"
+
+  @spec condition_type_badge_class(atom()) :: String.t()
+  defp condition_type_badge_class(:client_verified),
+    do:
+      "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 text-success bg-success-light"
+
+  defp condition_type_badge_class(:auth_provider_id),
+    do:
+      "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 text-badge-dns-text bg-badge-dns"
+
+  defp condition_type_badge_class(:remote_ip_location_region),
+    do:
+      "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 text-badge-ip-text bg-badge-ip"
+
+  defp condition_type_badge_class(:remote_ip),
+    do:
+      "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 text-badge-cidr-text bg-badge-cidr"
+
+  defp condition_type_badge_class(:current_utc_datetime),
+    do:
+      "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 text-body bg-raised border border-border"
+
+  defp condition_type_badge_class(_),
+    do:
+      "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 text-body bg-raised"
+
+  @spec condition_values_display(map(), list(), any()) :: String.t()
+  defp condition_values_display(%{property: :client_verified}, _providers, _account),
+    do: "Device must be verified"
+
+  defp condition_values_display(
+         %{property: :remote_ip_location_region, values: values},
+         _providers,
+         _account
+       ) do
+    Enum.map_join(values, ", ", fn code ->
+      try do
+        Portal.Geo.country_common_name!(code)
+      rescue
+        _ -> code
+      end
+    end)
+  end
+
+  defp condition_values_display(%{property: :remote_ip, values: values}, _providers, _account),
+    do: Enum.join(values, ", ")
+
+  defp condition_values_display(%{values: values}, _providers, _account),
+    do: Enum.join(values, ", ")
+
+  @spec tod_display_rows([String.t()]) :: {String.t(), [{String.t(), String.t()}]}
+  defp tod_display_rows(values) do
+    parsed =
+      Enum.flat_map(values, fn v ->
+        case String.split(v, "/", parts: 3) do
+          [day, ranges, tz] when ranges != "" -> [{day, ranges, tz}]
+          _ -> []
+        end
+      end)
+
+    timezone =
+      case parsed do
+        [{_, _, tz} | _] -> tz
+        _ -> "UTC"
+      end
+
+    rows =
+      Enum.map(parsed, fn {day, ranges, _tz} ->
+        {format_dow_abbr(day), format_time_ranges(ranges)}
+      end)
+
+    {timezone, rows}
+  end
+
+  @spec format_dow_abbr(String.t()) :: String.t()
+  defp format_dow_abbr("M"), do: "Mon"
+  defp format_dow_abbr("T"), do: "Tue"
+  defp format_dow_abbr("W"), do: "Wed"
+  defp format_dow_abbr("R"), do: "Thu"
+  defp format_dow_abbr("F"), do: "Fri"
+  defp format_dow_abbr("S"), do: "Sat"
+  defp format_dow_abbr("U"), do: "Sun"
+  defp format_dow_abbr(d), do: d
+
+  @spec format_time_ranges(String.t()) :: String.t()
+  defp format_time_ranges("true"), do: "all day"
+
+  defp format_time_ranges(ranges) do
+    ranges
+    |> String.split(",")
+    |> Enum.map_join(", ", fn range ->
+      case String.split(range, "-") do
+        [start, finish] -> "#{strip_seconds(start)}–#{strip_seconds(finish)}"
+        _ -> range
+      end
+    end)
+  end
+
+  @spec strip_seconds(String.t()) :: String.t()
+  defp strip_seconds(time) do
+    case String.split(time, ":") do
+      [h, m, _s] -> "#{h}:#{m}"
+      _ -> time
+    end
+  end
+
+  for {{code, _name}, index} <- Enum.with_index(@days_of_week) do
+    def day_of_week_index(unquote(code)), do: unquote(index)
+  end
+
+  @spec available_conditions(map() | nil) :: [atom()]
+  def available_conditions(%{type: :internet}),
+    do: [
+      :remote_ip_location_region,
+      :remote_ip,
+      :auth_provider_id,
+      :client_verified
+    ]
+
+  def available_conditions(_resource),
+    do: [
+      :remote_ip_location_region,
+      :remote_ip,
+      :auth_provider_id,
+      :client_verified,
+      :current_utc_datetime
+    ]
+
+  @spec condition_type_label(atom()) :: String.t()
+  def condition_type_label(:client_verified), do: "Require Verified Device"
+  def condition_type_label(:auth_provider_id), do: "Authentication Provider"
+  def condition_type_label(:remote_ip_location_region), do: "Device Location"
+  def condition_type_label(:remote_ip), do: "IP Range"
+  def condition_type_label(:current_utc_datetime), do: "Time of Day"
+
+  @spec country_name(String.t()) :: String.t()
+  def country_name(code) do
+    Portal.Geo.all_country_options!()
+    |> Enum.find_value(code, fn {label, c} -> if c == code, do: label end)
+  end
+
+  @condition_input_class "w-full text-xs rounded border border-border bg-raised text-heading px-2 py-1.5 outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus/30 transition-colors"
+
+  attr :type, :atom, required: true
+  attr :account, :any, default: nil
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :conditions_state, :map, required: true
+
+  def grant_condition_card(assigns) do
+    ~H"""
+    <.grant_client_verified_condition_card :if={@type == :client_verified} type={@type} />
+    <.grant_ip_range_condition_card
+      :if={@type == :remote_ip}
+      type={@type}
+      ip_range_operator={@conditions_state.ip_range_operator}
+      ip_range_values={@conditions_state.ip_range_values}
+      ip_range_input={@conditions_state.ip_range_input}
+    />
+    <.grant_location_condition_card
+      :if={@type == :remote_ip_location_region}
+      type={@type}
+      location_operator={@conditions_state.location_operator}
+      location_search={@conditions_state.location_search}
+      location_values={@conditions_state.location_values}
+    />
+    <.grant_auth_provider_condition_card
+      :if={@type == :auth_provider_id}
+      type={@type}
+      account={@account}
+      providers={@providers}
+      disabled_providers={@disabled_providers}
+      x509_auth_provider_id={@x509_auth_provider_id}
+      has_trust_anchors?={@has_trust_anchors?}
+      auth_provider_operator={@conditions_state.auth_provider_operator}
+      auth_provider_values={@conditions_state.auth_provider_values}
+    />
+    <.grant_tod_condition_card
+      :if={@type == :current_utc_datetime}
+      type={@type}
+      timezone={@conditions_state.timezone}
+      tod_values={@conditions_state.tod_values}
+      tod_adding={@conditions_state.tod_adding}
+      tod_pending={@conditions_state.tod_pending}
+      tod_pending_error={@conditions_state.tod_pending_error}
+    />
+    """
+  end
+
+  attr :type, :atom, required: true
+
+  defp grant_condition_card_header(assigns) do
+    ~H"""
+    <div class="flex items-center justify-between px-3 py-2 bg-raised border-b border-border">
+      <span class="text-xs font-medium text-heading">
+        {condition_type_label(@type)}
+      </span>
+      <button
+        type="button"
+        phx-click="remove_condition"
+        phx-value-type={@type}
+        class="flex items-center justify-center w-5 h-5 rounded text-subtle hover:text-heading hover:bg-surface transition-colors"
+        title="Remove condition"
+      >
+        <Core.icon name="ri-close-line" class="w-3.5 h-3.5" />
+      </button>
+    </div>
+    """
+  end
+
+  attr :type, :atom, required: true
+
+  defp grant_client_verified_condition_card(assigns) do
+    ~H"""
+    <div class="rounded-lg border border-border overflow-hidden">
+      <.grant_condition_card_header type={@type} />
+      <input
+        type="hidden"
+        name="policy[conditions][client_verified][property]"
+        value="client_verified"
+      />
+      <input
+        type="hidden"
+        name="policy[conditions][client_verified][operator]"
+        value="is"
+      />
+      <input
+        type="hidden"
+        name="policy[conditions][client_verified][values][]"
+        value="true"
+      />
+    </div>
+    """
+  end
+
+  attr :type, :atom, required: true
+  attr :ip_range_operator, :string, default: "is_in_cidr"
+  attr :ip_range_values, :list, default: []
+  attr :ip_range_input, :string, default: ""
+
+  defp grant_ip_range_condition_card(assigns) do
+    assigns = assign(assigns, :input_class, @condition_input_class)
+
+    ~H"""
+    <div class="rounded-lg border border-border overflow-hidden">
+      <.grant_condition_card_header type={@type} />
+      <div class="px-3 py-2.5 space-y-2">
+        <input
+          type="hidden"
+          name="policy[conditions][remote_ip][property]"
+          value="remote_ip"
+        />
+        <input
+          type="hidden"
+          name="policy[conditions][remote_ip][operator]"
+          value={@ip_range_operator}
+        />
+        <div class="inline-flex rounded border border-border overflow-hidden">
+          <button
+            type="button"
+            phx-click="change_ip_range_operator"
+            phx-value-operator="is_in_cidr"
+            class={[
+              "px-2 py-0.5 text-[10px] transition-colors",
+              if(@ip_range_operator == "is_in_cidr",
+                do: "bg-brand text-white",
+                else: "bg-surface text-body hover:text-heading"
+              )
+            ]}
+          >
+            is in CIDR
+          </button>
+          <button
+            type="button"
+            phx-click="change_ip_range_operator"
+            phx-value-operator="is_not_in_cidr"
+            class={[
+              "px-2 py-0.5 text-[10px] border-l border-border transition-colors",
+              if(@ip_range_operator == "is_not_in_cidr",
+                do: "bg-brand text-white",
+                else: "bg-surface text-body hover:text-heading"
+              )
+            ]}
+          >
+            is not in CIDR
+          </button>
+        </div>
+        <input
+          :for={v <- @ip_range_values}
+          type="hidden"
+          name="policy[conditions][remote_ip][values][]"
+          value={v}
+        />
+        <div :if={@ip_range_values != []} class="flex flex-wrap gap-1 mb-2">
+          <span
+            :for={v <- @ip_range_values}
+            class="inline-flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded text-[10px] font-mono bg-brand-muted text-brand border border-brand/20"
+          >
+            {v}
+            <button
+              type="button"
+              phx-click="remove_ip_range_value"
+              phx-value-range={v}
+              class="hover:text-error transition-colors"
+            >
+              <Core.icon name="ri-close-line" class="w-2.5 h-2.5" />
+            </button>
+          </span>
+        </div>
+        <div class="flex gap-1.5">
+          <input
+            type="text"
+            name="_ip_range_input"
+            value={@ip_range_input}
+            placeholder="e.g. 10.0.0.0/8"
+            phx-change="update_ip_range_input"
+            phx-key="Enter"
+            phx-keyup="add_ip_range_value"
+            class={[@input_class, "flex-1 font-mono placeholder:text-subtle"]}
+          />
+          <Form.button type="button" phx-click="add_ip_range_value" size="xs" class="shrink-0">
+            Add
+          </Form.button>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :type, :atom, required: true
+  attr :location_operator, :string, default: "is_in"
+  attr :location_search, :string, default: ""
+  attr :location_values, :list, default: []
+
+  defp grant_location_condition_card(assigns) do
+    ~H"""
+    <div class="rounded-lg border border-border overflow-hidden">
+      <.grant_condition_card_header type={@type} />
+      <div class="px-3 py-2.5">
+        <input
+          type="hidden"
+          name="policy[conditions][remote_ip_location_region][property]"
+          value="remote_ip_location_region"
+        />
+        <input
+          type="hidden"
+          name="policy[conditions][remote_ip_location_region][operator]"
+          value={@location_operator}
+        />
+        <input
+          :for={code <- @location_values}
+          type="hidden"
+          name="policy[conditions][remote_ip_location_region][values][]"
+          value={code}
+        />
+        <div class="inline-flex rounded border border-border overflow-hidden mb-3">
+          <button
+            type="button"
+            phx-click="change_location_operator"
+            phx-value-operator="is_in"
+            class={[
+              "px-2 py-0.5 text-[10px] transition-colors",
+              if(@location_operator == "is_in",
+                do: "bg-brand text-white",
+                else: "bg-surface text-body hover:text-heading"
+              )
+            ]}
+          >
+            is in
+          </button>
+          <button
+            type="button"
+            phx-click="change_location_operator"
+            phx-value-operator="is_not_in"
+            class={[
+              "px-2 py-0.5 text-[10px] border-l border-border transition-colors",
+              if(@location_operator == "is_not_in",
+                do: "bg-brand text-white",
+                else: "bg-surface text-body hover:text-heading"
+              )
+            ]}
+          >
+            is not in
+          </button>
+        </div>
+        <div :if={@location_values != []} class="flex flex-wrap gap-1 mb-2">
+          <span
+            :for={code <- @location_values}
+            class="inline-flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded text-[10px] bg-brand-muted text-brand border border-brand/20"
+          >
+            {country_name(code)}
+            <button
+              type="button"
+              phx-click="toggle_location_value"
+              phx-value-code={code}
+              class="hover:text-error transition-colors"
+            >
+              <Core.icon name="ri-close-line" class="w-2.5 h-2.5" />
+            </button>
+          </span>
+        </div>
+        <input
+          type="text"
+          placeholder="Search countries…"
+          value={@location_search}
+          phx-change="update_location_search"
+          phx-debounce="150"
+          name="_location_search"
+          class="w-full px-2.5 py-1.5 text-xs rounded border bg-input border-input-border text-heading placeholder:text-subtle outline-none focus:border-border-focus transition-colors mb-1"
+        />
+        <div class="max-h-36 overflow-y-auto rounded border border-border bg-surface">
+          <p
+            :if={@location_search == ""}
+            class="px-2.5 py-3 text-xs text-subtle text-center"
+          >
+            Type to search countries
+          </p>
+          <label
+            :for={
+              {label, code} <-
+                if @location_search == "" do
+                  []
+                else
+                  Portal.Geo.all_country_options!()
+                  |> Enum.filter(fn {l, _} ->
+                    String.contains?(String.downcase(l), String.downcase(@location_search))
+                  end)
+                end
+            }
+            class="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer hover:bg-raised transition-colors"
+            phx-click="toggle_location_value"
+            phx-value-code={code}
+          >
+            <input
+              type="checkbox"
+              class="w-3 h-3 accent-brand pointer-events-none"
+              readonly
+              checked={code in @location_values}
+            />
+            <span class="text-xs text-body">{label}</span>
+          </label>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :type, :atom, required: true
+  attr :account, :any, default: nil
+  attr :providers, :list, default: []
+  attr :disabled_providers, :list, default: []
+  attr :x509_auth_provider_id, :string, default: nil
+  attr :has_trust_anchors?, :boolean, default: false
+  attr :auth_provider_operator, :string, default: "is_in"
+  attr :auth_provider_values, :list, default: []
+
+  defp grant_auth_provider_condition_card(assigns) do
+    ~H"""
+    <div class="rounded-lg border border-border overflow-hidden">
+      <.grant_condition_card_header type={@type} />
+      <div class="px-3 py-2.5 space-y-2">
+        <input
+          type="hidden"
+          name="policy[conditions][auth_provider_id][property]"
+          value="auth_provider_id"
+        />
+        <input
+          type="hidden"
+          name="policy[conditions][auth_provider_id][operator]"
+          value={@auth_provider_operator}
+        />
+        <div class="inline-flex rounded border border-border overflow-hidden">
+          <button
+            type="button"
+            phx-click="change_auth_provider_operator"
+            phx-value-operator="is_in"
+            class={[
+              "px-2 py-0.5 text-[10px] transition-colors",
+              if(@auth_provider_operator == "is_in",
+                do: "bg-brand text-white",
+                else: "bg-surface text-body hover:text-heading"
+              )
+            ]}
+          >
+            is in
+          </button>
+          <button
+            type="button"
+            phx-click="change_auth_provider_operator"
+            phx-value-operator="is_not_in"
+            class={[
+              "px-2 py-0.5 text-[10px] border-l border-border transition-colors",
+              if(@auth_provider_operator == "is_not_in",
+                do: "bg-brand text-white",
+                else: "bg-surface text-body hover:text-heading"
+              )
+            ]}
+          >
+            is not in
+          </button>
+        </div>
+        <input
+          :for={id <- @auth_provider_values}
+          type="hidden"
+          name="policy[conditions][auth_provider_id][values][]"
+          value={id}
+        />
+        <.x509_trust_anchor_warning
+          show?={
+            not @has_trust_anchors? and not is_nil(@x509_auth_provider_id) and
+              @x509_auth_provider_id in @auth_provider_values
+          }
+          account={@account}
+        />
+        <div :if={@auth_provider_values != []} class="flex flex-wrap gap-1 mb-2">
+          <span
+            :for={
+              label <- auth_provider_labels(@auth_provider_values, @providers, @disabled_providers)
+            }
+            class={[
+              "inline-flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded text-[10px] border",
+              if(label.status == :active,
+                do: "bg-brand-muted text-brand border-brand/20",
+                else: "bg-warning-light text-warning border-warning/30"
+              )
+            ]}
+            title={label.status != :active && unavailable_auth_provider_hint(label.status)}
+            data-auth-provider-status={label.status}
+          >
+            <Core.icon
+              :if={label.status != :active}
+              name="ri-error-warning-line"
+              class="w-2.5 h-2.5 shrink-0"
+            />
+            {if label.status == :active, do: label.name, else: unavailable_auth_provider_name(label)}
+            <button
+              type="button"
+              phx-click="toggle_auth_provider_value"
+              phx-value-id={label.id}
+              class="hover:text-error transition-colors"
+            >
+              <Core.icon name="ri-close-line" class="w-2.5 h-2.5" />
+            </button>
+          </span>
+        </div>
+        <div class="rounded border border-border bg-surface">
+          <label
+            :for={p <- @providers}
+            class="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer hover:bg-raised transition-colors"
+            phx-click="toggle_auth_provider_value"
+            phx-value-id={p.id}
+          >
+            <input
+              type="checkbox"
+              class="w-3 h-3 accent-brand pointer-events-none"
+              readonly
+              checked={p.id in @auth_provider_values}
+            />
+            <span class="text-xs text-body">{p.name}</span>
+          </label>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :show?, :boolean, default: false
+  attr :account, :any, required: true
+
+  defp x509_trust_anchor_warning(assigns) do
+    ~H"""
+    <p
+      :if={@show?}
+      class="flex items-start gap-1.5 rounded border border-warning/30 bg-warning-light px-2.5 py-2 text-xs text-warning"
+    >
+      <Core.icon name="ri-error-warning-line" class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+      <span>
+        No devices will be able to use this authentication provider until you add one or more
+        <Navigation.link
+          navigate={~p"/#{@account}/settings/trust_anchors"}
+          class="font-medium underline hover:no-underline"
+        >Trust Anchors</Navigation.link>.
+      </span>
+    </p>
+    """
+  end
+
+  attr :type, :atom, required: true
+  attr :timezone, :string, default: "UTC"
+  attr :tod_values, :list, default: []
+  attr :tod_adding, :boolean, default: false
+  attr :tod_pending, :map, default: %{"on" => "", "off" => "", "days" => []}
+  attr :tod_pending_error, :string, default: nil
+
+  defp grant_tod_condition_card(assigns) do
+    assigns = assign(assigns, :input_class, @condition_input_class)
+
+    ~H"""
+    <div class="rounded-lg border border-border overflow-hidden">
+      <.grant_condition_card_header type={@type} />
+      <div class="px-3 py-2.5 space-y-2">
+        <input
+          type="hidden"
+          name="policy[conditions][current_utc_datetime][property]"
+          value="current_utc_datetime"
+        />
+        <input
+          type="hidden"
+          name="policy[conditions][current_utc_datetime][operator]"
+          value="is_in_day_of_week_time_ranges"
+        />
+        <select
+          name="policy[conditions][current_utc_datetime][timezone]"
+          phx-change="change_tod_timezone"
+          class={@input_class}
+        >
+          <option :for={tz <- TzExtra.time_zone_ids(include_aliases: true)} value={tz} selected={tz == @timezone}>
+            {tz}
+          </option>
+        </select>
+        <%!-- Confirmed ranges: hidden inputs for submission + compact display row --%>
+        <div class="space-y-1">
+          <div
+            :for={{range, idx} <- Enum.with_index(@tod_values)}
+            class="flex items-center gap-2"
+          >
+            <input
+              :for={day <- range["days"]}
+              type="hidden"
+              name={"policy[conditions][current_utc_datetime][values][#{idx}][days][]"}
+              value={day}
+            />
+            <input
+              type="hidden"
+              name={"policy[conditions][current_utc_datetime][values][#{idx}][on]"}
+              value={range["on"]}
+            />
+            <input
+              type="hidden"
+              name={"policy[conditions][current_utc_datetime][values][#{idx}][off]"}
+              value={range["off"]}
+            />
+            <div class="flex-1 flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-raised border border-border">
+              <span class="text-[10px] font-medium text-heading">
+                {format_tod_days(range["days"])}
+              </span>
+              <span class="text-[10px] font-medium text-heading tabular-nums shrink-0">
+                {range["on"]} – {range["off"]}
+              </span>
+            </div>
+            <button
+              type="button"
+              phx-click="remove_tod_range"
+              phx-value-index={idx}
+              class="shrink-0 p-0.5 rounded text-subtle hover:text-red-500 transition-colors"
+              title="Remove"
+            >
+              <Core.icon name="ri-close-line" class="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+        <%!-- Add range form --%>
+        <div
+          :if={@tod_adding}
+          id="tod_add_row"
+          phx-hook="TimePicker"
+          class="space-y-1.5 p-2 rounded border border-border bg-surface"
+        >
+          <div class="flex flex-wrap gap-1">
+            <button
+              :for={
+                {code, label} <- [
+                  {"M", "Mon"},
+                  {"T", "Tue"},
+                  {"W", "Wed"},
+                  {"R", "Thu"},
+                  {"F", "Fri"},
+                  {"S", "Sat"},
+                  {"U", "Sun"}
+                ]
+              }
+              type="button"
+              phx-click="toggle_tod_pending_day"
+              phx-value-day={code}
+              class={[
+                "px-1.5 py-0.5 rounded text-[10px] font-medium border transition-colors",
+                if code in @tod_pending["days"] do
+                  "bg-brand border-brand text-white"
+                else
+                  "bg-raised border-border text-body hover:text-heading"
+                end
+              ]}
+            >
+              {label}
+            </button>
+          </div>
+          <div class="flex items-start gap-1.5">
+            <div class="flex flex-col items-center gap-0.5">
+              <input
+                type="time"
+                name="_tod_on"
+                id="tod_pending_on"
+                value={@tod_pending["on"]}
+                phx-change="change_tod_pending"
+                class={[
+                  "shrink-0 text-xs rounded border border-border bg-raised",
+                  "text-heading px-2 py-1 outline-none focus:border-border-focus",
+                  "focus:ring-1 focus:ring-border-focus/30 transition-colors"
+                ]}
+              />
+              <span class="text-[9px] text-subtle">on</span>
+            </div>
+            <span class="text-subtle text-xs pt-1">–</span>
+            <div class="flex flex-col items-center gap-0.5">
+              <input
+                type="time"
+                name="_tod_off"
+                id="tod_pending_off"
+                value={@tod_pending["off"]}
+                phx-change="change_tod_pending"
+                class={[
+                  "shrink-0 text-xs rounded border border-border bg-raised",
+                  "text-heading px-2 py-1 outline-none focus:border-border-focus",
+                  "focus:ring-1 focus:ring-border-focus/30 transition-colors"
+                ]}
+              />
+              <span class="text-[9px] text-subtle">off</span>
+            </div>
+          </div>
+          <p
+            :if={@tod_pending_error}
+            class="flex items-center gap-1 text-[10px] text-error"
+          >
+            <Core.icon name="ri-alert-line" class="w-3 h-3 shrink-0" />
+            {@tod_pending_error}
+          </p>
+          <div class="flex justify-end gap-1.5">
+            <Form.button type="button" phx-click="cancel_tod_range" size="xs">
+              Cancel
+            </Form.button>
+            <Form.button type="button" phx-click="confirm_tod_range" style="primary" size="xs">
+              Add
+            </Form.button>
+          </div>
+        </div>
+        <button
+          :if={!@tod_adding}
+          type="button"
+          phx-click="start_add_tod_range"
+          class={[
+            "flex items-center justify-center gap-1 w-full px-2 py-1.5 rounded text-xs font-medium",
+            "border border-border-strong text-body",
+            "hover:border-brand hover:text-brand hover:bg-brand/5",
+            "transition-colors"
+          ]}
+        >
+          <Core.icon name="ri-add-line" class="w-3.5 h-3.5" /> Add range
+        </button>
+      </div>
+    </div>
+    """
+  end
+
+  @tod_day_order ["M", "T", "W", "R", "F", "S", "U"]
+  @tod_day_names %{"M" => "Mon", "T" => "Tue", "W" => "Wed", "R" => "Thu", "F" => "Fri", "S" => "Sat", "U" => "Sun"}
+
+  @spec format_tod_days([String.t()]) :: String.t()
+  defp format_tod_days(days) do
+    days
+    |> Enum.sort_by(&Enum.find_index(@tod_day_order, fn d -> d == &1 end))
+    |> Enum.map_join(", ", &Map.get(@tod_day_names, &1, &1))
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    import Portal.Repo.Query
+    alias Portal.Safe
+
+    # Inlined from PortalWeb.Groups.Components
+    def fetch_group_option(id, subject) do
+      group =
+        from(g in Portal.Group, as: :groups)
+        |> where([groups: g], g.id == ^id)
+        |> join(:left, [groups: g], d in assoc(g, :directory),
+          on: d.account_id == g.account_id,
+          as: :directory
+        )
+        |> join(:left, [directory: d], gd in Portal.Google.Directory,
+          on: gd.id == d.id and gd.account_id == d.account_id and d.type == :google,
+          as: :google_directory
+        )
+        |> join(:left, [directory: d], ed in Portal.Entra.Directory,
+          on: ed.id == d.id and ed.account_id == d.account_id and d.type == :entra,
+          as: :entra_directory
+        )
+        |> join(:left, [directory: d], od in Portal.Okta.Directory,
+          on: od.id == d.id and od.account_id == d.account_id and d.type == :okta,
+          as: :okta_directory
+        )
+        |> select(
+          [groups: g, directory: d, google_directory: gd, entra_directory: ed, okta_directory: od],
+          %{
+            group: g,
+            directory_name:
+              fragment(
+                "COALESCE(?, ?, ?, 'Firezone')",
+                gd.name,
+                ed.name,
+                od.name
+              ),
+            directory_type: d.type
+          }
+        )
+        |> Safe.scoped(subject)
+        |> Safe.one!()
+
+      {:ok, group_option(group)}
+    end
+
+    def list_group_options(search_query_or_nil, subject) do
+      query =
+        from(g in Portal.Group, as: :groups)
+        |> join(:left, [groups: g], d in assoc(g, :directory),
+          on: d.account_id == g.account_id,
+          as: :directory
+        )
+        |> join(:left, [directory: d], gd in Portal.Google.Directory,
+          on: gd.id == d.id and gd.account_id == d.account_id and d.type == :google,
+          as: :google_directory
+        )
+        |> join(:left, [directory: d], ed in Portal.Entra.Directory,
+          on: ed.id == d.id and ed.account_id == d.account_id and d.type == :entra,
+          as: :entra_directory
+        )
+        |> join(:left, [directory: d], od in Portal.Okta.Directory,
+          on: od.id == d.id and od.account_id == d.account_id and d.type == :okta,
+          as: :okta_directory
+        )
+        |> select(
+          [groups: g, directory: d, google_directory: gd, entra_directory: ed, okta_directory: od],
+          %{
+            group: g,
+            directory_name:
+              fragment(
+                "COALESCE(?, ?, ?, 'Firezone')",
+                gd.name,
+                ed.name,
+                od.name
+              ),
+            directory_type: d.type
+          }
+        )
+        |> order_by([groups: g], asc: g.name)
+        |> limit(25)
+
+      query =
+        if search_query_or_nil != "" and search_query_or_nil != nil do
+          from([groups: g] in query, where: fulltext_search(g.name, ^search_query_or_nil))
+        else
+          query
+        end
+
+      rows = query |> Safe.scoped(subject) |> Safe.all()
+
+      # For metadata, we'll return a simple count
+      metadata = %{limit: 25, count: length(rows)}
+
+      {:ok, grouped_select_options(rows), metadata}
+    end
+
+    defp grouped_select_options(rows) do
+      rows
+      |> Enum.group_by(&option_groups_index_and_label/1)
+      |> Enum.sort_by(fn {{options_group_index, options_group_label}, _rows} ->
+        {options_group_index, options_group_label}
+      end)
+      |> Enum.map(fn {{_options_group_index, options_group_label}, rows} ->
+        {options_group_label, rows |> Enum.sort_by(& &1.group.name) |> Enum.map(&group_option/1)}
+      end)
+    end
+
+    defp option_groups_index_and_label(row) do
+      index =
+        cond do
+          group_synced?(row.group) -> 9
+          group_managed?(row.group) -> 1
+          true -> 2
+        end
+
+      label =
+        cond do
+          group_synced?(row.group) ->
+            "Synced from #{row.directory_name}"
+
+          group_managed?(row.group) ->
+            "Managed by Firezone"
+
+          true ->
+            "Manually managed"
+        end
+
+      {index, label}
+    end
+
+    defp group_option(row) do
+      {row.group.id, row.group.name, row}
+    end
+
+    # Inlined from Portal.Actors helpers
+    defp group_synced?(group), do: not is_nil(group.directory_id)
+    defp group_managed?(group), do: group.type == :managed
+
+  end
+
+  attr :is_disabled, :boolean, required: true
+
+  def policy_status_badge(assigns) do
+    ~H"""
+    <Core.status_badge style={if @is_disabled, do: :danger, else: :success}>
+      {if @is_disabled, do: "Disabled", else: "Active"}
+    </Core.status_badge>
+    """
+  end
+end

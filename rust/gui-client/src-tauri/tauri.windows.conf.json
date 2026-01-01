@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "windows": {
+      "signCommand": {
+        "cmd": "C:\\Program Files\\Git\\bin\\bash.exe",
+        "args": ["../../../scripts/build/sign.sh", "%1"]
+      }
+    }
+  },
+  "mainBinaryName": "Firezone",
+  "productName": "Firezone"
+}

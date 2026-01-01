@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SERVICE_NAME="firezone-client-tunnel"
+
+sudo systemctl disable "$SERVICE_NAME"
+sudo systemctl stop "$SERVICE_NAME"

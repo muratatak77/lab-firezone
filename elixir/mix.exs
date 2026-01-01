@@ -1,0 +1,229 @@
+defmodule Portal.MixProject do
+  use Mix.Project
+
+  def cli do
+    [
+      preferred_envs: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.post": :test,
+        "coveralls.html": :test
+      ]
+    ]
+  end
+
+  def project do
+    [
+      app: :portal,
+      version: version(),
+      elixir: "~> 1.15",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      start_permanent: Mix.env() == :prod,
+      test_coverage: [tool: ExCoveralls],
+      test_ignore_filters: [~r"^test/fixtures/"],
+      listeners: listeners(),
+      docs: [
+        logo: "assets/static/images/logo.svg",
+        extras: ["docs/README.md", "docs/SECURITY.md", "docs/CONTRIBUTING.md"]
+      ],
+      deps: deps(),
+      dialyzer: [
+        plt_file: {:no_warn, "priv/plts/dialyzer.plt"},
+        plt_add_apps: [:mix, :credo],
+        ignore_warnings: ".dialyzer_ignore.exs"
+      ],
+      aliases: aliases(),
+      releases: releases()
+    ]
+  end
+
+  def application do
+    [
+      mod: {Portal.Application, []},
+      extra_applications: [
+        :logger,
+        :runtime_tools,
+        :crypto,
+        :os_mon,
+        :dialyzer,
+        # Ensure Postgrex.SCRAM.LockedCache is started before any database connections
+        :postgrex
+      ]
+    ]
+  end
+
+  defp elixirc_paths(:test), do: ["lib", "portal_dev", "test/support", ".credo"]
+  defp elixirc_paths(:dev), do: ["lib", "portal_dev", ".credo"]
+  defp elixirc_paths(_), do: ["lib"]
+
+  defp listeners do
+    System.get_env()
+    |> Enum.any?(fn {key, _val} -> String.starts_with?(key, "DEPENDABOT") end)
+    |> case do
+      true -> []
+      false -> [Phoenix.CodeReloader]
+    end
+  end
+
+  defp deps do
+    [
+      # Ecto / Database
+      {:postgrex, "~> 0.20"},
+      {:ecto_sql, "~> 3.7"},
+      {:ecto_psql_extras, "~> 0.8"},
+      {:phoenix_ecto, "~> 4.4"},
+
+      # Phoenix / Plug
+      {:phoenix, "~> 1.8"},
+      {:phoenix_pubsub, "~> 2.0"},
+      {:phoenix_html, "~> 4.0"},
+      {:phoenix_template, "~> 1.1.0"},
+      {:phoenix_live_view, "~> 1.1"},
+      {:phoenix_live_dashboard, "~> 0.8"},
+      {:phoenix_live_reload, "~> 1.2", only: :dev},
+      {:bandit, "~> 1.3"},
+      {:plug, "~> 1.15"},
+      {:gettext, "~> 1.0"},
+      {:remote_ip, "~> 1.1"},
+
+      # Auth
+      {:plug_crypto, "~> 2.0"},
+      {:jose, "~> 1.11"},
+      {:argon2_elixir, "~> 4.0"},
+
+      # Background jobs
+      {:oban, "~> 2.22"},
+      {:oban_web, "~> 2.11"},
+
+      # Erlang clustering
+      {:libcluster, "~> 3.3"},
+      {:tz, "~> 0.28"},
+      {:tz_extra, "~> 0.45"},
+
+      # Email
+      {:gen_smtp, "~> 1.0"},
+      {:swoosh, "~> 1.29.0"},
+      {:phoenix_swoosh, "~> 1.0"},
+
+      # IP Geolocation
+      {:geolix, "~> 2.0"},
+      {:geolix_adapter_mmdb2, "~> 0.6"},
+
+      # API / OpenAPI
+      {:open_api_spex, "~> 3.22.0"},
+      {:ymlr, "~> 5.0"},
+      {:hammer, "~> 7.5.0"},
+
+      # AWS request signing
+      {:aws_signature, "~> 0.4"},
+
+      # Observability
+      {:telemetry, "~> 1.0"},
+      {:telemetry_poller, "~> 1.0"},
+      {:telemetry_metrics, "~> 1.0"},
+      {:recon, "~> 2.5"},
+      {:observer_cli, "~> 2.0"},
+      {:opentelemetry, "~> 1.5"},
+      {:opentelemetry_logger_metadata, "~> 0.2.0"},
+      {:opentelemetry_api_experimental,
+       github: "open-telemetry/opentelemetry-erlang",
+       sparse: "apps/opentelemetry_api_experimental",
+       ref: "98be90e6",
+       override: true},
+      {:opentelemetry_experimental,
+       github: "open-telemetry/opentelemetry-erlang",
+       sparse: "apps/opentelemetry_experimental",
+       ref: "98be90e6",
+       override: true},
+      {:opentelemetry_exporter, "~> 1.8"},
+      {:opentelemetry_ecto, "~> 1.2"},
+      {:opentelemetry_oban, "~> 1.2.0"},
+      {:opentelemetry_telemetry, "~> 1.1", override: true},
+      {:opentelemetry_bandit, "~> 0.3"},
+      {:opentelemetry_phoenix, "~> 2.0"},
+      {:nimble_options, "~> 1.0", override: true},
+
+      # TODO: Remove override when this issue is resolved:
+      # https://github.com/open-telemetry/opentelemetry-erlang-contrib/issues/428
+      {:opentelemetry_semantic_conventions, "~> 1.27", override: true},
+      {:sentry, "~> 14.0"},
+      {:logger_json, "~> 7.0"},
+      {:req, "~> 0.7.2"},
+
+      # Asset pipeline
+      {:esbuild, "~> 0.7", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.5.1", runtime: Mix.env() == :dev},
+      {:remixicons,
+       github: "Remix-Design/RemixIcon",
+       sparse: "icons",
+       tag: "v4.9.1",
+       app: false,
+       compile: false,
+       depth: 1},
+
+      # Test deps
+      {:floki, "~> 0.38.0", only: :test},
+      {:lazy_html, ">= 0.1.0", only: :test},
+      {:excoveralls, "~> 0.18", only: :test},
+      {:junit_formatter, "~> 3.3", only: :test},
+
+      # Dev/test deps
+      {:credo, "~> 1.5", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.1", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test]},
+      {:sobelow, "~> 0.12", only: [:dev, :test]}
+    ]
+  end
+
+  defp aliases do
+    [
+      setup: ["deps.get", "ecto.setup", "assets.setup", "assets.build"],
+      "ecto.migrate": [
+        "ecto.migrate --migrations-path priv/repo/migrations --migrations-path priv/repo/manual_migrations"
+      ],
+      "ecto.rollback": [
+        "ecto.rollback --migrations-path priv/repo/migrations --migrations-path priv/repo/manual_migrations"
+      ],
+      "ecto.seed": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      reboot: ["ecto.reset", "run priv/repo/seeds.exs", "start"],
+      sobelow: [
+        "sobelow --skip -i Config.HTTPS,Config.Secrets,Config.CSWH,Config.CSRFRoute,Config.Headers --ignore-files lib/portal/dev/account_population.ex"
+      ],
+      "assets.setup": [
+        "cmd --shell cd assets && CI=true pnpm i",
+        "tailwind.install --if-missing",
+        "esbuild.install --if-missing"
+      ],
+      "assets.build": ["tailwind portal", "esbuild portal"],
+      "assets.deploy": ["tailwind portal --minify", "esbuild portal --minify", "phx.digest"],
+      "phx.server": ["ecto.create --quiet", "ecto.migrate", "phx.server"],
+      "openapi.generate": [
+        "openapi.spec.json --spec PortalAPI.ApiSpec --pretty=true --vendor-extensions=false --filename priv/static/openapi.json --no-start-app"
+      ],
+      test: ["ecto.create --quiet", "ecto.migrate", "openapi.generate", "test"],
+      start: ["compile --no-validate-compile-env", "phx.server", "run --no-halt"]
+    ]
+  end
+
+  defp releases do
+    [
+      portal: [
+        include_executables_for: [:unix],
+        validate_compile_env: true,
+        applications: [
+          portal: :permanent,
+          opentelemetry_exporter: :permanent,
+          opentelemetry_experimental: :permanent,
+          opentelemetry: :temporary
+        ]
+      ]
+    ]
+  end
+
+  defp version do
+    sha = System.get_env("GIT_SHA", "dev") |> String.trim()
+    "0.1.0+#{sha}"
+  end
+end

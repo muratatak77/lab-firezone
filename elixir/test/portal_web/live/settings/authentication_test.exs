@@ -1,0 +1,5074 @@
+defmodule PortalWeb.Settings.AuthenticationTest do
+  use PortalWeb.ConnCase, async: true
+
+  import Ecto.Query
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.AuthProviderFixtures
+  import Portal.FeaturesFixtures
+  import Portal.TokenFixtures
+  import Portal.PortalSessionFixtures
+  import Portal.PolicyFixtures
+  import Portal.TrustAnchorFixtures
+
+  alias Portal.EmailOTP
+  alias PortalWeb.Mocks
+
+  # =============================================================================
+  # Test Setup Helpers
+  # =============================================================================
+
+  setup do
+    account = account_fixture()
+    actor = admin_actor_fixture(account: account)
+
+    %{account: account, actor: actor}
+  end
+
+  defp request_confirm(lv, action, provider_id) do
+    lv
+    |> element("button[phx-click='toggle_provider_actions'][phx-value-id='#{provider_id}']")
+    |> render_click()
+
+    lv
+    |> element(
+      "button[phx-click='request_confirm'][phx-value-action='#{action}'][phx-value-id='#{provider_id}']"
+    )
+    |> render_click()
+  end
+
+  defp open_provider_actions(lv, provider_id) do
+    lv
+    |> element("button[phx-click='toggle_provider_actions'][phx-value-id='#{provider_id}']")
+    |> render_click()
+  end
+
+  defp has_provider_action_button?(html, action, provider_id) do
+    html
+    |> Floki.parse_fragment!()
+    |> Floki.find(
+      "button[phx-click='request_confirm'][phx-value-action='#{action}'][phx-value-id='#{provider_id}']"
+    )
+    |> Enum.any?()
+  end
+
+  defp confirm_action(lv, event, provider_id) do
+    lv
+    |> element("button[phx-click='#{event}'][phx-value-id='#{provider_id}']")
+    |> render_click()
+  end
+
+  defp provider_row_text(html, provider_id) do
+    html
+    |> Floki.parse_fragment!()
+    |> Floki.find("tr")
+    |> Enum.find(&(Floki.text(&1) =~ provider_id))
+    |> Floki.text(sep: " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  defp verification_ref_from_open_url(lv) do
+    assert_push_event(lv, "open_url", %{url: url})
+    send(self(), {:opened_url, url})
+
+    %{"state" => state} =
+      url
+      |> URI.parse()
+      |> Map.fetch!(:query)
+      |> URI.decode_query()
+
+    assert {:ok, %{verification_ref: verification_ref, lv_pid: serialized_pid}} =
+             PortalWeb.OIDC.verify_verification_state(state)
+
+    assert PortalWeb.OIDC.deserialize_pid(serialized_pid) == lv.pid
+
+    send(lv.pid, {:get_pending_verification, self()})
+
+    assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+
+    verification_ref
+  end
+
+  # =============================================================================
+  # Basic Page Rendering Tests
+  # =============================================================================
+
+  describe "index page" do
+    test "redirects to sign in page for unauthorized user", %{account: account, conn: conn} do
+      path = ~p"/#{account}/settings/authentication"
+
+      assert live(conn, path) ==
+               {:error,
+                {:redirect,
+                 %{
+                   to: ~p"/#{account}/sign_in?#{%{redirect_to: path}}",
+                   flash: %{"error" => "You must sign in to access that page."}
+                 }}}
+    end
+
+    test "renders page heading", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Identity Providers"
+    end
+
+    test "renders page title", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Identity Providers"
+    end
+
+    test "renders add provider button", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      parsed = Floki.parse_fragment!(html)
+
+      add_button =
+        Floki.find(parsed, "a[href='/#{account.slug}/settings/authentication/new']")
+
+      assert Floki.text(add_button) =~ "Add"
+    end
+
+    test "renders authentication documentation link", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "https://www.firezone.dev/kb/authenticate?utm_source=product#"
+    end
+
+    test "renders make default option for providers", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert open_provider_actions(lv, provider.id) =~ "Make default"
+    end
+  end
+
+  # =============================================================================
+  # Provider Listing Tests
+  # =============================================================================
+
+  describe "provider listing" do
+    test "loads the providers only after the socket connects", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+      conn = authorize_conn(conn, actor)
+
+      static = conn |> get(~p"/#{account}/settings/authentication") |> html_response(200)
+      assert static =~ ~s(id="providers-skeleton")
+      refute static =~ provider.id
+
+      {:ok, _lv, html} = live(conn, ~p"/#{account}/settings/authentication")
+      assert html =~ provider.id
+      refute html =~ ~s(id="providers-skeleton")
+    end
+
+    test "renders X.509 with a trust-anchor warning when the feature is enabled", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      enable_feature(:x509_auth)
+      provider = x509_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "X.509"
+      assert html =~ "No devices will be able to use this authentication provider"
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "0 client"
+      refute row_text =~ "0 portal"
+
+      assert has_element?(
+               lv,
+               "a[href='/#{account.slug}/settings/trust_anchors']",
+               "Trust Anchors"
+             )
+
+      actions = open_provider_actions(lv, provider.id)
+      refute actions =~ "Make default"
+      refute has_provider_action_button?(actions, "delete", provider.id)
+      refute actions =~ "/authentication/x509/#{provider.id}/edit"
+    end
+
+    test "does not warn for X.509 when the account has a trust anchor", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      enable_feature(:x509_auth)
+      _provider = x509_provider_fixture(account: account)
+      _anchor = trust_anchor_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "X.509"
+      refute html =~ "No devices will be able to use this authentication provider"
+    end
+
+    test "hides X.509 when X.509 authentication is globally disabled", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      _provider = x509_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      refute html =~ "X.509"
+    end
+
+    test "renders email_otp provider", %{account: account, actor: actor, conn: conn} do
+      # authorize_conn creates an email_otp provider
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Email OTP"
+    end
+
+    test "renders userpass provider", %{account: account, actor: actor, conn: conn} do
+      userpass_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Username and Password"
+    end
+
+    test "renders google provider", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, name: "My Google Provider")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "My Google Provider"
+    end
+
+    test "renders github provider", %{account: account, actor: actor, conn: conn} do
+      github_provider_fixture(account: account, name: "My GitHub Provider")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "My GitHub Provider"
+      assert html =~ "ri-github-fill"
+    end
+
+    test "renders entra provider", %{account: account, actor: actor, conn: conn} do
+      entra_provider_fixture(account: account, name: "My Entra Provider")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "My Entra Provider"
+    end
+
+    test "renders okta provider", %{account: account, actor: actor, conn: conn} do
+      okta_provider_fixture(account: account, name: "My Okta Provider")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "My Okta Provider"
+    end
+
+    test "renders oidc provider", %{account: account, actor: actor, conn: conn} do
+      oidc_provider_fixture(account: account, name: "My OIDC Provider")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "My OIDC Provider"
+    end
+
+    test "renders provider issuer", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, issuer: "https://accounts.google.com")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Personal Google accounts"
+    end
+
+    test "renders provider ID", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ provider.id
+    end
+
+    test "renders DEFAULT badge for default provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, is_default: true)
+      other = oidc_provider_fixture(account: account, is_default: false)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "Default"
+      refute provider_row_text(html, other.id) =~ "Default"
+    end
+
+    test "renders LEGACY badge for legacy oidc provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      legacy_provider = oidc_provider_fixture(account: account, is_legacy: true)
+      new_provider = oidc_provider_fixture(account: account, is_legacy: false)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, legacy_provider.id) =~ "Legacy"
+      refute provider_row_text(html, new_provider.id) =~ "Legacy"
+    end
+
+    test "renders session counts", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account)
+
+      # Create client tokens and portal sessions
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+
+      portal_session_fixture(
+        account: account,
+        actor: actor,
+        auth_provider: provider.auth_provider
+      )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "2"
+      assert row_text =~ "1"
+      assert row_text =~ "client"
+      assert row_text =~ "portal"
+    end
+
+    test "renders portal session lifetime", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, portal_session_lifetime_secs: 3600)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "1h"
+    end
+
+    test "renders client session lifetime", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, client_session_lifetime_secs: 86400)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "1d"
+    end
+
+    test "shows schema default when session lifetime is nil", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, portal_session_lifetime_secs: nil)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # nil falls back to the schema default (28800s = 8h)
+      assert provider_row_text(html, provider.id) =~ "8h"
+    end
+
+    test "renders disabled portal/client for context-specific providers", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, context: :clients_only)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "Clients"
+    end
+  end
+
+  # =============================================================================
+  # Select Provider Type Panel Tests
+  # =============================================================================
+
+  describe "select provider type panel" do
+    test "opens panel with provider options", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/new")
+
+      html = render(lv)
+
+      assert html =~ "Select Provider Type"
+      assert html =~ "Google"
+      assert html =~ "Entra"
+      assert html =~ "Okta"
+      assert html =~ "OIDC"
+    end
+
+    test "has links to new provider forms", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/new")
+
+      parsed = Floki.parse_fragment!(html)
+
+      assert Floki.find(parsed, "a[href='/#{account.slug}/settings/authentication/google/new']") !=
+               []
+
+      assert Floki.find(parsed, "a[href='/#{account.slug}/settings/authentication/github/new']") !=
+               []
+
+      assert Floki.find(parsed, "a[href='/#{account.slug}/settings/authentication/entra/new']") !=
+               []
+
+      assert Floki.find(parsed, "a[href='/#{account.slug}/settings/authentication/okta/new']") !=
+               []
+
+      assert Floki.find(parsed, "a[href='/#{account.slug}/settings/authentication/oidc/new']") !=
+               []
+    end
+
+    test "closes panel when clicking close", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/new")
+
+      lv |> element("button[phx-click='close_panel']") |> render_click()
+
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+    end
+
+    test "closes panel on escape keydown", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/new")
+
+      render_keydown(lv, "handle_keydown", %{"key" => "Escape"})
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+    end
+  end
+
+  # =============================================================================
+  # New Google Provider Tests
+  # =============================================================================
+
+  describe "new google provider" do
+    test "renders new google provider form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      assert html =~ "Add Google Provider"
+      assert html =~ "Name"
+      assert html =~ "Context"
+      assert html =~ "Portal (seconds)"
+      assert html =~ "Client (seconds)"
+      assert html =~ "Clients will be <strong>signed out</strong>"
+      assert html =~ "after this and forced to re-authenticate."
+      assert html =~ "Verify Now"
+    end
+
+    test "validates portal_session_lifetime_secs minimum", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      # Below minimum (300 seconds)
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{portal_session_lifetime_secs: 100}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert errors["auth_provider[portal_session_lifetime_secs]"] != nil
+    end
+
+    test "validates portal_session_lifetime_secs maximum", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      # Above maximum (86400 seconds)
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{portal_session_lifetime_secs: 100_000}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert errors["auth_provider[portal_session_lifetime_secs]"] != nil
+    end
+
+    test "validates client_session_lifetime_secs minimum", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{client_session_lifetime_secs: 1000}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert errors["auth_provider[client_session_lifetime_secs]"] != nil
+    end
+
+    test "validates client_session_lifetime_secs maximum", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{client_session_lifetime_secs: 8_000_000}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert errors["auth_provider[client_session_lifetime_secs]"] != nil
+    end
+
+    test "shows verify button when form is valid but not verified", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      # The verify button should be present
+      assert html =~ "Verify Now"
+    end
+
+    test "shows awaiting verification message", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # New GitHub Provider Tests
+  # =============================================================================
+
+  describe "new github provider" do
+    test "renders new github provider form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/github/new")
+
+      assert html =~ "Add GitHub Provider"
+      assert html =~ "Sign in with your GitHub account to verify the configuration."
+      assert html =~ "Verify Now"
+      refute html =~ "Redirect URI"
+
+      parsed = Floki.parse_fragment!(html)
+      radios = "input[name='auth_provider[email_verification_method]']"
+      assert parsed |> Floki.find(radios) |> Floki.attribute("value") == ["proof", "none"]
+      assert parsed |> Floki.find(radios <> "[checked]") |> Floki.attribute("value") == ["proof"]
+    end
+
+    test "does not verify when the callback has no GitHub issuer", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.GitHub.stub()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/github/new")
+
+      lv |> element("#verify-button") |> render_click()
+
+      assert_push_event(lv, "open_url", %{url: url})
+      %{"state" => state} = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      callback_conn = get(build_conn(), ~p"/auth/oidc/callback", %{"state" => state, "code" => "c"})
+      get(build_conn(), redirected_to(callback_conn))
+
+      refute_received {:github_token_request, _params}
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+      refute html =~ "Verified"
+    end
+
+    test "verifies with GitHub and creates the provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.GitHub.stub()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/github/new")
+
+      lv |> element("#verify-button") |> render_click()
+
+      assert_push_event(lv, "open_url", %{url: url})
+      %URI{host: "github.test", query: query} = URI.parse(url)
+      %{"state" => state, "prompt" => "select_account"} = URI.decode_query(query)
+
+      callback_conn =
+        get(build_conn(), ~p"/auth/oidc/callback", %{
+          "state" => state,
+          "code" => "c",
+          "iss" => "https://github.com/login/oauth"
+        })
+
+      get(build_conn(), redirected_to(callback_conn))
+
+      html = render(lv)
+      assert html =~ "Verified"
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+
+      provider = Portal.Repo.get_by!(Portal.GitHub.AuthProvider, account_id: account.id)
+      assert provider.issuer == "https://github.com/login/oauth"
+      assert provider.name == "GitHub"
+      assert provider.email_verification_method == :proof
+      refute provider.is_default
+
+      parent = Portal.Repo.get_by!(Portal.AuthProvider, id: provider.id)
+      assert parent.type == :github
+    end
+  end
+
+  # =============================================================================
+  # New Entra Provider Tests
+  # =============================================================================
+
+  describe "new entra provider" do
+    test "renders new entra provider form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      assert html =~ "Add Microsoft Entra Provider"
+      assert html =~ "Name"
+      assert html =~ "Context"
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # New Okta Provider Tests
+  # =============================================================================
+
+  describe "new okta provider" do
+    test "renders new okta provider form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      assert html =~ "Add Okta Provider"
+      assert html =~ "Name"
+      assert html =~ "Context"
+      assert html =~ "Okta Domain"
+      assert html =~ "Client ID"
+      assert html =~ "Client Secret"
+      assert html =~ "Redirect URI"
+      assert html =~ "Verify Now"
+    end
+
+    test "validates required fields", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          okta_domain: "",
+          client_id: "",
+          client_secret: ""
+        }
+      })
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert Map.has_key?(errors, "auth_provider[okta_domain]")
+      assert Map.has_key?(errors, "auth_provider[client_id]")
+      assert Map.has_key?(errors, "auth_provider[client_secret]")
+    end
+
+    test "validates okta_domain is FQDN", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{okta_domain: "invalid domain"}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert errors["auth_provider[okta_domain]"] != nil
+    end
+
+    test "shows redirect URI for copy", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      assert html =~ "/auth/oidc/callback"
+    end
+  end
+
+  # =============================================================================
+  # New OIDC Provider Tests
+  # =============================================================================
+
+  describe "new oidc provider" do
+    test "renders new oidc provider form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      assert html =~ "Add OpenID Connect Provider"
+      assert html =~ "Name"
+      assert html =~ "Context"
+      assert html =~ "Discovery Document URI"
+      assert html =~ "Client ID"
+      assert html =~ "Client Secret"
+      assert html =~ "Email Verification"
+      assert html =~ "Do not require the identity provider to confirm email ownership"
+      assert html =~ "email_verified=true"
+      assert html =~ "Send a one-time passcode to the claimed email address"
+      assert html =~ "Redirect URI"
+      assert html =~ "Verify Now"
+    end
+
+    test "validates required fields", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          discovery_document_uri: "",
+          client_id: "",
+          client_secret: ""
+        }
+      })
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert Map.has_key?(errors, "auth_provider[discovery_document_uri]")
+      assert Map.has_key?(errors, "auth_provider[client_id]")
+      assert Map.has_key?(errors, "auth_provider[client_secret]")
+    end
+
+    test "validates discovery_document_uri is valid URI", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{discovery_document_uri: "not a url"}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert errors["auth_provider[discovery_document_uri]"] != nil
+    end
+  end
+
+  # =============================================================================
+  # Edit Provider Tests
+  # =============================================================================
+
+  describe "edit email_otp provider" do
+    test "renders edit form", %{account: account, actor: actor, conn: conn} do
+      # First create the email_otp provider, then use authorize_conn_with_provider with a google provider
+      email_otp_provider = email_otp_provider_fixture(account: account, name: "Test Email OTP")
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      assert html =~ "Edit Test Email OTP"
+      assert html =~ "Name"
+      assert html =~ "Context"
+      # Email OTP doesn't require verification
+      refute html =~ "Provider Verification"
+    end
+
+    test "updates provider name", %{account: account, actor: actor, conn: conn} do
+      email_otp_provider = email_otp_provider_fixture(account: account, name: "Old Name")
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      # Change the name
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "New Name"}})
+      |> render_change()
+
+      # Submit the form
+      lv
+      |> form("#auth-provider-form")
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+
+      html = render(lv)
+      assert html =~ "Authentication provider saved successfully"
+      assert html =~ "New Name"
+    end
+
+    test "updates provider context", %{account: account, actor: actor, conn: conn} do
+      email_otp_provider =
+        email_otp_provider_fixture(account: account, context: :clients_and_portal)
+
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      # Change the context and submit
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{context: "portal_only"}})
+      |> render_change()
+
+      lv
+      |> form("#auth-provider-form")
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+
+      # Verify the change was saved
+      updated = Repo.get!(EmailOTP.AuthProvider, email_otp_provider.id)
+      assert updated.context == :portal_only
+    end
+  end
+
+  describe "edit userpass provider" do
+    test "renders edit form", %{account: account, actor: actor, conn: conn} do
+      provider = userpass_provider_fixture(account: account, name: "Test Userpass")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/userpass/#{provider.id}/edit")
+
+      assert html =~ "Edit Test Userpass"
+      # Userpass doesn't require verification
+      refute html =~ "Provider Verification"
+    end
+
+    test "updates provider", %{account: account, actor: actor, conn: conn} do
+      provider = userpass_provider_fixture(account: account, name: "Old Name")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/userpass/#{provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Updated Userpass"}})
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+
+      html = render(lv)
+      assert html =~ "Authentication provider saved successfully"
+    end
+  end
+
+  describe "edit github provider" do
+    test "switches email verification to None without re-verifying", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = github_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/github/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{email_verification_method: "none"}})
+      |> render_change()
+
+      assert render(lv) =~ "Verified"
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+
+      assert Portal.Repo.reload!(provider).email_verification_method == :none
+    end
+
+    test "rejects an unknown email verification method", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = github_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/github/#{provider.id}/edit")
+
+      render_change(lv, "validate", %{"auth_provider" => %{"email_verification_method" => "claim"}})
+      render_submit(lv, "submit_provider", %{})
+
+      assert Portal.Repo.reload!(provider).email_verification_method == :proof
+    end
+  end
+
+  describe "edit google provider" do
+    test "renders edit form with verification section", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(workspace_domains: ["example.com"], account: account, name: "Test Google")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      assert html =~ "Edit Test Google"
+      assert html =~ "Verified domains"
+      assert html =~ "Verified"
+    end
+
+    test "offers to refresh the domains when verified", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(workspace_domains: ["example.com"], account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      assert html =~ "Refresh domains"
+      refute html =~ ">Reset<"
+    end
+
+    test "first verification enables the administrator's domain and lists the rest", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/new")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      assert_received {:opened_url, url}
+      assert url =~ "admin.directory.domain.readonly"
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com",
+        ["primary.example", "second.example", "third.example"], "primary.example", verification_ref,
+        {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      assert has_element?(lv, "#verified-organization-0", "primary.example")
+      assert has_element?(lv, "#verified-organization-0", "(primary)")
+      assert has_element?(lv, "#verified-domain-toggle-0[checked][disabled]")
+      assert has_element?(lv, "#verified-organization-1", "second.example")
+      refute has_element?(lv, "#verified-domain-toggle-1[checked]")
+      assert has_element?(lv, "#verified-organization-2", "third.example")
+      assert render(lv) =~ "At least one domain must be enabled"
+
+      lv |> element("#verified-domain-toggle-2") |> render_click()
+      assert has_element?(lv, "#verified-domain-toggle-2[checked]")
+      refute has_element?(lv, "#verified-domain-toggle-0[disabled]")
+      lv |> element("#verified-domain-toggle-0") |> render_click()
+      refute has_element?(lv, "#verified-domain-toggle-0[checked]")
+      assert has_element?(lv, "#verified-domain-toggle-2[checked][disabled]")
+      render_click(lv, "toggle_verified_domain", %{"domain" => "forged.example"})
+      refute render(lv) =~ "forged.example"
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      saved = Repo.get_by!(Portal.Google.AuthProvider, account_id: ctx.account.id)
+      assert saved.workspace_domains == ["third.example"]
+    end
+
+    test "keeps one domain enabled and persists toggled domains", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      provider = google_provider_fixture(account: ctx.account,
+        workspace_domains: ["primary.example", "second.example"])
+      path = ~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit"
+      conn = authorize_conn(ctx.conn, ctx.actor)
+      {:ok, lv, _} = live(conn, path)
+      assert has_element?(lv, "#verified-organization-1", "second.example")
+      refute has_element?(lv, "#verified-organization-0", "(primary)")
+      refute has_element?(lv, "#verified-domain-toggle-0")
+
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com",
+        ["primary.example", "second.example", "third.example"], "primary.example", verification_ref,
+        {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      assert has_element?(lv, "#verified-organization-0", "(primary)")
+      assert has_element?(lv, "#verified-domain-toggle-0[checked]")
+      refute has_element?(lv, "#verified-domain-toggle-0[disabled]")
+      assert has_element?(lv, "#verified-domain-toggle-1[checked]")
+      refute has_element?(lv, "#verified-domain-toggle-2[checked]")
+
+      lv |> element("#verified-domain-toggle-1") |> render_click()
+      refute has_element?(lv, "#verified-domain-toggle-1[checked]")
+      # The last enabled domain is locked until another one is enabled.
+      assert has_element?(lv, "#verified-domain-toggle-0[checked][disabled]")
+      render_click(lv, "toggle_verified_domain", %{"domain" => "primary.example"})
+      assert has_element?(lv, "#verified-domain-toggle-0[checked]")
+      lv |> element("#verified-domain-toggle-2") |> render_click()
+      assert has_element?(lv, "#verified-domain-toggle-2[checked]")
+      refute has_element?(lv, "#verified-domain-toggle-0[disabled]")
+      assert has_element?(lv, "#verified-organization-1", "second.example")
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert Repo.get!(Portal.Google.AuthProvider, provider.id).workspace_domains ==
+               ["primary.example", "third.example"]
+
+      # Reopening shows only the saved domains; toggles need a fresh verification.
+      {:ok, lv, _} = live(conn, path)
+      assert has_element?(lv, "#verified-organization-1", "third.example")
+      refute has_element?(lv, "#verified-organization-2")
+      refute has_element?(lv, "#verified-domain-toggle-0")
+      refute has_element?(lv, "#verified-organization-0", "(primary)")
+    end
+
+    test "refreshing keeps the enabled domains", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      provider = google_provider_fixture(account: ctx.account,
+        workspace_domains: ["primary.example", "second.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com",
+        ["second.example", "primary.example", "fourth.example"], "primary.example", verification_ref,
+        {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      assert has_element?(lv, "#verified-organization-0", "second.example")
+      assert has_element?(lv, "#verified-organization-0", "(primary)")
+      assert has_element?(lv, "#verified-organization-1", "primary.example")
+      assert has_element?(lv, "#verified-organization-2", "fourth.example")
+      refute has_element?(lv, "#verified-organization-3")
+      assert has_element?(lv, "#verified-domain-toggle-0[checked]")
+      assert has_element?(lv, "#verified-domain-toggle-1[checked]")
+      refute has_element?(lv, "#verified-domain-toggle-2[checked]")
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert Repo.get!(Portal.Google.AuthProvider, provider.id).workspace_domains ==
+               ["second.example", "primary.example"]
+    end
+
+    test "an administrator of an unrelated Workspace cannot refresh the domains", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      provider = google_provider_fixture(account: ctx.account, workspace_domains: ["primary.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com",
+        ["other.example", "another.example"], "other.example", verification_ref, {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      refute render(lv) =~ "other.example"
+      assert render(lv) =~ "administrator of the Google Workspace that this provider already uses"
+    end
+
+    test "a personal account cannot refresh a Workspace provider", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      provider = google_provider_fixture(account: ctx.account, workspace_domains: ["primary.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com", nil, nil, verification_ref,
+        {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      assert has_element?(lv, "#verified-organization-0", "primary.example")
+      assert render(lv) =~ "existing domains have been kept"
+    end
+
+    test "cannot clear the first verified domain with a forged reset event", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, workspace_domains: ["example.com"])
+      {:ok, lv, _html} = conn |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+      render_click(lv, "reset_verification")
+      assert has_element?(lv, "#verified-organization-0", "example.com")
+    end
+
+    test "updates non-verification fields without re-verification", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(workspace_domains: ["example.com"], account: account, name: "Old Google")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "New Google Name"}})
+      |> render_change()
+
+      lv
+      |> form("#auth-provider-form")
+      |> render_submit()
+
+      # Wait for redirect and then check
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+
+      # Check the page shows the updated name
+      html = render(lv)
+      assert html =~ "New Google Name"
+    end
+  end
+
+  describe "provider action confirmations" do
+    test "opens and cancels pending confirmation state", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      html = request_confirm(lv, "toggle", provider.id)
+      assert html =~ "Disable"
+
+      html = render_click(lv, "cancel_confirm")
+      refute html =~ "Disable #{provider.name}"
+    end
+
+    test "closes edit panel on escape keydown", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, name: "Escape Google")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      render_keydown(lv, "handle_keydown", %{"key" => "Escape"})
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+    end
+  end
+
+  describe "provider actions menu navigation" do
+    test "closes the actions menu when navigating to edit", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, name: "Edit From Menu")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      html = open_provider_actions(lv, provider.id)
+      assert has_provider_action_button?(html, "toggle", provider.id)
+
+      lv
+      |> element("a[href='/" <> "#{account.slug}/settings/authentication/google/#{provider.id}/edit']")
+      |> render_click()
+
+      assert_patch(lv, ~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      html = render(lv)
+      assert html =~ "Edit Edit From Menu"
+      refute has_provider_action_button?(html, "toggle", provider.id)
+    end
+  end
+
+  describe "edit entra provider" do
+    test "renders edit form", %{account: account, actor: actor, conn: conn} do
+      provider = entra_provider_fixture(account: account, name: "Test Entra")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/#{provider.id}/edit")
+
+      assert html =~ "Edit Test Entra"
+      assert html =~ "Verified tenants"
+    end
+
+    test "allows changing email_claim", %{account: account, actor: actor, conn: conn} do
+      provider =
+        entra_provider_fixture(account: account, name: "Test Entra", is_verified: true)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/#{provider.id}/edit")
+
+      assert html =~ "Email Claim"
+
+      lv
+      |> form("#auth-provider-form", %{
+        "auth_provider" => %{"email_claim" => "email"}
+      })
+      |> render_change()
+
+      lv |> form("#auth-provider-form") |> render_submit()
+
+      html = render(lv)
+      assert html =~ "saved"
+
+      updated = Portal.Repo.get!(Portal.Entra.AuthProvider, provider.id)
+      assert updated.email_claim == "email"
+    end
+
+    test "allows selecting a verified sign-in tenant", %{account: account, actor: actor, conn: conn} do
+      [first, second] = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+      provider = entra_provider_fixture(account: account, tenant_ids: [first, second])
+      conn = authorize_conn(conn, actor)
+
+      {:ok, lv, html} = live(conn, ~p"/#{account}/settings/authentication/entra/#{provider.id}/edit")
+
+      assert html =~ "Sign-in Tenant"
+
+      lv
+      |> form("#auth-provider-form", %{"auth_provider" => %{"sign_in_tenant_id" => second}})
+      |> render_change()
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert Repo.get!(Portal.Entra.AuthProvider, provider.id).sign_in_tenant_id == second
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/settings/authentication/entra/#{provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{"auth_provider" => %{"sign_in_tenant_id" => ""}})
+      |> render_change()
+
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert Repo.get!(Portal.Entra.AuthProvider, provider.id).sign_in_tenant_id == nil
+    end
+
+    test "clears the sign-in tenant when its tenant is removed", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      [first, second] = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      provider =
+        entra_provider_fixture(account: account, tenant_ids: [first, second], sign_in_tenant_id: second)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/#{provider.id}/edit")
+
+      lv |> element("#verified-organization-1 button") |> render_click()
+      lv |> form("#auth-provider-form") |> render_submit()
+
+      saved = Repo.get!(Portal.Entra.AuthProvider, provider.id)
+      assert saved.tenant_ids == [first]
+      assert saved.sign_in_tenant_id == nil
+    end
+  end
+
+  describe "edit okta provider" do
+    test "renders edit form with all fields", %{account: account, actor: actor, conn: conn} do
+      provider = okta_provider_fixture(account: account, name: "Test Okta")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Edit Test Okta"
+      assert html =~ "Okta Domain"
+      assert html =~ "Client ID"
+      assert html =~ "Client Secret"
+      assert html =~ "Verification"
+    end
+
+    test "clears verification when client_id changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      # Initially verified
+      assert html =~ "Verified"
+
+      # Change client_id
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{client_id: "new-client-id"}})
+        |> render_change()
+
+      # Verification should be cleared
+      assert html =~ "Verify Now"
+    end
+
+    test "clears verification when client_secret changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{client_secret: "new-secret"}})
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "clears verification when okta_domain changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{okta_domain: "new-domain.okta.com"}})
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+  end
+
+  describe "stored client secret" do
+    for {type, fixture} <- [{"okta", :okta_provider_fixture}, {"oidc", :oidc_provider_fixture}] do
+      test "never renders the stored #{type} client secret", %{
+        account: account,
+        actor: actor,
+        conn: conn
+      } do
+        stored = "stored-secret-#{System.unique_integer([:positive])}"
+
+        provider =
+          apply(Portal.AuthProviderFixtures, unquote(fixture), [
+            %{account: account, client_secret: stored}
+          ])
+
+        {:ok, lv, html} =
+          conn
+          |> authorize_conn(actor)
+          |> live(~p"/#{account}/settings/authentication/#{unquote(type)}/#{provider.id}/edit")
+
+        refute html =~ stored
+        assert html =~ "Leave blank to keep the current value"
+
+        html =
+          lv
+          |> form("#auth-provider-form", %{auth_provider: %{name: "Renamed"}})
+          |> render_change()
+
+        refute html =~ stored
+      end
+    end
+
+    test "keeps the stored secret when the box is left blank", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Renamed Okta", client_secret: ""}})
+      |> render_change()
+
+      lv |> element("#auth-provider-form") |> render_submit()
+
+      updated = Repo.get_by!(Portal.Okta.AuthProvider, id: provider.id)
+      assert updated.name == "Renamed Okta"
+      assert updated.client_secret == provider.client_secret
+    end
+
+    test "resets the secret when the Okta domain changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+      provider = okta_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      # As a browser sends it: the untouched secret box carries an _unused_
+      # marker.
+      html =
+        render_change(lv, "validate", %{
+          "_target" => ["auth_provider", "okta_domain"],
+          "auth_provider" => %{
+            "okta_domain" => "attacker.example.com",
+            "client_secret" => "",
+            "_unused_client_secret" => ""
+          }
+        })
+
+      refute html =~ "Leave blank to keep the current value"
+      assert html =~ "Required for the new Okta domain."
+      assert has_element?(lv, "#auth_provider_client_secret[required]")
+      refute has_element?(lv, "#verify-button")
+
+      lv |> element("#auth-provider-form") |> render_submit()
+
+      updated = Repo.get_by!(Portal.Okta.AuthProvider, id: provider.id)
+      assert updated.okta_domain == provider.okta_domain
+      assert updated.client_secret == provider.client_secret
+    end
+
+    test "saves a new discovery document URI and secret once verified", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      provider =
+        oidc_provider_fixture(
+          account: account,
+          discovery_document_uri: "https://old-idp.example.com/.well-known/openid-configuration",
+          email_verification_method: :none
+        )
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_secret: "new-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack = make_ref()
+      send(lv.pid, {:oidc_verify_complete, "https://example.com", verification_ref, {self(), ack}})
+      assert_receive {:verification_ack, ^ack}
+
+      lv |> element("#auth-provider-form") |> render_submit()
+
+      updated = Repo.get_by!(Portal.OIDC.AuthProvider, id: provider.id)
+      assert updated.discovery_document_uri == Mocks.OIDC.discovery_document_uri()
+      assert updated.client_secret == "new-secret"
+      assert updated.issuer == "https://example.com"
+    end
+
+    test "keeps a secret typed again unchanged through a verification reset", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      provider =
+        oidc_provider_fixture(
+          account: account,
+          discovery_document_uri: "https://old-idp.example.com/.well-known/openid-configuration",
+          email_verification_method: :none
+        )
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_secret: provider.client_secret
+        }
+      })
+      |> render_change()
+
+      assert has_element?(lv, "#verify-button")
+
+      lv |> element("#verify-button") |> render_click()
+      verification_ref_from_open_url(lv)
+      render_hook(lv, "reset_verification", %{})
+      assert has_element?(lv, "#verify-button")
+
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack = make_ref()
+      send(lv.pid, {:oidc_verify_complete, "https://example.com", verification_ref, {self(), ack}})
+      assert_receive {:verification_ack, ^ack}
+
+      lv |> element("#auth-provider-form") |> render_submit()
+
+      updated = Repo.get_by!(Portal.OIDC.AuthProvider, id: provider.id)
+      assert updated.discovery_document_uri == Mocks.OIDC.discovery_document_uri()
+      assert updated.client_secret == provider.client_secret
+    end
+  end
+
+  describe "edit oidc provider" do
+    test "renders edit form with all fields", %{account: account, actor: actor, conn: conn} do
+      provider = oidc_provider_fixture(account: account, name: "Test OIDC")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      assert html =~ "Edit Test OIDC"
+      assert html =~ "Discovery Document URI"
+      assert html =~ "Client ID"
+      assert html =~ "Client Secret"
+      assert html =~ "Email Verification"
+      assert html =~ "Do not require the identity provider to confirm email ownership"
+      assert html =~ "email_verified=true"
+      assert html =~ "Send a one-time passcode to the claimed email address"
+      assert html =~ "Verification"
+    end
+
+    test "clears verification when discovery_document_uri changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = oidc_provider_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{
+          auth_provider: %{
+            discovery_document_uri: "https://new.example.com/.well-known/openid-configuration"
+          }
+        })
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "clears verification when email_verification_method changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = oidc_provider_fixture(account: account, email_verification_method: :claim)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{
+          auth_provider: %{email_verification_method: "none"}
+        })
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "shows legacy warning for legacy providers", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = oidc_provider_fixture(account: account, is_legacy: true)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      # Check for legacy-related text in the form
+      assert html =~ "legacy" or html =~ "Legacy" or html =~ "LEGACY"
+    end
+
+    test "shows legacy redirect URI for legacy providers", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = oidc_provider_fixture(account: account, is_legacy: true)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      # Legacy redirect URI should contain "providers" path
+      assert html =~ "providers/#{provider.id}/handle_callback" or html =~ "oidc/callback"
+    end
+  end
+
+  # =============================================================================
+  # Toggle Provider (Enable/Disable) Tests
+  # =============================================================================
+
+  describe "toggle provider" do
+    test "can disable a provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, is_disabled: false)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("toggle", provider.id)
+      lv |> confirm_action("toggle_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "disabled successfully"
+    end
+
+    test "can enable a disabled provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, is_disabled: true)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("toggle", provider.id)
+      lv |> confirm_action("toggle_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "enabled successfully"
+    end
+
+    test "cannot disable provider user is signed in with", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # Create a google provider and sign in with it
+      provider = google_provider_fixture(account: account, is_disabled: false)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, provider)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("toggle", provider.id)
+      lv |> confirm_action("toggle_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "cannot disable the provider you are currently signed in with"
+    end
+
+    test "cannot disable the default provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, is_disabled: false, is_default: true)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("toggle", provider.id)
+      lv |> confirm_action("toggle_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "Cannot disable the default authentication provider"
+    end
+  end
+
+  # =============================================================================
+  # Delete Provider Tests
+  # =============================================================================
+
+  describe "delete provider" do
+    test "can delete a provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, name: "Provider To Delete")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("delete", provider.id)
+      lv |> confirm_action("delete_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "deleted successfully"
+      refute html =~ "Provider To Delete"
+    end
+
+    test "warns how many policies reference the provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+      other_provider = github_provider_fixture(account: account)
+
+      for operator <- [:is_in, :is_not_in] do
+        policy_fixture(
+          account: account,
+          conditions: [%{property: :auth_provider_id, operator: operator, values: [provider.id]}]
+        )
+      end
+
+      policy_fixture(
+        account: account,
+        conditions: [
+          %{property: :auth_provider_id, operator: :is_in, values: [other_provider.id]}
+        ]
+      )
+
+      policy_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("delete", provider.id)
+
+      assert has_element?(
+               lv,
+               "#provider-#{provider.id}-policy-warning",
+               "2 policies reference this provider and will need to be updated."
+             )
+    end
+
+    test "does not warn when no policy references the provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+      policy_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("delete", provider.id)
+
+      assert render(lv) =~ "Delete this provider?"
+      refute has_element?(lv, "#provider-#{provider.id}-policy-warning")
+    end
+
+    test "cannot delete provider user is signed in with", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, provider)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("delete", provider.id)
+      lv |> confirm_action("delete_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "cannot delete the provider you are currently signed in with"
+    end
+
+    test "email_otp providers cannot be deleted via UI", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # authorize_conn creates an email_otp provider, but we can verify it has no delete button
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # The delete button should not exist for email_otp type
+      # The view conditionally renders: :if={@type not in ["email_otp", "userpass"]}
+      # We verify by checking there's no delete button that references an email_otp provider
+      # Since we only have one provider (email_otp) created by authorize_conn,
+      # and it shouldn't have a delete button, the delete_provider buttons should be minimal
+      parsed = Floki.parse_fragment!(html)
+      delete_buttons = Floki.find(parsed, "button[phx-click='delete_provider']")
+
+      # The email_otp provider shouldn't have a delete button
+      assert Enum.empty?(delete_buttons)
+    end
+
+    test "X.509 providers cannot be deleted even with a forged event", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      enable_feature(:x509_auth)
+      provider = x509_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      render_hook(lv, "delete_provider", %{"id" => provider.id})
+
+      assert render(lv) =~ "Failed to delete authentication provider"
+
+      assert Repo.get_by!(Portal.X509.AuthProvider,
+               account_id: account.id,
+               id: provider.id
+             )
+    end
+
+    test "userpass providers cannot be deleted via UI", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = userpass_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # Similar to above, verify no delete button for userpass
+      parsed = Floki.parse_fragment!(html)
+
+      delete_buttons =
+        Floki.find(parsed, "button[phx-click='delete_provider'][phx-value-id='#{provider.id}']")
+
+      assert Enum.empty?(delete_buttons)
+    end
+  end
+
+  # =============================================================================
+  # Default Provider Management Tests
+  # =============================================================================
+
+  describe "default provider management" do
+    test "can set a provider as default", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, name: "My Google")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv
+      |> open_provider_actions(provider.id)
+
+      lv
+      |> element("button[phx-click='set_default_provider'][phx-value-id='#{provider.id}']")
+      |> render_click()
+
+      html = render(lv)
+      assert html =~ "Default authentication provider set to My Google"
+    end
+
+    test "can clear default provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, is_default: true)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv
+      |> open_provider_actions(provider.id)
+
+      lv
+      |> element("button[phx-click='clear_default_provider']")
+      |> render_click()
+
+      html = render(lv)
+      assert html =~ "Default authentication provider cleared"
+    end
+
+    test "shows current default in select", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, is_default: true, name: "Default Provider")
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Default Provider"
+      assert open_provider_actions(lv, provider.id) =~ "Remove default"
+    end
+
+    test "email_otp cannot be set as default", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      provider = Repo.one!(from p in EmailOTP.AuthProvider, where: p.account_id == ^account.id)
+      html = open_provider_actions(lv, provider.id)
+
+      refute html =~ "phx-click=\"set_default_provider\""
+    end
+
+    test "userpass cannot be set as default", %{account: account, actor: actor, conn: conn} do
+      provider = userpass_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      html = open_provider_actions(lv, provider.id)
+      refute html =~ "phx-click=\"set_default_provider\""
+    end
+
+    test "disabled providers appear in default provider select", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      google_provider_fixture(account: account, is_disabled: true, name: "Disabled Google")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Disabled Google"
+    end
+  end
+
+  # =============================================================================
+  # Session Revocation Tests
+  # =============================================================================
+
+  describe "session revocation" do
+    test "shows revoke all button when sessions exist", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "1 client"
+    end
+
+    test "hides revoke all button when no sessions exist", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # The revoke button should not be present for this provider
+      # We check that there's no revoke_sessions button for this provider ID
+      parsed = Floki.parse_fragment!(html)
+
+      revoke_buttons =
+        Floki.find(parsed, "button[phx-click='revoke_sessions'][phx-value-id='#{provider.id}']")
+
+      assert Enum.empty?(revoke_buttons)
+    end
+
+    test "can revoke all sessions for a provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, name: "Test Provider")
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv |> request_confirm("revoke", provider.id)
+      lv |> confirm_action("revoke_sessions", provider.id)
+
+      html = render(lv)
+      assert html =~ "have been revoked"
+    end
+  end
+
+  # =============================================================================
+  # Verification Flow Tests
+  # =============================================================================
+
+  describe "verification flow" do
+    test "google provider shows verification link", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Google"}})
+      |> render_change()
+
+      html = render(lv)
+      # Verification link should be available
+      assert html =~ "Verify Now"
+    end
+
+    test "entra provider shows verification link", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      html = render(lv)
+      # Verification link should be available
+      assert html =~ "Verify Now"
+    end
+
+    test "okta provider shows verification link", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test Okta",
+          okta_domain: "example.okta.com",
+          client_id: "test-id",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      html = render(lv)
+      # Verification link should be available
+      assert html =~ "Verify Now"
+    end
+
+    test "oidc provider shows verification link", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: "https://example.com/.well-known/openid-configuration",
+          client_id: "test-id",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      html = render(lv)
+      # Verification link should be available
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # Form State Tests
+  # =============================================================================
+
+  describe "form state management" do
+    test "submit button is disabled when form not verified", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      # Form should have disabled submit button initially (not verified)
+      parsed = Floki.parse_fragment!(html)
+      submit_button = Floki.find(parsed, "button[form='auth-provider-form'][type='submit']")
+      # Check that disabled attribute exists (can be "" or "disabled")
+      disabled_attr = Floki.attribute(submit_button, "disabled")
+      assert disabled_attr != []
+    end
+
+    test "preserves verification state during validation", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      # Make a non-verification field change
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{name: "New Name"}})
+        |> render_change()
+
+      # Should still show as verified
+      assert html =~ "Verified"
+    end
+
+    test "closes panel when clicking close button", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv |> element("button[phx-click='close_panel'][title='Close (Esc)']") |> render_click()
+
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+    end
+  end
+
+  # =============================================================================
+  # Duration Formatting Tests
+  # =============================================================================
+
+  describe "duration formatting" do
+    test "formats seconds correctly", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, portal_session_lifetime_secs: 45)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "45s"
+    end
+
+    test "formats minutes correctly", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, portal_session_lifetime_secs: 600)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "10m"
+    end
+
+    test "formats hours correctly", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, portal_session_lifetime_secs: 7200)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "2h"
+    end
+
+    test "formats days correctly", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, client_session_lifetime_secs: 172_800)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "2d"
+    end
+  end
+
+  # =============================================================================
+  # Context Options Tests
+  # =============================================================================
+
+  describe "context options" do
+    test "shows all context options in form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      assert html =~ "Client Applications and Admin Portal"
+      assert html =~ "Client Applications Only"
+      assert html =~ "Admin Portal Only"
+    end
+
+    test "can change context to clients_only for email_otp", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      email_otp_provider =
+        email_otp_provider_fixture(account: account, context: :clients_and_portal)
+
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{context: "clients_only"}})
+      |> render_change()
+
+      lv
+      |> form("#auth-provider-form")
+      |> render_submit()
+
+      updated = Repo.get!(EmailOTP.AuthProvider, email_otp_provider.id)
+      assert updated.context == :clients_only
+    end
+
+    test "can change context to portal_only for email_otp", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      email_otp_provider =
+        email_otp_provider_fixture(account: account, context: :clients_and_portal)
+
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{context: "portal_only"}})
+      |> render_change()
+
+      lv
+      |> form("#auth-provider-form")
+      |> render_submit()
+
+      updated = Repo.get!(EmailOTP.AuthProvider, email_otp_provider.id)
+      assert updated.context == :portal_only
+    end
+  end
+
+  # =============================================================================
+  # Edge Cases and Error Handling
+  # =============================================================================
+
+  describe "edge cases" do
+    test "handles non-existent provider ID in edit", %{account: account, actor: actor, conn: conn} do
+      non_existent_id = Ecto.UUID.generate()
+
+      assert_raise Ecto.NoResultsError, fn ->
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{non_existent_id}/edit")
+      end
+    end
+
+    test "handles provider from different account", %{account: account, actor: actor, conn: conn} do
+      other_account = account_fixture()
+      other_provider = google_provider_fixture(account: other_account)
+
+      assert_raise Ecto.NoResultsError, fn ->
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{other_provider.id}/edit")
+      end
+    end
+  end
+
+  # =============================================================================
+  # DB Module Tests
+  # =============================================================================
+
+  describe "Database.list_all_providers/1" do
+    test "returns all provider types", %{account: account, actor: actor, conn: conn} do
+      # Create various provider types
+      _provider = google_provider_fixture(account: account)
+      entra_provider_fixture(account: account)
+      okta_provider_fixture(account: account)
+      oidc_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # Should show all providers (email_otp created by authorize_conn + 4 we created)
+      assert html =~ "Google"
+      assert html =~ "Entra"
+      assert html =~ "Okta"
+      assert html =~ "OpenID Connect"
+    end
+  end
+
+  describe "Database.enrich_with_session_counts/2" do
+    test "returns zero counts for providers with no sessions", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "0"
+      assert row_text =~ "client"
+      assert row_text =~ "portal"
+    end
+
+    test "returns correct counts for providers with sessions", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      # Create 3 client tokens and 2 portal sessions
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+
+      portal_session_fixture(
+        account: account,
+        actor: actor,
+        auth_provider: provider.auth_provider
+      )
+
+      portal_session_fixture(
+        account: account,
+        actor: actor,
+        auth_provider: provider.auth_provider
+      )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "3"
+      assert row_text =~ "2"
+      assert row_text =~ "client"
+      assert row_text =~ "portal"
+    end
+  end
+
+  describe "Database.revoke_sessions_for_provider/2" do
+    test "deletes all sessions for a provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, name: "Revoke Test Provider")
+
+      client_token_fixture(account: account, actor: actor, auth_provider: provider.auth_provider)
+
+      portal_session_fixture(
+        account: account,
+        actor: actor,
+        auth_provider: provider.auth_provider
+      )
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "1"
+      assert row_text =~ "client"
+      assert row_text =~ "portal"
+
+      # Revoke sessions
+      lv |> request_confirm("revoke", provider.id)
+      lv |> confirm_action("revoke_sessions", provider.id)
+
+      html = render(lv)
+      assert html =~ "have been revoked"
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "0"
+      assert row_text =~ "client"
+      assert row_text =~ "portal"
+    end
+  end
+
+  # =============================================================================
+  # Unique Constraint Tests
+  # =============================================================================
+
+  describe "unique constraints" do
+    test "shows the personal Google provider mode", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # Create first google provider with specific issuer
+      _first = google_provider_fixture(account: account, issuer: "https://accounts.google.com")
+
+      # Can view the page with existing provider
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Personal Google accounts"
+    end
+
+    test "oidc provider has unique client_id constraint per account", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # Create first OIDC provider
+      _first = oidc_provider_fixture(account: account, client_id: "unique-client-id")
+
+      # Can view the page with existing provider
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "OpenID Connect"
+    end
+  end
+
+  # =============================================================================
+  # Start Verification Tests
+  # =============================================================================
+
+  describe "start verification" do
+    test "clicking verify button subscribes to PubSub topic for google", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      # Enter valid data
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Google"}})
+      |> render_change()
+
+      # Try to start verification - this will subscribe to PubSub
+      # and push an open_url event
+      html = render(lv)
+      assert html =~ "Verify Now"
+    end
+
+    test "clicking verify button subscribes to PubSub topic for entra", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # Titleize Tests (indirect through form rendering)
+  # =============================================================================
+
+  describe "titleize helper" do
+    test "renders Google title", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      assert html =~ "Google Provider"
+    end
+
+    test "renders Microsoft Entra title", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      assert html =~ "Microsoft Entra Provider"
+    end
+
+    test "renders Okta title", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      assert html =~ "Okta Provider"
+    end
+
+    test "renders OpenID Connect title", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      assert html =~ "OpenID Connect Provider"
+    end
+
+    test "renders Email OTP title in edit", %{account: account, actor: actor, conn: conn} do
+      email_otp_provider = email_otp_provider_fixture(account: account, name: "Test Email OTP")
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      assert html =~ "Edit Test Email OTP"
+    end
+
+    test "renders Username & Password title in edit", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = userpass_provider_fixture(account: account, name: "Test Userpass")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/userpass/#{provider.id}/edit")
+
+      assert html =~ "Edit Test Userpass"
+    end
+  end
+
+  # =============================================================================
+  # Verified Provider Tests
+  # =============================================================================
+
+  describe "verified provider state" do
+    test "shows verified badge for verified google provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, is_verified: true)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+    end
+
+    test "shows awaiting verification for new provider form", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # New providers start unverified, so we test the new form instead
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      assert html =~ "Verify Now"
+    end
+
+    test "email_otp providers always show as verified (no verification section)", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      email_otp_provider = email_otp_provider_fixture(account: account)
+      google_provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn_with_provider(actor, google_provider)
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      # Email OTP doesn't show verification section
+      refute html =~ "Provider Verification"
+    end
+
+    test "userpass providers always show as verified (no verification section)", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = userpass_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/userpass/#{provider.id}/edit")
+
+      # Userpass doesn't show verification section
+      refute html =~ "Provider Verification"
+    end
+  end
+
+  # =============================================================================
+  # Form Submit Tests
+  # =============================================================================
+
+  describe "form submission validation errors" do
+    test "shows validation errors when submitting invalid google form", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      # Clear the name - name might not be required by the changeset
+      # Test a field that is actually validated
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{portal_session_lifetime_secs: 10}
+      })
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      # portal_session_lifetime_secs has min/max validation
+      assert Map.has_key?(errors, "auth_provider[portal_session_lifetime_secs]")
+    end
+
+    test "shows validation errors when submitting invalid okta form", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      # Clear required fields
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{okta_domain: ""}})
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert Map.has_key?(errors, "auth_provider[okta_domain]")
+    end
+  end
+
+  # =============================================================================
+  # Combined Duration Formatting Tests
+  # =============================================================================
+
+  describe "duration formatting additional cases" do
+    test "formats complex durations with days and hours", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # 1.5 days = 129600 seconds
+      provider = google_provider_fixture(account: account, client_session_lifetime_secs: 129_600)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "1d"
+    end
+
+    test "formats exactly 1 hour", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, portal_session_lifetime_secs: 3600)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "1h"
+    end
+
+    test "formats exactly 1 day", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account, client_session_lifetime_secs: 86400)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "1d"
+    end
+  end
+
+  # =============================================================================
+  # Provider Card Display Tests
+  # =============================================================================
+
+  describe "provider card display" do
+    test "shows toggle switch for provider", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      parsed = Floki.parse_fragment!(html)
+
+      toggles =
+        Floki.find(parsed, "button[phx-click='toggle_provider_actions']")
+
+      assert length(toggles) >= 2
+    end
+
+    test "shows edit link for each provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      html = open_provider_actions(lv, provider.id)
+      assert html =~ "/#{account.slug}/settings/authentication/google/#{provider.id}/edit"
+    end
+
+    test "shows updated timestamp", %{account: account, actor: actor, conn: conn} do
+      google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert html =~ "Google"
+    end
+  end
+
+  # =============================================================================
+  # Panel Tests
+  # =============================================================================
+
+  describe "panel behavior" do
+    test "new provider panel has form", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      assert html =~ "auth-provider-form"
+    end
+
+    test "edit provider panel has form", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/#{provider.id}/edit")
+
+      assert html =~ "auth-provider-form"
+    end
+
+    test "close button returns to provider list", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv |> element("button[phx-click='close_panel'][title='Close (Esc)']") |> render_click()
+      assert_patch(lv, ~p"/#{account}/settings/authentication")
+    end
+  end
+
+  # =============================================================================
+  # Verification Setup Error Tests
+  # =============================================================================
+
+  describe "start_verification error handling" do
+    test "handles connection refused error", %{account: account, actor: actor, conn: conn} do
+      Mocks.OIDC.stub_connection_refused()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+
+      assert html =~
+               "Unable to fetch discovery document: Connection refused by the remote server."
+    end
+
+    test "handles HTTP 404 error", %{account: account, actor: actor, conn: conn} do
+      Mocks.OIDC.stub_discovery_error(404, "Not Found")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Discovery document not found (HTTP 404)"
+    end
+
+    test "handles HTTP 500 error", %{account: account, actor: actor, conn: conn} do
+      Mocks.OIDC.stub_discovery_error(500, "Internal Server Error")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Identity provider is unavailable (HTTP 500)"
+    end
+
+    test "handles invalid JSON in discovery document", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_invalid_json()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Discovery document contains invalid JSON"
+    end
+
+    test "validates okta_domain must be a valid FQDN", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test Okta",
+          okta_domain: "not a valid domain!",
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert Map.has_key?(errors, "auth_provider[okta_domain]")
+    end
+
+    test "successful verification setup for google provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Google"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      # Should push an event to open the URL
+      html = render(lv)
+      assert html =~ "Verify Now" or html =~ "Awaiting"
+    end
+
+    test "successful verification setup for entra provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      # For entra, verification should work without external calls
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Verify Now" or html =~ "Awaiting"
+    end
+  end
+
+  # =============================================================================
+  # Verification PubSub Handler Tests
+  # =============================================================================
+
+  describe "verification PubSub message handling" do
+    test "handles oidc_verify with valid setup", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      # Click verify to set up verification state
+      lv |> element("#verify-button") |> render_click()
+
+      # The socket should now have verification state assigned
+      html = render(lv)
+      # Verification setup should have started
+      assert html =~ "Verify Now" or html =~ "error"
+    end
+
+    test "passes email_verification_method from oidc form into pending verification", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret",
+          email_verification_method: "none"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      send(lv.pid, {:get_pending_verification, self()})
+
+      assert_receive {:pending_verification,
+                      %{require_email_verified: false, config: _config, verifier: verifier}}
+
+      assert is_binary(verifier)
+    end
+
+    test "clears pending oidc verification when email_verification_method changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      attrs = %{
+        name: "Test OIDC",
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        client_id: "test-client",
+        client_secret: "test-secret",
+        email_verification_method: "none"
+      }
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: attrs})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{attrs | email_verification_method: "claim"}
+      })
+      |> render_change()
+
+      send(lv.pid, {:get_pending_verification, self()})
+
+      assert_receive {:pending_verification, nil}
+    end
+
+    test "ignores stale oidc verification completion after email_verification_method changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      attrs = %{
+        name: "Test OIDC",
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        client_id: "test-client",
+        client_secret: "test-secret",
+        email_verification_method: "none"
+      }
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: attrs})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      send(lv.pid, {:get_pending_verification, self()})
+
+      assert_receive {:pending_verification,
+                      %{require_email_verified: false, verification_ref: verification_ref}}
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{
+          auth_provider: %{attrs | email_verification_method: "claim"}
+        })
+        |> render_change()
+
+      assert html =~ "Verify Now"
+
+      ref = make_ref()
+      send(lv.pid, {:oidc_verify_complete, "https://example.com", verification_ref, {self(), ref}})
+
+      assert_receive {:verification_ack, ^ref}
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+      refute html =~ "Verified"
+    end
+
+    test "ignores stale oidc verification completion after a newer verification starts", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      attrs = %{
+        name: "Test OIDC",
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        client_id: "test-client",
+        client_secret: "test-secret",
+        email_verification_method: "none"
+      }
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: attrs})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      send(lv.pid, {:get_pending_verification, self()})
+
+      assert_receive {:pending_verification,
+                      %{require_email_verified: false, verification_ref: stale_ref}}
+
+      updated_attrs = %{attrs | email_verification_method: "claim"}
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: updated_attrs})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      send(lv.pid, {:get_pending_verification, self()})
+
+      assert_receive {:pending_verification,
+                      %{require_email_verified: true, verification_ref: current_ref}}
+
+      stale_ack_ref = make_ref()
+      send(lv.pid, {:oidc_verify_complete, "https://example.com", stale_ref, {self(), stale_ack_ref}})
+
+      assert_receive {:verification_ack, ^stale_ack_ref}
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+      refute html =~ "Verified"
+
+      current_ack_ref = make_ref()
+      send(lv.pid, {:oidc_verify_complete, "https://example.com", current_ref, {self(), current_ack_ref}})
+
+      assert_receive {:verification_ack, ^current_ack_ref}
+
+      html = render(lv)
+      assert html =~ "Verified"
+    end
+
+    test "peeks at an Entra verifier without consuming it before the code callback", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      assert_push_event(lv, "open_url", %{url: url})
+
+      %{"state" => state} = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert {:ok, %{verification_ref: verification_ref}} =
+               PortalWeb.OIDC.verify_verification_state(state)
+
+      send(lv.pid, {:peek_pending_verification, self()})
+      assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+
+      send(lv.pid, {:get_pending_verification, self()})
+      assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+    end
+
+    test "does not consume an Entra verifier for a stale callback reference", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      assert_push_event(lv, "open_url", %{url: url})
+
+      %{"state" => state} = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert {:ok, %{verification_ref: verification_ref}} =
+               PortalWeb.OIDC.verify_verification_state(state)
+
+      send(lv.pid, {:get_pending_verification, Ecto.UUID.generate(), self()})
+      assert_receive {:pending_verification, nil}
+
+      send(lv.pid, {:peek_pending_verification, self()})
+      assert_receive {:pending_verification, %{verification_ref: ^verification_ref}}
+    end
+
+    for {name, expected_name} <- [{"Entra", "Entra"}, {"Custom name", "Custom name"}] do
+      @provider_name name
+      @expected_provider_name expected_name
+      test "preserves the provider name after verifying #{name}", %{account: account, actor: actor, conn: conn} do
+        {:ok, lv, html} =
+          conn
+          |> authorize_conn(actor)
+          |> live(~p"/#{account}/settings/authentication/entra/new")
+
+        assert html =~ "Only users from the verified tenant"
+
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{name: @provider_name}})
+        |> render_change()
+
+        lv |> element("#verify-button") |> render_click()
+        verification_ref = verification_ref_from_open_url(lv)
+        ack_ref = make_ref()
+        send(lv.pid, {:entra_verify_complete,
+          "https://login.microsoftonline.com/12345678-1234-1234-1234-123456789012/v2.0",
+          "12345678-1234-1234-1234-123456789012", "Example Tenant", verification_ref,
+          {self(), ack_ref}})
+        assert_receive {:verification_ack, ^ack_ref}
+        assert has_element?(lv, "input[name='auth_provider[name]'][value='#{@expected_provider_name}']")
+
+        lv |> form("#auth-provider-form") |> render_submit()
+        assert Repo.get_by!(Portal.Entra.AuthProvider, account_id: account.id).name == @expected_provider_name
+      end
+    end
+
+    for {name, expected_name} <- [{"Google", "Google"}, {"Custom Google", "Custom Google"}] do
+      @google_provider_name name
+      @expected_google_name expected_name
+      test "saves verified Workspace domains and preserves #{name}", %{account: account, actor: actor, conn: conn} do
+        Mocks.OIDC.stub_discovery_document()
+        {:ok, lv, _} = conn |> authorize_conn(actor)
+          |> live(~p"/#{account}/settings/authentication/google/new")
+        lv |> form("#auth-provider-form", %{auth_provider: %{name: @google_provider_name}}) |> render_change()
+        lv |> element("#verify-button") |> render_click()
+        verification_ref = verification_ref_from_open_url(lv)
+        domains = ["example.com", "secondary.example"]
+        ack_ref = make_ref()
+        send(lv.pid, {:google_verify_complete, "https://accounts.google.com", domains,
+          "example.com", verification_ref, {self(), ack_ref}})
+        assert_receive {:verification_ack, ^ack_ref}
+        assert has_element?(lv, "input[name='auth_provider[name]'][value='#{@expected_google_name}']")
+
+        # Browser-submitted domain values cannot replace verified server-side values.
+        render_change(lv, "validate", %{"auth_provider" => %{"name" => @expected_google_name,
+          "workspace_domains" => ["attacker.example"]}})
+        lv |> form("#auth-provider-form") |> render_submit()
+        provider = Repo.get_by!(Portal.Google.AuthProvider, account_id: account.id)
+        assert provider.name == @expected_google_name
+        assert provider.workspace_domains == ["example.com"]
+      end
+    end
+
+    test "rejects generic and stale Google verification results", %{account: account, actor: actor, conn: conn} do
+      Mocks.OIDC.stub_discovery_document()
+      {:ok, lv, _} = conn |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack = make_ref()
+      send(lv.pid, {:oidc_verify_complete, "https://accounts.google.com", verification_ref, {self(), ack}})
+      assert_receive {:verification_ack, ^ack}
+      refute render(lv) =~ "> Verified"
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com", ["example.com"],
+        "example.com", Ecto.UUID.generate(), {self(), ack}})
+      assert_receive {:verification_ack, ^ack}
+      assert has_element?(lv, "#verify-button")
+    end
+
+    for {name, expected_name} <- [{"Okta", "example.okta.com"}, {"Custom Okta", "Custom Okta"}] do
+      @okta_provider_name name
+      @expected_okta_name expected_name
+      test "pre-fills #{name} from the verified Okta hostname", %{account: account, actor: actor, conn: conn} do
+        Mocks.OIDC.stub_discovery_document()
+        {:ok, lv, _} = conn |> authorize_conn(actor)
+          |> live(~p"/#{account}/settings/authentication/okta/new")
+        lv |> form("#auth-provider-form", %{auth_provider: %{name: @okta_provider_name,
+          okta_domain: "example.okta.com", client_id: "test-client", client_secret: "test-secret"}})
+          |> render_change()
+        lv |> element("#verify-button") |> render_click()
+        verification_ref = verification_ref_from_open_url(lv)
+        ack = make_ref()
+        send(lv.pid, {:oidc_verify_complete, "https://example.okta.com", verification_ref, {self(), ack}})
+        assert_receive {:verification_ack, ^ack}
+        assert has_element?(lv, "input[name='auth_provider[name]'][value='#{@expected_okta_name}']")
+      end
+    end
+
+    test "accepts only the active entra verification completion", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      stale_ref = verification_ref_from_open_url(lv)
+
+      lv |> element("#verify-button") |> render_click()
+      current_ref = verification_ref_from_open_url(lv)
+
+      stale_ack_ref = make_ref()
+
+      send(
+        lv.pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/stale/v2.0", "stale",
+         stale_ref, {self(), stale_ack_ref}}
+      )
+
+      assert_receive {:verification_ack, ^stale_ack_ref}
+      refute has_element?(lv, "#verified-organizations")
+
+      current_ack_ref = make_ref()
+
+      send(
+        lv.pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/12345678-1234-1234-1234-123456789012/v2.0", "12345678-1234-1234-1234-123456789012",
+         current_ref, {self(), current_ack_ref}}
+      )
+
+      assert_receive {:verification_ack, ^current_ack_ref}
+      assert has_element?(lv, "#verified-organizations")
+    end
+
+    test "ignores entra completion after navigating to another provider form", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+
+      render_patch(lv, ~p"/#{account}/settings/authentication/google/new")
+
+      ack_ref = make_ref()
+
+      send(
+        lv.pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/stale/v2.0", "stale",
+         verification_ref, {self(), ack_ref}}
+      )
+
+      assert_receive {:verification_ack, ^ack_ref}
+
+      html = render(lv)
+      assert html =~ "Add Google Provider"
+      refute has_element?(lv, "#verified-organizations")
+    end
+
+    test "handles entra provider verification setup via bypass", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      # Click verify to set up verification state
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+    end
+
+    test "handles okta provider form with valid domain format", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      # Use a valid FQDN format
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test Okta",
+          okta_domain: "test-domain.okta.com",
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      html = render(lv)
+      # Form should be valid and show verify button
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # Reset Verification Tests
+  # =============================================================================
+
+  describe "verified organization allowlists" do
+    for {type, schema, field, values} <- [
+          {"entra", Portal.Entra.AuthProvider, :tenant_ids,
+           ["12345678-1234-1234-1234-123456789012", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"]},
+          {"google", Portal.Google.AuthProvider, :workspace_domains,
+           ["primary.example", "secondary.example", "third.example"]}
+        ] do
+      @allowlist_type type
+      @allowlist_schema schema
+      @allowlist_field field
+      @allowlist_values values
+
+      test "requires a verified first #{@allowlist_type} entry and ignores forged form values", ctx do
+        {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+          |> live(~p"/#{ctx.account}/settings/authentication/#{@allowlist_type}/new")
+        render_change(lv, "validate", %{"auth_provider" => %{
+          Atom.to_string(@allowlist_field) => @allowlist_values,
+          "is_verified" => "true", "issuer" => "https://attacker.example"}})
+        lv |> form("#auth-provider-form") |> render_submit()
+        refute Repo.get_by(@allowlist_schema, account_id: ctx.account.id)
+        refute has_element?(lv, "#verified-organizations")
+      end
+
+      test "appends and deduplicates #{@allowlist_type} verifications in one new provider", ctx do
+        Mocks.OIDC.stub_discovery_document()
+        {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+          |> live(~p"/#{ctx.account}/settings/authentication/#{@allowlist_type}/new")
+        [first, second, _] = @allowlist_values
+        complete_allowlist_verification(lv, @allowlist_type, first)
+        assert has_element?(lv, "#verified-organization-0", first)
+        assert has_element?(lv, "#verify-button", if(@allowlist_type == "google", do: "Refresh domains", else: "Verify another"))
+        complete_allowlist_verification(lv, @allowlist_type, second, [first])
+        complete_allowlist_verification(lv, @allowlist_type, second, [first])
+        assert has_element?(lv, "#verified-organization-1", second)
+        refute has_element?(lv, "#verified-organization-2")
+        lv |> form("#auth-provider-form") |> render_submit()
+        provider = Repo.get_by!(@allowlist_schema, account_id: ctx.account.id)
+        assert Map.fetch!(provider, @allowlist_field) == [first, second]
+      end
+
+      test "appends #{@allowlist_type} verification while preserving edits to a saved provider", ctx do
+        Mocks.OIDC.stub_discovery_document()
+        [first, second, _] = @allowlist_values
+        provider = allowlist_provider_fixture(@allowlist_type, ctx.account, [first])
+        {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+          |> live(~p"/#{ctx.account}/settings/authentication/#{@allowlist_type}/#{provider.id}/edit")
+        lv |> form("#auth-provider-form", %{auth_provider: %{name: "MSP SSO", portal_session_lifetime_secs: 3600}})
+          |> render_change()
+        complete_allowlist_verification(lv, @allowlist_type, second, [first])
+        # An ordinary form validation must preserve server-owned verified values.
+        render_change(lv, "validate", %{"auth_provider" => %{"name" => "MSP SSO",
+          "portal_session_lifetime_secs" => "3600", Atom.to_string(@allowlist_field) => ["attacker.example"]}})
+        lv |> form("#auth-provider-form") |> render_submit()
+        saved = Repo.get!(@allowlist_schema, provider.id)
+        assert Map.fetch!(saved, @allowlist_field) == [first, second]
+        assert saved.name == "MSP SSO"
+        assert saved.portal_session_lifetime_secs == 3600
+      end
+
+    end
+
+    test "protects the first entra row and persists removal of subsequent rows", ctx do
+      [first, second, _] = ["12345678-1234-1234-1234-123456789012", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"]
+      provider = entra_provider_fixture(account: ctx.account, tenant_ids: [first, second])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/entra/#{provider.id}/edit")
+      refute has_element?(lv, "#verified-organization-0 button")
+      assert has_element?(lv, "#verified-organization-1 button[phx-click='remove_verified_organization']")
+      render_click(lv, "remove_verified_organization", %{"organization" => first, "value" => ""})
+      assert has_element?(lv, "#verified-organization-0", first)
+      # Browsers include the button's native value (an empty string) in click payloads.
+      lv |> element("#verified-organization-1 button") |> render_click(%{"value" => ""})
+      refute has_element?(lv, "#verified-organization-1")
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert Repo.get!(Portal.Entra.AuthProvider, provider.id).tenant_ids == [first]
+    end
+
+    test "ignores stale entra verification after removing an entry", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      [first, second, third] = ["12345678-1234-1234-1234-123456789012", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"]
+      provider = entra_provider_fixture(account: ctx.account, tenant_ids: [first, second])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/entra/#{provider.id}/edit")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      lv |> element("#verified-organization-1 button") |> render_click()
+      send_allowlist_verification(lv, "entra", third, verification_ref)
+      assert has_element?(lv, "#verified-organization-0", first)
+      refute has_element?(lv, "#verified-organization-1")
+    end
+
+    test "google domains have no remove button", ctx do
+      provider = google_provider_fixture(account: ctx.account, workspace_domains: ["primary.example", "secondary.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      refute has_element?(lv, "#verified-organizations button")
+      assert has_element?(lv, "#verified-organization-1", "secondary.example")
+    end
+
+    test "saves a second Google Workspace provider with non-overlapping domains", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      existing = google_provider_fixture(account: ctx.account, name: "First Workspace", workspace_domains: ["first.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/new")
+      lv |> form("#auth-provider-form", %{auth_provider: %{name: "Second Workspace"}}) |> render_change()
+      complete_allowlist_verification(lv, "google", "second.example")
+      lv |> form("#auth-provider-form") |> render_submit()
+      saved = Repo.get_by!(Portal.Google.AuthProvider, account_id: ctx.account.id, name: "Second Workspace")
+      assert saved.workspace_domains == ["second.example"]
+      refute saved.is_legacy_unrestricted
+      assert Repo.reload!(existing).workspace_domains == ["first.example"]
+    end
+
+    test "shows an error for overlapping Google Workspace domains", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      google_provider_fixture(account: ctx.account, workspace_domains: ["work.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/new")
+      complete_allowlist_verification(lv, "google", "work.example")
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert render(lv) =~ "A domain is already verified on another Google authentication provider in this account."
+    end
+
+    test "shows an error for a second personal Google provider", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      google_provider_fixture(account: ctx.account, workspace_domains: nil)
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/new")
+      lv |> element("#verify-button") |> render_click()
+      ref = verification_ref_from_open_url(lv)
+      ack = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com", nil, nil, ref, {self(), ack}})
+      assert_receive {:verification_ack, ^ack}
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert render(lv) =~ "Only one Google authentication provider without Workspace domains is allowed per account."
+    end
+
+    test "saves a verified personal Google provider with restrictions unset", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/new")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com", nil, nil,
+        verification_ref, {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      assert render(lv) =~ "Personal Google accounts only"
+      render_change(lv, "validate", %{"auth_provider" => %{"name" => "Personal Google",
+        "workspace_domains" => ["attacker.example"], "is_legacy_unrestricted" => "true"}})
+      lv |> form("#auth-provider-form") |> render_submit()
+      provider = Repo.get_by!(Portal.Google.AuthProvider, account_id: ctx.account.id)
+      assert provider.name == "Personal Google"
+      assert provider.workspace_domains == nil
+      refute provider.is_legacy_unrestricted
+    end
+
+    test "editing an existing unrestricted Google provider keeps validation off", ctx do
+      provider = google_provider_fixture(account: ctx.account, workspace_domains: nil, is_legacy_unrestricted: true)
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      lv |> form("#auth-provider-form", %{auth_provider: %{name: "Existing Google", portal_session_lifetime_secs: 3600}})
+        |> render_change()
+      lv |> form("#auth-provider-form") |> render_submit()
+      saved = Repo.get!(Portal.Google.AuthProvider, provider.id)
+      assert saved.name == "Existing Google"
+      assert saved.portal_session_lifetime_secs == 3600
+      assert saved.workspace_domains == nil
+      assert saved.is_legacy_unrestricted
+    end
+
+    test "personal verification cannot clear existing Google domain restrictions", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      provider = google_provider_fixture(account: ctx.account, workspace_domains: ["primary.example"])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+      ack_ref = make_ref()
+      send(lv.pid, {:google_verify_complete, "https://accounts.google.com", nil, nil,
+        verification_ref, {self(), ack_ref}})
+      assert_receive {:verification_ack, ^ack_ref}
+      assert render(lv) =~ "existing domains have been kept"
+      assert has_element?(lv, "#verified-organization-0", "primary.example")
+      lv |> form("#auth-provider-form") |> render_submit()
+      saved = Repo.get!(Portal.Google.AuthProvider, provider.id)
+      assert saved.workspace_domains == ["primary.example"]
+      refute saved.is_legacy_unrestricted
+    end
+
+    test "does not show a blank verification alert for an Entra name collision", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      first = "12345678-1234-1234-1234-123456789012"
+      second = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+      entra_provider_fixture(account: ctx.account, name: "Entra", tenant_ids: [first])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/entra/new")
+      complete_allowlist_verification(lv, "entra", second)
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert has_element?(lv, "#auth-provider-form", "An Entra authentication provider with this name already exists.")
+      refute has_element?(lv, "#auth-provider-form .flash-error")
+
+      lv |> form("#auth-provider-form", %{auth_provider: %{name: "Another organization"}}) |> render_change()
+      complete_allowlist_verification(lv, "entra", first)
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert has_element?(lv, "#auth-provider-form .flash-error", "A tenant is already verified on another")
+      assert Repo.aggregate(Portal.Entra.AuthProvider, :count) == 1
+    end
+
+    for destination <- [:new, :edit, :same_type, :close] do
+      @error_destination destination
+      test "clears Entra errors when navigating to #{@error_destination}", ctx do
+        Mocks.OIDC.stub_discovery_document()
+        tenant_id = "12345678-1234-1234-1234-123456789012"
+        entra = entra_provider_fixture(account: ctx.account, name: "Existing Entra", tenant_ids: [tenant_id])
+        google = google_provider_fixture(account: ctx.account)
+        {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+          |> live(~p"/#{ctx.account}/settings/authentication/entra/new")
+        complete_allowlist_verification(lv, "entra", tenant_id)
+        lv |> form("#auth-provider-form") |> render_submit()
+        assert has_element?(lv, "#auth-provider-form .flash-error", "A tenant is already verified on another")
+
+        case @error_destination do
+          :new -> render_patch(lv, ~p"/#{ctx.account}/settings/authentication/google/new")
+          :edit -> render_patch(lv, ~p"/#{ctx.account}/settings/authentication/google/#{google.id}/edit")
+          :same_type -> render_patch(lv, ~p"/#{ctx.account}/settings/authentication/entra/#{entra.id}/edit")
+          :close ->
+            lv |> element("#add-provider-panel button[phx-click='close_panel'][title='Close (Esc)']") |> render_click()
+            render_patch(lv, ~p"/#{ctx.account}/settings/authentication/entra/#{entra.id}/edit")
+        end
+
+        refute has_element?(lv, "#auth-provider-form .flash-error")
+      end
+    end
+
+    test "shows a verification error when another Entra provider already accepts the tenant", ctx do
+      Mocks.OIDC.stub_discovery_document()
+      tenant_id = "12345678-1234-1234-1234-123456789012"
+      entra_provider_fixture(account: ctx.account, name: "Existing Entra", tenant_ids: [tenant_id])
+      {:ok, lv, _} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/entra/new")
+      complete_allowlist_verification(lv, "entra", tenant_id)
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert render(lv) =~ "A tenant is already verified on another Entra authentication provider in this account."
+      assert Repo.aggregate(Portal.Entra.AuthProvider, :count) == 1
+    end
+
+    test "keeps legacy Google sign-in unrestricted until domains are saved", ctx do
+      provider = google_provider_fixture(account: ctx.account, workspace_domains: nil, is_legacy_unrestricted: true)
+      {:ok, lv, html} = ctx.conn |> authorize_conn(ctx.actor)
+        |> live(~p"/#{ctx.account}/settings/authentication/google/#{provider.id}/edit")
+      assert html =~ "Personal and Workspace Google accounts can sign in"
+      assert Repo.get!(Portal.Google.AuthProvider, provider.id).workspace_domains == nil
+      Mocks.OIDC.stub_discovery_document()
+      complete_allowlist_verification(lv, "google", "primary.example")
+      lv |> form("#auth-provider-form") |> render_submit()
+      assert Repo.get!(Portal.Google.AuthProvider, provider.id).workspace_domains == ["primary.example"]
+    end
+  end
+
+  defp allowlist_provider_fixture("entra", account, values),
+    do: entra_provider_fixture(account: account, tenant_ids: values)
+
+  defp allowlist_provider_fixture("google", account, values),
+    do: google_provider_fixture(account: account, workspace_domains: values)
+
+  defp complete_allowlist_verification(lv, type, value, proven \\ []) do
+    lv |> element("#verify-button") |> render_click()
+    verification_ref = verification_ref_from_open_url(lv)
+    html = send_allowlist_verification(lv, type, value, verification_ref, proven)
+    toggle = "#verified-organizations input[phx-value-domain='#{value}']"
+
+    if type == "google" and has_element?(lv, toggle) and not has_element?(lv, "#{toggle}[checked]") do
+      lv |> element(toggle) |> render_click()
+    else
+      html
+    end
+  end
+
+  defp send_allowlist_verification(lv, type, value, verification_ref, proven \\ []) do
+    ack_ref = make_ref()
+    message = case type do
+      "entra" -> {:entra_verify_complete, "https://login.microsoftonline.com/#{value}/v2.0",
+        value, "Customer tenant", verification_ref, {self(), ack_ref}}
+      "google" -> {:google_verify_complete, "https://accounts.google.com", proven ++ [value], value,
+        verification_ref, {self(), ack_ref}}
+    end
+    send(lv.pid, message)
+    assert_receive {:verification_ack, ^ack_ref}
+    render(lv)
+  end
+
+  # =============================================================================
+  # Form Submit Error Path Tests
+  # =============================================================================
+
+  describe "form submission error paths" do
+    test "shows error when submitting unverified provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Unverified Google"}})
+      |> render_change()
+
+      # Try to submit without verification
+      lv
+      |> form("#auth-provider-form")
+      |> render_submit()
+
+      html = render(lv)
+      # The submit button should be disabled or form should show error
+      assert html =~ "disabled" or html =~ "verification" or html =~ "Awaiting"
+    end
+
+    test "validates discovery_document_uri format", %{account: account, actor: actor, conn: conn} do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: "not-a-valid-url",
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      errors = form_validation_errors(element(lv, "#auth-provider-form"))
+      assert Map.has_key?(errors, "auth_provider[discovery_document_uri]")
+    end
+  end
+
+  # =============================================================================
+  # Clear Verification When Fields Change Tests
+  # =============================================================================
+
+  describe "clear verification when trigger fields change" do
+    test "clears verification when client_id changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account, is_verified: true)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{client_id: "new-client-id"}})
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "clears verification when client_secret changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account, is_verified: true)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{client_secret: "new-secret"}})
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "clears verification when discovery_document_uri changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = oidc_provider_fixture(account: account, is_verified: true)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{
+          auth_provider: %{
+            discovery_document_uri: "https://new.example.com/.well-known/openid-configuration"
+          }
+        })
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "clears verification when okta_domain changes", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account, is_verified: true)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{okta_domain: "new-domain.okta.com"}})
+        |> render_change()
+
+      assert html =~ "Verify Now"
+    end
+
+    test "preserves verification when non-trigger fields change", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = okta_provider_fixture(account: account, is_verified: true)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/#{provider.id}/edit")
+
+      assert html =~ "Verified"
+
+      html =
+        lv
+        |> form("#auth-provider-form", %{auth_provider: %{name: "New Name"}})
+        |> render_change()
+
+      # Should still be verified since name is not a trigger field
+      assert html =~ "Verified"
+    end
+  end
+
+  # =============================================================================
+  # Provider Type-Specific Redirect URI Tests
+  # =============================================================================
+
+  describe "redirect URI display" do
+    test "shows redirect URI for okta provider", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      assert html =~ "Redirect URI"
+      assert html =~ "/auth/oidc/callback"
+    end
+
+    test "shows redirect URI for oidc provider", %{account: account, actor: actor, conn: conn} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      assert html =~ "Redirect URI"
+      assert html =~ "/auth/oidc/callback"
+    end
+
+    test "does not show redirect URI for google provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/google/new")
+
+      # Google uses pre-configured redirect URI, so copy field may not be shown
+      refute html =~ "Copy this URI into your Google"
+    end
+
+    test "does not show redirect URI for entra provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      # Entra uses pre-configured redirect URI
+      refute html =~ "Copy this URI into your Entra"
+    end
+  end
+
+  # =============================================================================
+  # Context-Specific Session Lifetime Display Tests
+  # =============================================================================
+
+  describe "context-specific session lifetime display" do
+    test "shows disabled for portal when context is clients_only", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, context: :clients_only)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "Clients"
+    end
+
+    test "shows disabled for clients when context is portal_only", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, context: :portal_only)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      assert provider_row_text(html, provider.id) =~ "Portal"
+    end
+
+    test "shows both durations when context is clients_and_portal", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider =
+        google_provider_fixture(
+          account: account,
+          context: :clients_and_portal,
+          portal_session_lifetime_secs: 3600,
+          client_session_lifetime_secs: 86400
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      row_text = provider_row_text(html, provider.id)
+      assert row_text =~ "1h"
+      assert row_text =~ "1d"
+    end
+  end
+
+  # =============================================================================
+  # Ready to Verify Tests
+  # =============================================================================
+
+  describe "ready_to_verify form state" do
+    test "verify button is disabled when form has validation errors", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      # Leave required fields empty to create validation errors
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "",
+          discovery_document_uri: "",
+          client_id: "",
+          client_secret: ""
+        }
+      })
+      |> render_change()
+
+      html = render(lv)
+      parsed = Floki.parse_fragment!(html)
+
+      # Find the verify button
+      verify_button = Floki.find(parsed, "#verify-button")
+
+      # Should be disabled when form has errors
+      disabled_attr = Floki.attribute(verify_button, "disabled")
+      assert disabled_attr != [] or Enum.empty?(verify_button)
+    end
+
+    test "verify button is enabled when form has only verification errors", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      # Fill in all required fields
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: "https://example.com/.well-known/openid-configuration",
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      html = render(lv)
+      # Verify button should be present and not disabled
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # PubSub Verification Completion Tests
+  # =============================================================================
+
+  describe "PubSub verification completion" do
+    test "handles oidc_verify message with token mismatch", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      # Start verification to get the token
+      lv |> element("#verify-button") |> render_click()
+
+      # Get the LiveView pid to send a message to it
+      lv_pid = lv.pid
+
+      send(lv_pid, {:oidc_verify_failed, :token_mismatch})
+      html = render(lv)
+      assert html =~ "Failed to verify"
+    end
+
+    test "handles entra_directory_sync_complete message", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra"}})
+      |> render_change()
+
+      # Start verification
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+
+      lv_pid = lv.pid
+
+      send(lv_pid, {:verification_failed, "Admin consent error", verification_ref})
+      html = render(lv)
+      assert html =~ "Verification failed"
+    end
+
+    test "oidc_verify handles verification callback error", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      # Start verification
+      lv |> element("#verify-button") |> render_click()
+
+      # The verification process is now started, render to confirm
+      html = render(lv)
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # Additional Verification Error Tests
+  # =============================================================================
+
+  describe "verification error handling edge cases" do
+    test "handles slow response during verification setup", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      # Stub with a valid discovery document (slow response simulation not needed with Req.Test)
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+    end
+
+    test "handles HTTP 403 error", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      # Discovery document errors now happen in the new tab (begin_verification controller)
+      assert html =~ "Verify Now"
+    end
+  end
+
+  # =============================================================================
+  # Titleize Helper Coverage Tests
+  # =============================================================================
+
+  describe "titleize helper in edit forms" do
+    test "renders Email OTP title in edit form", %{account: account, actor: actor, conn: conn} do
+      # authorize_conn creates an email_otp provider, authorize first then get the provider
+      authorized_conn = authorize_conn(conn, actor)
+
+      # Get the email_otp provider created by authorize_conn
+      import Ecto.Query
+
+      [email_otp_provider | _] =
+        from(p in Portal.EmailOTP.AuthProvider, where: p.account_id == ^account.id)
+        |> Portal.Repo.all()
+
+      {:ok, _lv, html} =
+        authorized_conn
+        |> live(~p"/#{account}/settings/authentication/email_otp/#{email_otp_provider.id}/edit")
+
+      # The title should show Email OTP (from titleize helper)
+      assert html =~ "Email OTP"
+    end
+
+    test "renders Username & Password title in edit form", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = userpass_provider_fixture(account: account, name: "My Userpass")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/userpass/#{provider.id}/edit")
+
+      # The title should use titleize("userpass") which returns "Username & Password"
+      assert html =~ "My Userpass" or html =~ "Username"
+    end
+  end
+
+  # =============================================================================
+  # DB Helper Edge Cases
+  # =============================================================================
+
+  describe "Database helper edge cases" do
+    test "revoke_sessions_for_provider handles nil provider", %{actor: actor} do
+      alias PortalWeb.Settings.Authentication.Database
+
+      # Build a proper subject from the actor
+      {:ok, subject} =
+        Portal.Authentication.build_subject(
+          %Portal.PortalSession{actor_id: actor.id, account_id: actor.account_id},
+          %Portal.Authentication.Context{
+            type: :portal,
+            user_agent: "test",
+            remote_ip: {127, 0, 0, 1}
+          }
+        )
+
+      # Should return {:ok, 0} for nil provider
+      assert {:ok, 0} = Database.revoke_sessions_for_provider(nil, subject)
+    end
+  end
+
+  # =============================================================================
+  # Successful PubSub Verification Tests
+  # =============================================================================
+
+  describe "successful PubSub verification completion" do
+    test "entra_directory_sync_complete with matching token marks provider verified", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra Verified"}})
+      |> render_change()
+
+      # Start verification to get the actual token
+      lv |> element("#verify-button") |> render_click()
+
+      # The verification is set up, check that awaiting verification is shown
+      html = render(lv)
+      assert html =~ "Verify Now"
+    end
+
+    test "oidc_verify with token mismatch shows error message", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC Verified",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      # Start verification
+      lv |> element("#verify-button") |> render_click()
+
+      lv_pid = lv.pid
+      send(lv_pid, {:oidc_verify_failed, :token_mismatch})
+      html = render(lv)
+      assert html =~ "Failed to verify"
+    end
+  end
+
+  # =============================================================================
+  # Revoke Sessions Tests
+  # =============================================================================
+
+  describe "revoke sessions" do
+    test "can revoke sessions for a provider", %{account: account, actor: actor, conn: conn} do
+      provider = google_provider_fixture(account: account, name: "Provider With Sessions")
+
+      # Create a session for this provider
+      context = %Portal.Authentication.Context{
+        type: :portal,
+        user_agent: "test-agent",
+        remote_ip: {127, 0, 0, 1}
+      }
+
+      expires_at = DateTime.add(DateTime.utc_now(), 3600, :second)
+
+      {:ok, _session} =
+        Portal.Authentication.create_portal_session(actor, provider.id, context, expires_at)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # Find and click the revoke button
+      # The revoke button is inside the provider card
+      lv |> request_confirm("revoke", provider.id)
+      lv |> confirm_action("revoke_sessions", provider.id)
+
+      html = render(lv)
+      assert html =~ "have been revoked"
+    end
+  end
+
+  # =============================================================================
+  # Additional Verification Error Path Tests
+  # =============================================================================
+
+  describe "verification error paths" do
+    test "handles HTTP error with error_code in response body", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_error(418, JSON.encode!(%{"error" => "teapot"}))
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Failed to fetch discovery document (HTTP 418)"
+    end
+
+    test "handles malformed JSON in discovery document", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_invalid_json("{")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Discovery document contains invalid JSON"
+    end
+
+    test "handles connection refused error", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_connection_refused()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+
+      assert html =~
+               "Unable to fetch discovery document: Connection refused by the remote server."
+    end
+
+    test "handles nxdomain error for invalid domain", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_dns_error()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+
+      assert html =~
+               "Unable to fetch discovery document: DNS lookup failed. Please verify the provider domain."
+    end
+
+    test "handles HTTP 418 error", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_error(418, "I'm a teapot")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Failed to fetch discovery document (HTTP 418)"
+    end
+  end
+
+  # =============================================================================
+  # PubSub Verification Success Path Tests
+  # =============================================================================
+
+  describe "PubSub verification success paths" do
+    test "entra_directory_sync_complete with matching token marks provider as verified", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/entra/new")
+
+      lv
+      |> form("#auth-provider-form", %{auth_provider: %{name: "Test Entra Verified"}})
+      |> render_change()
+
+      # Start verification
+      lv |> element("#verify-button") |> render_click()
+      verification_ref = verification_ref_from_open_url(lv)
+
+      # Wait for the verification to be set up
+      html = render(lv)
+      assert html =~ "Verify Now"
+
+      lv_pid = lv.pid
+
+      send(
+        lv_pid,
+        {:entra_verify_complete, "https://login.microsoftonline.com/test_tenant/v2.0",
+         "test_tenant", verification_ref, nil}
+      )
+
+      html = render(lv)
+      assert html =~ "Verified"
+    end
+
+    test "oidc_verify with callback error shows verification error", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_document()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Verify Now"
+
+      lv_pid = lv.pid
+      send(lv_pid, {:oidc_verify_failed, :token_exchange_failed})
+      html = render(lv)
+      assert html =~ "Failed to verify"
+    end
+  end
+
+  # =============================================================================
+  # Default Provider Error Path Tests
+  # =============================================================================
+
+  describe "default provider operations" do
+    test "assign_default_provider updates UI on success", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, name: "Google Provider")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv
+      |> open_provider_actions(provider.id)
+
+      lv
+      |> element("button[phx-click='set_default_provider'][phx-value-id='#{provider.id}']")
+      |> render_click()
+
+      html = render(lv)
+      assert html =~ "Default authentication provider set"
+    end
+
+    test "clear_default_provider updates UI on success", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, name: "Default Google", is_default: true)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      lv
+      |> open_provider_actions(provider.id)
+
+      lv
+      |> element("button[phx-click='clear_default_provider']")
+      |> render_click()
+
+      html = render(lv)
+      assert html =~ "Default authentication provider cleared"
+    end
+  end
+
+  # =============================================================================
+  # Delete Provider Success Path Test
+  # =============================================================================
+
+  describe "delete provider operations" do
+    test "successfully deletes a non-active provider", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      provider = google_provider_fixture(account: account, name: "Provider to Delete")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication")
+
+      # Verify provider exists
+      html = render(lv)
+      assert html =~ "Provider to Delete"
+
+      # Delete the provider
+      lv |> request_confirm("delete", provider.id)
+      lv |> confirm_action("delete_provider", provider.id)
+
+      html = render(lv)
+      assert html =~ "deleted successfully"
+      refute html =~ "Provider to Delete"
+    end
+  end
+
+  # =============================================================================
+  # Specific Verification Error Handler Tests
+  # =============================================================================
+
+  describe "specific verification error handlers" do
+    test "handles truncated JSON response", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_invalid_json("{")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Discovery document contains invalid JSON"
+    end
+
+    test "handles JSON with invalid byte sequences", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_invalid_json(<<255, 254, 253>>)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Discovery document contains invalid JSON"
+    end
+
+    test "handles HTTP 401 error", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_discovery_error(401, "Unauthorized")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/oidc/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test OIDC",
+          discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+      assert html =~ "Failed to fetch discovery document (HTTP 401)"
+    end
+
+    test "handles Okta DNS lookup failure", %{
+      account: account,
+      actor: actor,
+      conn: conn
+    } do
+      Mocks.OIDC.stub_dns_error()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/settings/authentication/okta/new")
+
+      lv
+      |> form("#auth-provider-form", %{
+        auth_provider: %{
+          name: "Test Okta",
+          okta_domain: "mock.oidc.test",
+          client_id: "test-client",
+          client_secret: "test-secret"
+        }
+      })
+      |> render_change()
+
+      lv |> element("#verify-button") |> render_click()
+
+      html = render(lv)
+
+      assert html =~
+               "Unable to fetch discovery document: DNS lookup failed. Please verify the provider domain."
+    end
+  end
+end

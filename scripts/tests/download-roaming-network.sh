@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+
+source "./scripts/tests/lib.sh"
+
+# Download 10MB at a max rate of 300KB/s, i.e. ~33s of transfer.
+# The roam has to happen while the download is still in flight, and enough of it
+# has to remain afterwards for the gateway to record the reconnected path. That
+# window has to cover a slow `docker network disconnect`, which has taken as long
+# as 14s to take effect on a loaded runner, on top of the 5s pre-roam wait, the 3s
+# outage and the reconnect.
+client sh -c \
+    "curl \
+        --fail \
+        --max-time 60 \
+        --keepalive-time 1 \
+        --limit-rate 300000 \
+        --output download.file \
+        http://download.httpbin/bytes?num=10000000" &
+
+DOWNLOAD_PID=$!
+
+sleep 5 # Download a bit
+
+docker network disconnect firezone_primary-client-internal firezone-primary-client-1 # Disconnect the client
+sleep 3
+docker network connect firezone_primary-client-internal firezone-primary-client-1 --ip 172.30.0.200 --ip6 172:30::200 # Reconnect client with a different IP
+
+# Add static route to internet subnet via router; they get removed when the network interface disappears
+client ip -4 route add 203.0.113.0/24 via 172.30.0.254
+client ip -6 route add 203:0:113::/64 via 172:30:0::254
+
+# Send SIGHUP, triggering `reconnect` internally
+sudo kill -s HUP "$(ps -C firezone-headless-client -o pid=)"
+
+wait $DOWNLOAD_PID || {
+    echo "Download process failed"
+    exit 1
+}
+
+known_checksum="f5e02aa71e67f41d79023a128ca35bad86cf7b6656967bfe0884b3a3c4325eaf"
+computed_checksum=$(client sha256sum download.file | awk '{ print $1 }')
+
+if [[ "$computed_checksum" != "$known_checksum" ]]; then
+    echo "Checksum of downloaded file does not match"
+    exit 1
+fi
+
+# Assert the roam itself was fast. The download budget above is generous to
+# accommodate TCP slow-start after the disconnect, but the Firezone-side
+# recovery (ICE renegotiation + TURN allocate + WireGuard handshake) should
+# stay well under a second. Catch regressions here, not via the curl timeout.
+handshake_ms=$(last_wg_handshake_ms)
+if [ "$handshake_ms" -gt 2000 ]; then
+    echo "Roam took too long: WireGuard handshake completed ${handshake_ms}ms after intent (budget: 2000ms)"
+    exit 1
+fi
+
+sleep 3
+readarray -t flows < <(get_flow_logs "tcp")
+
+# A roam must not split the flow: the whole download is one flow that
+# accumulates the reconnected path as another outer tuple.
+assert_eq "${#flows[@]}" 1
+
+flow="${flows[0]}"
+
+assert_eq "$(get_flow_field "$flow" "inner_dst_ip")" "172.21.0.101"
+
+outers="$(get_flow_field "$flow" "outers")"
+
+num_tuples="$(echo "$outers" | grep -o '"dst_ip":' | wc -l || true)"
+assert_gteq "$num_tuples" 2
+
+# At least one tuple must come from the reconnected path, i.e. not from the
+# client's standard p2p port.
+non_standard_ports="$(echo "$outers" | grep -oP '"src_port":\K[0-9]+' | grep -cv '^52625$' || true)"
+assert_gteq "$non_standard_ports" 1

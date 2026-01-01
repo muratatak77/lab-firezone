@@ -1,0 +1,118 @@
+defmodule Portal.ComponentVersions do
+  alias Portal.{ComponentVersions, Device}
+  use Supervisor
+  require Logger
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__.Supervisor)
+  end
+
+  @impl true
+  def init(_opts) do
+    fetch_from_url? =
+      Portal.Config.fetch_env!(:portal, ComponentVersions)
+      |> Keyword.get(:fetch_from_url)
+
+    children =
+      if fetch_from_url? do
+        [ComponentVersions.Refresher]
+      else
+        []
+      end
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  def gateway_version do
+    ComponentVersions.component_version(:gateway)
+  end
+
+  def client_version(%Device{type: :client} = client) do
+    client
+    |> get_component_type()
+    |> component_version()
+  end
+
+  def component_version(component) do
+    Portal.Config.get_env(:portal, ComponentVersions, [])
+    |> Keyword.get(:versions, [])
+    |> Keyword.get(component, "0.0.0")
+  end
+
+  def fetch_versions do
+    config = fetch_config!()
+    releases_url = Keyword.fetch!(config, :firezone_releases_url)
+    fetch_from_url? = Keyword.fetch!(config, :fetch_from_url)
+
+    if fetch_from_url? do
+      fetch_versions_from_url(releases_url)
+    else
+      {:ok, Keyword.fetch!(config, :versions)}
+    end
+  end
+
+  def get_component_type(%Device{
+        type: :client,
+        actor: %Portal.Actor{type: :service_account}
+      }),
+      do: :headless
+
+  def get_component_type(%Device{type: :client, last_seen_user_agent: ua})
+      when is_binary(ua),
+      do: get_component_type_from_user_agent(ua)
+
+  def get_component_type(%Device{type: :client}), do: :gui
+
+  def get_component_type_from_user_agent(user_agent) when is_binary(user_agent) do
+    cond do
+      String.contains?(user_agent, "headless-client/") -> :headless
+      String.contains?(user_agent, "gui-client/") -> :gui
+      String.contains?(user_agent, "apple-client/") -> :apple
+      String.contains?(user_agent, "android-client/") -> :android
+      String.starts_with?(user_agent, "Mac OS") -> :apple
+      String.starts_with?(user_agent, "macOS") -> :apple
+      String.starts_with?(user_agent, "iOS") -> :apple
+      String.starts_with?(user_agent, "Android") -> :android
+      true -> :gui
+    end
+  end
+
+  defp fetch_config! do
+    Portal.Config.fetch_env!(:portal, __MODULE__)
+  end
+
+  defp fetch_versions_from_url(releases_url) do
+    req_opts =
+      fetch_config!()
+      |> Keyword.get(:req_opts, [])
+
+    case Req.get(releases_url, req_opts) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        versions = decode_versions_response(body)
+        {:ok, Enum.into(versions, [])}
+
+      {:ok, response} ->
+        Logger.warning("Can't fetch Firezone versions", reason: inspect(response))
+        {:error, {response.status, response.body}}
+
+      {:error, reason} ->
+        Logger.warning("Can't fetch Firezone versions", reason: inspect(reason))
+        {:error, reason}
+    end
+  end
+
+  defp decode_versions_response(%{
+         "apple" => apple,
+         "android" => android,
+         "gateway" => gateway,
+         "gui" => gui,
+         "headless" => headless
+       }) do
+    %{apple: apple, android: android, gateway: gateway, gui: gui, headless: headless}
+  end
+
+  defp decode_versions_response(_response) do
+    fetch_config!()
+    |> Keyword.fetch!(:versions)
+  end
+end

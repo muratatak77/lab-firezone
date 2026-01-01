@@ -1,0 +1,937 @@
+//! Virtual network interface
+
+use crate::{FIREZONE_MARK, tun_device_manager::TunIpStack};
+use anyhow::{Context as _, Result};
+use futures::{
+    StreamExt, TryStreamExt,
+    future::{self, Either},
+};
+use ip_network::{IpNetwork, Ipv4Network, Ipv6Network};
+use libc::{
+    EEXIST, ENOENT, ESRCH, F_GETFL, F_SETFL, O_NONBLOCK, O_RDWR, S_IFCHR, fcntl, makedev, mknod,
+    open,
+};
+use logging::{DisplayBTreeSet, err_with_src};
+use netlink_packet_route::link::{AfSpecInet6, AfSpecUnspec, In6AddrGenMode, LinkAttribute, State};
+use netlink_packet_route::route::{
+    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
+};
+use netlink_packet_route::rule::RuleAction;
+use rtnetlink::sys::AsyncSocket;
+use rtnetlink::{Error::NetlinkError, Handle, RuleAddRequest, new_connection};
+use rtnetlink::{LinkUnspec, RouteMessageBuilder};
+use std::sync::Arc;
+use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::HashMap,
+    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+};
+use std::{
+    collections::HashSet,
+    net::{Ipv4Addr, Ipv6Addr},
+};
+use std::{
+    ffi::CStr,
+    fs, io,
+    os::{fd::RawFd, unix::fs::PermissionsExt},
+};
+use std::{net::IpAddr, time::Duration};
+use tokio::time::Instant;
+use tun_ioctl as ioctl;
+
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+
+const TUN_F_CSUM: libc::c_uint = 0x01;
+const TUN_F_TSO4: libc::c_uint = 0x02;
+const TUN_F_TSO6: libc::c_uint = 0x04;
+const TUN_F_USO4: libc::c_uint = 0x20;
+const TUN_F_USO6: libc::c_uint = 0x40;
+
+const TUN_DEV_MAJOR: u32 = 10;
+const TUN_DEV_MINOR: u32 = 200;
+
+const TUN_FILE: &CStr = c"/dev/net/tun";
+
+const FIREZONE_TABLE_USER: u32 = 0x2021_fd00;
+const FIREZONE_TABLE_LINK_SCOPE: u32 = 0x2021_fd01;
+const FIREZONE_TABLE_INTERNET: u32 = 0x2021_fd02;
+
+/// For lack of a better name
+pub struct TunDeviceManager {
+    mtu: u32,
+    connection: Connection,
+    routes: BTreeSet<IpNetwork>,
+}
+
+struct Connection {
+    netlink: Netlink,
+    connection_task: tokio::task::JoinHandle<()>,
+    link_scope_route_sync_task: tokio::task::JoinHandle<()>,
+}
+
+/// Serialised access to the netlink socket.
+///
+/// All clones of a [`Handle`] talk to the kernel over a single socket, and the
+/// kernel only tracks one dump per socket: it rejects a second concurrent one with
+/// `EBUSY`. Rather than have each caller work out whether what it is about to do
+/// counts as a dump, every use of the socket goes through [`Netlink::run`], which
+/// holds a lock shared by all clones of this type for as long as the closure runs.
+///
+/// The closure receives a `&Handle`, so a sequence of netlink operations cannot
+/// interleave with another task's. The lock is not reentrant: a closure must
+/// therefore confine itself to the helpers that take a `&Handle` and must not
+/// reach back for a [`Netlink`], which would deadlock.
+#[derive(Clone)]
+struct Netlink {
+    handle: Handle,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Netlink {
+    fn new(handle: Handle) -> Self {
+        Self {
+            handle,
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Runs a sequence of netlink operations, excluding all other callers for its duration.
+    async fn run<T>(&self, operations: impl AsyncFnOnce(&Handle) -> T) -> T {
+        let _guard = self.lock.lock().await;
+
+        operations(&self.handle).await
+    }
+}
+
+impl Drop for TunDeviceManager {
+    fn drop(&mut self) {
+        self.connection.connection_task.abort();
+        self.connection.link_scope_route_sync_task.abort();
+    }
+}
+
+impl TunDeviceManager {
+    pub const IFACE_NAME: &'static str = "tun-firezone";
+
+    /// Creates a new managed tunnel device.
+    ///
+    /// Panics if called without a Tokio runtime.
+    pub fn new(mtu: usize) -> Result<Self> {
+        let (mut cxn, handle, messages) =
+            new_connection().context("Failed to create netlink connection")?;
+        let netlink = Netlink::new(handle);
+
+        tokio::spawn({
+            let netlink = netlink.clone();
+
+            async move {
+                if let Err(e) = flush_routing_tables(netlink).await {
+                    tracing::debug!("Failed to flush routing tables: {e}")
+                }
+            }
+        });
+
+        subscribe_to_route_changes(&mut cxn)?;
+
+        let connection = Connection {
+            link_scope_route_sync_task: tokio::spawn(sync_link_scope_routes_worker(
+                messages,
+                netlink.clone(),
+            )),
+            connection_task: tokio::spawn(cxn),
+            netlink,
+        };
+
+        Ok(Self {
+            connection,
+            routes: Default::default(),
+            mtu: mtu as u32,
+        })
+    }
+
+    pub fn make_tun(&mut self) -> Result<Box<dyn tun::Tun>> {
+        create_tun_device()?;
+        let fd = open_tun()?;
+        let io = tun_linux::Io::new(Self::IFACE_NAME, fd)?;
+        let tun = Box::new(io);
+
+        // Do this in a separate task because:
+        // a) We want it to be infallible.
+        // b) We don't want `async` to creep into the API.
+        tokio::spawn({
+            let netlink = self.connection.netlink.clone();
+
+            async move {
+                if let Err(e) = set_txqueue_length(netlink, 10_000).await {
+                    tracing::warn!("Failed to set TX queue length: {e}")
+                }
+            }
+        });
+
+        Ok(tun)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn set_ips(&mut self, ipv4: Ipv4Addr, ipv6: Ipv6Addr) -> Result<TunIpStack> {
+        let mtu = self.mtu;
+
+        self.connection
+            .netlink
+            .run(async |handle| configure_ips(handle, mtu, ipv4, ipv6).await)
+            .await
+    }
+
+    pub async fn set_routes(&mut self, routes: impl IntoIterator<Item = IpNetwork>) -> Result<()> {
+        let new_routes = BTreeSet::from_iter(routes);
+
+        tracing::info!(new_routes = %DisplayBTreeSet(&new_routes), "Setting new routes");
+
+        let stale_routes = self
+            .routes
+            .difference(&new_routes)
+            .copied()
+            .collect::<Vec<_>>();
+
+        self.connection
+            .netlink
+            .run(async |handle| apply_routes(handle, &stale_routes, &new_routes).await)
+            .await?;
+
+        self.routes = new_routes;
+        Ok(())
+    }
+}
+
+async fn configure_ips(
+    handle: &Handle,
+    mtu: u32,
+    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
+) -> Result<TunIpStack> {
+    let index = tun_device_index(handle).await?;
+
+    disable_ipv6_link_local(handle, index).await;
+
+    let ips = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute();
+
+    ips.try_for_each(|ip| handle.address().del(ip).execute())
+        .await
+        .context("Failed to delete existing addresses")?;
+
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
+        .execute()
+        .await
+        .context("Failed to set default MTU")?;
+
+    tracing::debug!(%ipv4, %ipv6, "Setting tunnel interface IPs");
+
+    let res_v4 = handle.address().add(index, ipv4.into(), 32).execute().await;
+    let res_v6 = handle
+        .address()
+        .add(index, ipv6.into(), 128)
+        .execute()
+        .await;
+
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(index).up().build())
+        .execute()
+        .await
+        .context("Failed to bring up interface")?;
+
+    if res_v4.is_ok() {
+        match install_rules([
+            make_rule(handle, FIREZONE_TABLE_USER, 100).v4(),
+            make_rule(handle, FIREZONE_TABLE_LINK_SCOPE, 200).v4(),
+            make_rule(handle, FIREZONE_TABLE_INTERNET, 300).v4(),
+        ])
+        .await
+        {
+            Ok(()) => tracing::debug!("Successfully created routing rules for IPv4"),
+            Err(NetlinkError(err)) if is_unsupported(err.raw_code()) => {
+                tracing::debug!(
+                    "VRF/fwmark routing rules not supported for IPv4 (possibly WSL or kernel without VRF): {err}"
+                )
+            }
+            Err(e) => tracing::warn!("Failed to add IPv4 routing rules: {e}"),
+        }
+    }
+
+    if res_v6.is_ok() {
+        match install_rules([
+            make_rule(handle, FIREZONE_TABLE_USER, 100).v6(),
+            make_rule(handle, FIREZONE_TABLE_LINK_SCOPE, 200).v6(),
+            make_rule(handle, FIREZONE_TABLE_INTERNET, 300).v6(),
+        ])
+        .await
+        {
+            Ok(()) => tracing::debug!("Successfully created routing rules for IPv6"),
+            Err(NetlinkError(err)) if is_unsupported(err.raw_code()) => {
+                tracing::debug!(
+                    "VRF/fwmark routing rules not supported for IPv6 (possibly WSL or kernel without VRF): {err}"
+                )
+            }
+            Err(e) => tracing::warn!("Failed to add IPv6 routing rules: {e}"),
+        }
+    }
+
+    let tun_ip_stack = match (res_v4, res_v6) {
+        (Ok(()), Ok(())) => TunIpStack::Dual,
+        (Ok(()), Err(e)) => {
+            tracing::debug!("Failed to set IPv6 address on TUN device: {e}");
+
+            TunIpStack::V4Only
+        }
+        (Err(e), Ok(())) => {
+            tracing::debug!("Failed to set IPv4 address on TUN device: {e}");
+
+            TunIpStack::V6Only
+        }
+        (Err(e_v4), Err(e_v6)) => {
+            anyhow::bail!("Failed to set IPv4 and IPv6 address on TUN device: {e_v4} | {e_v6}")
+        }
+    };
+
+    Ok(tun_ip_stack)
+}
+
+async fn apply_routes(
+    handle: &Handle,
+    stale_routes: &[IpNetwork],
+    new_routes: &BTreeSet<IpNetwork>,
+) -> Result<()> {
+    let index = tun_device_index(handle).await?;
+
+    for route in stale_routes {
+        let table = if is_default_route(route) {
+            FIREZONE_TABLE_INTERNET
+        } else {
+            FIREZONE_TABLE_USER
+        };
+
+        remove_route(route, index, table, handle).await;
+    }
+
+    for route in new_routes {
+        let table = if is_default_route(route) {
+            FIREZONE_TABLE_INTERNET
+        } else {
+            FIREZONE_TABLE_USER
+        };
+
+        add_route(route, index, table, handle).await;
+    }
+
+    Ok(())
+}
+
+/// Worker function that triggers a link-scope route sync on every notification from netlink.
+///
+/// We add/remove routes one-by-one and a new notification is triggered for each.
+/// To avoid unnecessary syncs, we debounce the sync by delaying its start by 500ms, resetting
+/// the timer on each new notification.
+async fn sync_link_scope_routes_worker(
+    mut messages: futures::channel::mpsc::UnboundedReceiver<(
+        netlink_packet_core::NetlinkMessage<netlink_packet_route::RouteNetlinkMessage>,
+        rtnetlink::sys::SocketAddr,
+    )>,
+    netlink: Netlink,
+) {
+    let mut debounce_timer = Box::pin(tokio::time::sleep(Duration::MAX));
+
+    loop {
+        match future::select(messages.next(), debounce_timer.as_mut()).await {
+            Either::Left((None, _)) => break,
+            Either::Left((Some((message, _)), _)) => {
+                // Check if this is a route/address/link change message
+                let netlink_packet_core::NetlinkPayload::InnerMessage(_) = message.payload else {
+                    continue;
+                };
+
+                debounce_timer
+                    .as_mut()
+                    .reset(Instant::now() + Duration::from_millis(500));
+            }
+            Either::Right((_, _)) => {
+                if let Err(e) = sync_link_scope_routes(&netlink).await {
+                    tracing::debug!("Failed to sync link-scope routes: {e:#}");
+                }
+
+                // Reset to far future so it doesn't trigger again until a new message arrives
+                debounce_timer = Box::pin(tokio::time::sleep(Duration::MAX));
+            }
+        }
+    }
+}
+
+async fn set_txqueue_length(netlink: Netlink, queue_len: u32) -> Result<()> {
+    netlink
+        .run(async |handle| {
+            let index = tun_device_index(handle).await?;
+
+            handle
+                .link()
+                .set(
+                    LinkUnspec::new_with_index(index)
+                        .append_extra_attribute(LinkAttribute::TxQueueLen(queue_len))
+                        .build(),
+                )
+                .execute()
+                .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+fn make_rule(handle: &Handle, table: u32, priority: u32) -> RuleAddRequest {
+    let mut rule = handle
+        .rule()
+        .add()
+        .fw_mark(FIREZONE_MARK)
+        .table_id(table)
+        .priority(priority)
+        .action(RuleAction::ToTable);
+
+    rule.message_mut()
+        .header
+        .flags
+        .insert(netlink_packet_route::rule::RuleFlags::Invert);
+
+    rule.message_mut()
+        .attributes
+        .push(netlink_packet_route::rule::RuleAttribute::Protocol(
+            RouteProtocol::Kernel,
+        ));
+
+    rule
+}
+
+async fn install_rules<const N: usize, T>(
+    requests: [RuleAddRequest<T>; N],
+) -> Result<(), rtnetlink::Error> {
+    for req in requests {
+        match req.execute().await {
+            Err(e) if matches!(&e, NetlinkError(err) if err.raw_code() == -EEXIST) => {}
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a netlink error means the kernel does not offer the facility we asked for.
+///
+/// A kernel built without VRF answers `EOPNOTSUPP`; one booted with IPv6 disabled
+/// answers `EAFNOSUPPORT` instead.
+fn is_unsupported(raw_code: i32) -> bool {
+    raw_code == -libc::EOPNOTSUPP || raw_code == -libc::EAFNOSUPPORT
+}
+
+/// Disables automatic IPv6 link-local address generation on the TUN device.
+///
+/// We assign explicit tunnel IPs and never use a link-local address on the TUN
+/// device. Suppressing it before the interface is brought up also avoids a race
+/// where the address cleanup in `set_ips` deletes a still-tentative (DAD)
+/// link-local and fails with `EBUSY`, which would otherwise abort the client.
+async fn disable_ipv6_link_local(handle: &Handle, index: u32) {
+    let result = handle
+        .link()
+        .set(
+            LinkUnspec::new_with_index(index)
+                .append_extra_attribute(LinkAttribute::AfSpecUnspec(vec![AfSpecUnspec::Inet6(
+                    vec![AfSpecInet6::AddrGenMode(In6AddrGenMode::None)],
+                )]))
+                .build(),
+        )
+        .execute()
+        .await
+        .context("Failed to disable IPv6 link-local address generation");
+
+    // Not fatal: an older kernel without `IFLA_INET6_ADDR_GEN_MODE` just keeps its
+    // default link-local, which the address cleanup in `set_ips` handles.
+    if let Err(e) = result {
+        tracing::debug!("{e:#}");
+    }
+}
+
+async fn tun_device_index(handle: &Handle) -> Result<u32> {
+    let index = handle
+        .link()
+        .get()
+        .match_name(TunDeviceManager::IFACE_NAME.to_string())
+        .execute()
+        .try_next()
+        .await?
+        .context("No interface")?
+        .header
+        .index;
+
+    Ok(index)
+}
+
+fn make_route_v4(idx: u32, route: Ipv4Network, table: u32) -> RouteMessage {
+    RouteMessageBuilder::<Ipv4Addr>::new()
+        .output_interface(idx)
+        .protocol(RouteProtocol::Static)
+        .scope(RouteScope::Universe)
+        .table_id(table)
+        .destination_prefix(route.network_address(), route.netmask())
+        .build()
+}
+
+fn make_route_v6(idx: u32, route: Ipv6Network, table: u32) -> RouteMessage {
+    RouteMessageBuilder::<Ipv6Addr>::new()
+        .output_interface(idx)
+        .protocol(RouteProtocol::Static)
+        .scope(RouteScope::Universe)
+        .table_id(table)
+        .destination_prefix(route.network_address(), route.netmask())
+        .build()
+}
+
+async fn add_route(route: &IpNetwork, idx: u32, table: u32, handle: &Handle) {
+    let message = match route {
+        IpNetwork::V4(ipnet) => make_route_v4(idx, *ipnet, table),
+        IpNetwork::V6(ipnet) => make_route_v6(idx, *ipnet, table),
+    };
+
+    execute_add_route_message(message, handle).await;
+}
+
+async fn remove_route(route: &IpNetwork, idx: u32, table: u32, handle: &Handle) {
+    let message = match route {
+        IpNetwork::V4(ipnet) => make_route_v4(idx, *ipnet, table),
+        IpNetwork::V6(ipnet) => make_route_v6(idx, *ipnet, table),
+    };
+
+    execute_del_route_message(message, handle).await
+}
+
+async fn execute_add_route_message(message: RouteMessage, handle: &Handle) {
+    let route = route_from_message(&message).map(tracing::field::display);
+    let iface_idx = iface_index_from_message(&message).map(tracing::field::display);
+    let table_id = table_id_from_message(&message);
+
+    let Err(err) = handle.route().add(message).execute().await else {
+        tracing::debug!(route, iface_idx, %table_id, "Created new route");
+
+        return;
+    };
+
+    // We expect this to be called often with an already existing route
+    if matches!(&err, NetlinkError(err) if err.raw_code() == -EEXIST) {
+        return;
+    }
+
+    // On systems without support for a certain IP version (i.e. no IPv6), attempting to add a route may result in "Not supported (os error 95)".
+    if matches!(&err, NetlinkError(err) if err.raw_code() == -libc::EOPNOTSUPP) {
+        return;
+    }
+
+    tracing::warn!(route, "Failed to add route: {}", err_with_src(&err));
+}
+
+async fn execute_del_route_message(message: RouteMessage, handle: &Handle) {
+    let route = route_from_message(&message).map(tracing::field::display);
+    let iface_idx = iface_index_from_message(&message).map(tracing::field::display);
+    let table_id = table_id_from_message(&message);
+
+    let Err(err) = handle.route().del(message).execute().await else {
+        tracing::debug!(route, iface_idx, %table_id, "Removed route");
+
+        return;
+    };
+
+    // Our view of the current routes may be stale. Removing a route that no longer exists shouldn't print a warning.
+    if matches!(&err, NetlinkError(err) if err.raw_code() == -ENOENT) {
+        return;
+    }
+
+    // "No such process" is another version of "route does not exist".
+    // See <https://askubuntu.com/questions/1330333/what-causes-rtnetlink-answers-no-such-process-when-using-ifdown-command>.
+    if matches!(&err, NetlinkError(err) if err.raw_code() == -ESRCH) {
+        return;
+    }
+
+    tracing::warn!(route, "Failed to remove route: {}", err_with_src(&err));
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "We don't want to match all attributes."
+)]
+fn table_id_from_message(message: &RouteMessage) -> u32 {
+    message
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(message.header.table as u32)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "We don't want to match all attributes."
+)]
+fn iface_index_from_message(message: &RouteMessage) -> Option<u32> {
+    message.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Oif(idx) => Some(*idx),
+        _ => None,
+    })
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "We don't want to match all attributes."
+)]
+fn route_from_message(message: &RouteMessage) -> Option<IpNetwork> {
+    let netmask = message.header.destination_prefix_length;
+
+    message.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Destination(RouteAddress::Inet(ipv4)) => {
+            Some(IpNetwork::V4(Ipv4Network::new(*ipv4, netmask).ok()?))
+        }
+        RouteAttribute::Destination(RouteAddress::Inet6(ipv6)) => {
+            Some(IpNetwork::V6(Ipv6Network::new(*ipv6, netmask).ok()?))
+        }
+        _ => None,
+    })
+}
+
+async fn flush_routing_tables(netlink: Netlink) -> Result<()> {
+    tracing::debug!("Flushing routing table");
+
+    netlink
+        .run(async |handle| delete_firezone_routes(handle).await)
+        .await
+}
+
+async fn delete_firezone_routes(handle: &Handle) -> Result<()> {
+    let routes = list_routes(handle)
+        .await?
+        .into_iter()
+        .filter(|r| {
+            [
+                FIREZONE_TABLE_USER,
+                FIREZONE_TABLE_LINK_SCOPE,
+                FIREZONE_TABLE_INTERNET,
+            ]
+            .contains(&table_id_from_message(r))
+        })
+        .collect::<Vec<_>>();
+
+    for msg in routes {
+        execute_del_route_message(msg, handle).await;
+    }
+
+    Ok(())
+}
+
+fn subscribe_to_route_changes(
+    cxn: &mut rtnetlink::proto::Connection<netlink_packet_route::RouteNetlinkMessage>,
+) -> Result<(), anyhow::Error> {
+    let groups = (libc::RTMGRP_IPV4_ROUTE
+        | libc::RTMGRP_IPV6_ROUTE
+        | libc::RTMGRP_LINK
+        | libc::RTMGRP_IPV4_IFADDR
+        | libc::RTMGRP_IPV6_IFADDR) as u32;
+
+    cxn.socket_mut()
+        .socket_mut()
+        .bind(&rtnetlink::sys::SocketAddr::new(0, groups))
+        .context("Failed to bind netlink socket for events")?;
+
+    Ok(())
+}
+
+/// Sync link-scope routes from the main table to the Firezone routing table.
+///
+/// This ensures that directly-connected networks (like local LANs) bypass the tunnel.
+async fn sync_link_scope_routes(netlink: &Netlink) -> Result<()> {
+    tracing::debug!("Syncing link-scope routes to Firezone routing table");
+
+    netlink
+        .run(async |handle| copy_link_scope_routes(handle).await)
+        .await
+}
+
+async fn copy_link_scope_routes(handle: &Handle) -> Result<()> {
+    let link_scope_routes = list_routes(handle)
+        .await?
+        .into_iter()
+        .filter(|route| route.header.scope == RouteScope::Link) // Only process link-scope routes
+        .collect::<Vec<_>>();
+    let link_states = link_states(handle, &link_scope_routes).await;
+
+    let link_scope_routes_firezone_table = link_scope_routes
+        .iter()
+        .filter(|m| table_id_from_message(m) == FIREZONE_TABLE_LINK_SCOPE)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let link_scope_routes_main_table = link_scope_routes
+        .iter()
+        .filter(|m| m.header.table == libc::RT_TABLE_MAIN)
+        .filter(|m| {
+            let Some(idx) = iface_index_from_message(m) else {
+                return false;
+            };
+
+            let Some(link_state) = link_states.get(&idx).copied() else {
+                return false;
+            };
+
+            let Some(route) = route_from_message(m) else {
+                return false;
+            };
+
+            let is_up = link_state == State::Up;
+
+            if !is_up {
+                tracing::debug!(%route, "Skipping route because corresponding interface is not up");
+            }
+
+            is_up
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if HashSet::<IpNetwork>::from_iter(
+        link_scope_routes_firezone_table
+            .iter()
+            .filter_map(route_from_message),
+    ) == HashSet::<IpNetwork>::from_iter(
+        link_scope_routes_main_table
+            .iter()
+            .filter_map(route_from_message),
+    ) {
+        tracing::debug!("Link-scope routes in Firezone table are up-to-date");
+
+        return Ok(());
+    }
+
+    // Now add all current link-scope routes from main table to Firezone table
+    for mut message in link_scope_routes_main_table {
+        // Change the table ID from main table to Firezone table
+        message.header.table = libc::RT_TABLE_UNSPEC;
+        message
+            .attributes
+            .retain(|a| !matches!(a, RouteAttribute::Table(_)));
+        message
+            .attributes
+            .push(RouteAttribute::Table(FIREZONE_TABLE_LINK_SCOPE));
+
+        execute_add_route_message(message, handle).await;
+    }
+
+    Ok(())
+}
+
+fn is_default_route(route: &IpNetwork) -> bool {
+    match route {
+        IpNetwork::V4(v4) => v4 == &Ipv4Network::DEFAULT_ROUTE,
+        IpNetwork::V6(v6) => v6 == &Ipv6Network::DEFAULT_ROUTE,
+    }
+}
+
+async fn list_routes(handle: &Handle) -> Result<Vec<RouteMessage>> {
+    let all_routes = handle
+        .route()
+        .get(RouteMessageBuilder::<IpAddr>::new().build())
+        .execute()
+        .try_collect::<Vec<_>>()
+        .await
+        .context("Failed to get routes")?;
+
+    Ok(all_routes)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "We only want the `OperState` attribute."
+)]
+async fn link_states(handle: &Handle, link_scope_routes: &[RouteMessage]) -> HashMap<u32, State> {
+    let mut link_state = HashMap::with_capacity(link_scope_routes.len());
+
+    for idx in link_scope_routes
+        .iter()
+        .filter_map(iface_index_from_message)
+    {
+        let link_message = match handle
+            .link()
+            .get()
+            .match_index(idx)
+            .execute()
+            .try_next()
+            .await
+        {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                tracing::debug!(%idx, "Failed to get link state");
+                link_state.insert(idx, State::Unknown);
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(%idx, "Failed to get link state: {e}");
+                link_state.insert(idx, State::Unknown);
+                continue;
+            }
+        };
+
+        let state = link_message
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                LinkAttribute::OperState(state) => Some(*state),
+                _ => None,
+            })
+            .unwrap_or(State::Unknown);
+
+        link_state.insert(idx, state);
+    }
+
+    link_state
+}
+
+fn open_tun() -> Result<tun_linux::TunFd<Arc<OwnedFd>>> {
+    let fd = match unsafe { open(TUN_FILE.as_ptr() as _, O_RDWR) } {
+        -1 => {
+            let file = TUN_FILE.to_str()?;
+
+            return Err(anyhow::Error::new(get_last_error()))
+                .with_context(|| format!("Failed to open '{file}'"));
+        }
+        fd => {
+            // Safety: We just opened the FD.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+    };
+
+    unsafe {
+        ioctl::exec(
+            fd.as_raw_fd(),
+            TUNSETIFF,
+            &mut ioctl::Request::<ioctl::SetTunFlagsPayload>::new(TunDeviceManager::IFACE_NAME),
+        )
+        .context("Failed to set flags on TUN device")?;
+    }
+
+    // A successful `TUNSETOFFLOAD` is the kernel promising it handles these offloads on both the
+    // read (GRO) and write (GSO) side, so we use it directly as the capability probe rather than
+    // gating on a kernel version. It fails on kernels without UDP segmentation offload (added in
+    // Linux 6.2), where we run without offloads and exchange plain packets.
+    let offloads = try_enable_offloads(fd.as_raw_fd());
+
+    if !offloads {
+        tracing::info!(
+            "Kernel does not support TUN segmentation offloads; packets will not be coalesced"
+        );
+    }
+
+    set_non_blocking(fd.as_raw_fd()).context("Failed to make TUN device non-blocking")?;
+
+    Ok(tun_linux::TunFd::new(Arc::new(fd), offloads))
+}
+
+/// Enables checksum and segmentation offloads on the TUN device, returning whether the kernel
+/// accepted them.
+///
+/// A successful `TUNSETOFFLOAD` is the kernel's promise that it handles these offloads on both the
+/// read (GRO) and write (GSO) side. They are all-or-nothing: if any is unsupported - UDP
+/// segmentation offload in particular needs Linux 6.2 - the ioctl fails and we run without them.
+fn try_enable_offloads(fd: RawFd) -> bool {
+    const OFFLOADS: libc::c_uint = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_USO4 | TUN_F_USO6;
+
+    // Safety: The file descriptor is valid.
+    unsafe { libc::ioctl(fd, TUNSETOFFLOAD as _, OFFLOADS as libc::c_ulong) >= 0 }
+}
+
+fn get_last_error() -> io::Error {
+    io::Error::last_os_error()
+}
+
+fn set_non_blocking(fd: RawFd) -> io::Result<()> {
+    match unsafe { fcntl(fd, F_GETFL) } {
+        -1 => Err(get_last_error()),
+        flags => match unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } {
+            -1 => Err(get_last_error()),
+            _ => Ok(()),
+        },
+    }
+}
+
+fn create_tun_device() -> io::Result<()> {
+    let path = TUN_FILE.to_str().map_err(io::Error::other)?;
+    let path = Path::new(path);
+
+    if path.exists() {
+        return Ok(());
+    }
+
+    let parent_dir = path
+        .parent()
+        .expect("const-declared path always has a parent");
+    fs::create_dir_all(parent_dir)?;
+    let permissions = fs::Permissions::from_mode(0o751);
+    fs::set_permissions(parent_dir, permissions)?;
+    if unsafe {
+        mknod(
+            TUN_FILE.as_ptr() as _,
+            S_IFCHR,
+            makedev(TUN_DEV_MAJOR, TUN_DEV_MINOR),
+        )
+    } != 0
+    {
+        return Err(get_last_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn netlink_operations_do_not_overlap() {
+        let (_cxn, handle, _messages) = new_connection().unwrap();
+        let netlink = Netlink::new(handle);
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        future::join_all((0..10).map(|_| {
+            let netlink = netlink.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+
+            async move {
+                netlink
+                    .run(async |_| {
+                        max_in_flight.fetch_max(
+                            in_flight.fetch_add(1, Ordering::SeqCst) + 1,
+                            Ordering::SeqCst,
+                        );
+                        tokio::task::yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+            }
+        }))
+        .await;
+
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+    }
+}

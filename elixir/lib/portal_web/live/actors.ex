@@ -1,0 +1,1817 @@
+defmodule PortalWeb.Actors do
+  use PortalWeb, :live_view
+
+  alias __MODULE__.Database
+  alias PortalWeb.Actors.Components, as: ActorComponents
+
+  alias Portal.Actor
+  alias Portal.Authentication
+  alias Portal.Changes.Change
+  alias Portal.ExternalIdentity
+  alias Portal.PortalSession
+  alias Portal.ClientToken
+  alias Portal.Presence
+  alias Portal.PubSub
+  alias Phoenix.LiveView.AsyncResult
+
+  import Ecto.Changeset
+
+  require Logger
+
+  def mount(_params, _session, socket) do
+    subject = socket.assigns.subject
+
+    if connected?(socket) do
+      :ok = PubSub.Changes.subscribe(socket.assigns.account.id, :actors)
+      :ok = Presence.Devices.Account.subscribe(socket.assigns.account.id)
+    end
+
+    socket =
+      socket
+      |> assign(page_title: "People")
+      |> assign_async(:actors_count, fn -> {:ok, %{actors_count: Database.count_actors(subject)}} end)
+      |> assign(
+        selected_actor: nil,
+        portal_sessions_subscribed_actor_id: nil
+      )
+      |> assign(base_actor_assigns())
+      |> assign(actors: [], actors_metadata: %Portal.Repo.OffsetPaginator.Metadata{})
+      |> LiveTable.assign_live_table("actors",
+        query_module: Database,
+        sortable_fields: [
+          {:actors, :name},
+          {:actors, :email},
+          {:actors, :updated_at}
+        ],
+        loader: &load_actors/2
+      )
+
+    {:ok, socket}
+  end
+
+  # New Person Panel — skip type selection, go straight to user form
+  def handle_params(params, uri, %{assigns: %{live_action: :new}} = socket) do
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+    changeset = changeset(%Actor{}, %{type: :account_user})
+
+    {:noreply,
+     socket
+     |> assign(selected_actor: nil)
+     |> assign(base_actor_assigns())
+     |> merge_state(:actor_panel, creating_actor: true, new_actor_type: :user)
+     |> assign(actor_form: actor_form_state(to_form(changeset)))}
+  end
+
+  # Show Actor Panel
+  def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+
+    if selected_actor_matches?(socket, id) do
+      actor = socket.assigns.selected_actor
+      default_tab = default_actor_tab(actor)
+
+      socket =
+        socket
+        |> merge_state(:actor_panel,
+          view: :detail,
+          active_tab: Map.get(params, "tab", default_tab),
+          confirm_disable_actor: false,
+          confirm_delete_actor: false,
+          confirm_delete_identity_id: nil,
+          confirm_delete_token_id: nil,
+          confirm_delete_session_id: nil
+        )
+        |> subscribe_portal_sessions(actor)
+
+      {:noreply, socket}
+    else
+      {:noreply, handle_actor_show(socket, id, params)}
+    end
+  end
+
+  # Edit Actor Panel
+  def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :edit}} = socket) do
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      socket = LiveTable.handle_live_tables_params(socket, params, uri)
+      changeset = changeset(actor, %{})
+
+      is_last_admin =
+        actor.type == :account_admin_user and
+          not other_enabled_admins_exist?(actor, socket.assigns.subject)
+
+      identities = Database.get_identities_for_actor(actor.id, socket.assigns.subject)
+      groups = Database.get_groups_for_actor(actor.id, socket.assigns.subject)
+
+      {:noreply,
+       socket
+       |> assign(selected_actor: actor)
+       |> assign(base_actor_assigns())
+       |> assign(
+         actor_panel: actor_panel_state(view: :edit, is_last_admin: is_last_admin),
+         actor_form: actor_form_state(to_form(changeset)),
+         actor_related: actor_related_state(identities: identities, groups: groups),
+         actor_group_membership: actor_group_membership_state()
+       )}
+    else
+      {:error, :not_found} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Actor not found")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+
+      {:error, :unauthorized} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "You are not authorized to view this actor")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+    end
+  end
+
+  # Default handler - list view, no selection
+  def handle_params(params, uri, socket) do
+    socket = LiveTable.handle_live_tables_params(socket, params, uri)
+
+    socket =
+      socket
+      |> assign(selected_actor: nil)
+      |> assign(base_actor_assigns())
+      |> unsubscribe_portal_sessions()
+
+    {:noreply, socket}
+  end
+
+  def handle_event(event, params, socket)
+      when event in ["paginate", "order_by", "filter", "table_row_click", "change_limit"],
+      do: LiveTable.handle_live_table_event(event, params, socket)
+
+  def handle_event(
+        "close_panel",
+        _params,
+        %{assigns: %{actor_panel: %{creating_actor: true}}} = socket
+      ) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
+  end
+
+  def handle_event("close_panel", _params, socket) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
+  end
+
+  def handle_event("handle_keydown", _params, %{assigns: %{live_action: :edit}} = socket)
+      when not is_nil(socket.assigns.selected_actor) do
+    {:noreply,
+     push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}"))}
+  end
+
+  def handle_event("handle_keydown", _params, socket)
+      when not is_nil(socket.assigns.selected_actor) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
+  end
+
+  def handle_event(
+        "handle_keydown",
+        _params,
+        %{assigns: %{actor_panel: %{creating_actor: true}}} = socket
+      ) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
+  end
+
+  def handle_event("handle_keydown", _params, socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("open_new_actor_panel", _params, socket) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/new"))}
+  end
+
+  def handle_event("select_new_actor_type", %{"type" => "user"}, socket) do
+    changeset = changeset(%Actor{}, %{type: :account_user})
+
+    {:noreply,
+     socket
+     |> merge_state(:actor_panel, new_actor_type: :user)
+     |> assign(actor_form: actor_form_state(to_form(changeset)))}
+  end
+
+  def handle_event("select_new_actor_type", %{"type" => "service_account"}, socket) do
+    changeset = changeset(%Actor{type: :service_account}, %{})
+
+    {:noreply,
+     socket
+     |> merge_state(:actor_panel, new_actor_type: :service_account)
+     |> assign(actor_form: actor_form_state(to_form(changeset)))
+     |> assign(actor_token: actor_token_state(token_expiration: default_token_expiration()))}
+  end
+
+  def handle_event("open_actor_edit_form", _params, socket) do
+    {:noreply,
+     push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}/edit"))}
+  end
+
+  def handle_event("cancel_actor_edit_form", _params, socket) do
+    {:noreply,
+     push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{socket.assigns.selected_actor.id}"))}
+  end
+
+  def handle_event("validate", %{"actor" => attrs} = params, socket) do
+    # Use form data which has type already set, or actor from assigns for edit
+    actor = socket.assigns.selected_actor || socket.assigns.actor_form.form.data
+
+    changeset =
+      actor
+      |> changeset(attrs)
+      |> Map.put(:action, :validate)
+
+    # Preserve token_expiration for service account form
+    token_expiration =
+      Map.get(params, "token_expiration", socket.assigns.actor_token.token_expiration || "")
+
+    {:noreply,
+     socket
+     |> assign(actor_form: actor_form_state(to_form(changeset)))
+     |> merge_state(:actor_token, token_expiration: token_expiration)}
+  end
+
+  def handle_event("search_actor_groups", %{"value" => search_term}, socket) do
+    actor_id = socket.assigns.selected_actor && socket.assigns.selected_actor.id
+
+    results =
+      case Database.search_groups_for_actor(search_term, actor_id, socket.assigns.subject) do
+        {:error, _} -> []
+        groups -> groups
+      end
+
+    {:noreply, merge_state(socket, :actor_group_membership, group_search_results: results)}
+  end
+
+  def handle_event("focus_group_search", _params, socket) do
+    {:noreply, merge_state(socket, :actor_group_membership, group_search_results: [])}
+  end
+
+  def handle_event("blur_group_search", _params, socket) do
+    {:noreply, merge_state(socket, :actor_group_membership, group_search_results: nil)}
+  end
+
+  def handle_event("add_pending_group", %{"group_id" => group_id}, socket) do
+    existing_group_ids = Enum.map(socket.assigns.actor_related.groups, & &1.group.id)
+    pending_ids = Enum.map(socket.assigns.actor_group_membership.pending_group_additions, & &1.id)
+
+    already_exists = group_id in existing_group_ids or group_id in pending_ids
+
+    group =
+      Enum.find(
+        socket.assigns.actor_group_membership.group_search_results || [],
+        &(&1.id == group_id)
+      )
+
+    socket =
+      if already_exists or is_nil(group) do
+        socket
+      else
+        membership = socket.assigns.actor_group_membership
+
+        assign(
+          socket,
+          actor_group_membership:
+            membership
+            |> Map.put(
+              :pending_group_additions,
+              membership.pending_group_additions ++ [group]
+            )
+            |> Map.put(
+              :pending_group_removals,
+              Enum.reject(membership.pending_group_removals, &(&1 == group_id))
+            )
+            |> Map.put(:group_search_results, nil)
+        )
+      end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("remove_pending_group_addition", %{"group_id" => group_id}, socket) do
+    additions =
+      Enum.reject(
+        socket.assigns.actor_group_membership.pending_group_additions,
+        &(&1.id == group_id)
+      )
+
+    {:noreply, merge_state(socket, :actor_group_membership, pending_group_additions: additions)}
+  end
+
+  def handle_event("add_pending_group_removal", %{"group_id" => group_id}, socket) do
+    # Only for existing memberships; also remove from pending_group_additions if it was there
+    additions =
+      Enum.reject(
+        socket.assigns.actor_group_membership.pending_group_additions,
+        &(&1.id == group_id)
+      )
+
+    removals =
+      if group_id in socket.assigns.actor_group_membership.pending_group_removals do
+        socket.assigns.actor_group_membership.pending_group_removals
+      else
+        socket.assigns.actor_group_membership.pending_group_removals ++ [group_id]
+      end
+
+    {:noreply,
+     merge_state(socket, :actor_group_membership,
+       pending_group_additions: additions,
+       pending_group_removals: removals
+     )}
+  end
+
+  def handle_event("undo_pending_group_removal", %{"group_id" => group_id}, socket) do
+    removals =
+      Enum.reject(socket.assigns.actor_group_membership.pending_group_removals, &(&1 == group_id))
+
+    {:noreply, merge_state(socket, :actor_group_membership, pending_group_removals: removals)}
+  end
+
+  def handle_event("create_user", %{"actor" => attrs}, socket) do
+    changeset = changeset(%Actor{}, attrs)
+    actor_type = get_change(changeset, :type) || :account_user
+    account = socket.assigns.account
+
+    # Check billing limits
+    cond do
+      not Portal.Billing.can_create_users?(account) ->
+        {:noreply, put_flash(socket, :error, "User limit reached for your account")}
+
+      actor_type == :account_admin_user and not Portal.Billing.can_create_admin_users?(account) ->
+        {:noreply, put_flash(socket, :error, "Admin user limit reached for your account")}
+
+      true ->
+        case Database.create(changeset, socket.assigns.subject) do
+          {:ok, actor} ->
+            socket =
+              socket
+              |> apply_group_membership_changes(actor, socket.assigns.subject)
+              |> put_flash(:success, "User created successfully")
+              |> LiveTable.reload_live_table!("actors")
+              |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))
+
+            {:noreply, socket}
+
+          {:error, changeset} ->
+            {:noreply, assign(socket, actor_form: actor_form_state(to_form(changeset)))}
+        end
+    end
+  end
+
+  def handle_event("create_service_account", %{"actor" => attrs} = params, socket) do
+    account = socket.assigns.account
+
+    # Check billing limits
+    if Portal.Billing.can_create_service_accounts?(account) do
+      attrs = Map.put(attrs, "type", "service_account")
+      changeset = changeset(%Actor{type: :service_account}, attrs)
+      token_expiration = Map.get(params, "token_expiration")
+
+      result =
+        Database.create_service_account_with_token(
+          changeset,
+          token_expiration,
+          socket.assigns.subject,
+          &create_actor_token/3
+        )
+
+      case result do
+        {:ok, {actor, nil}} ->
+          socket =
+            socket
+            |> apply_group_membership_changes(actor, socket.assigns.subject)
+            |> LiveTable.reload_live_table!("actors")
+            |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))
+
+          {:noreply, socket}
+
+        {:ok, {actor, {_token, encoded_token}}} ->
+          socket =
+            socket
+            |> apply_group_membership_changes(actor, socket.assigns.subject)
+            |> LiveTable.reload_live_table!("actors")
+            |> merge_state(:actor_related, created_token: encoded_token)
+            |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))
+
+          {:noreply, socket}
+
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:noreply, assign(socket, actor_form: actor_form_state(to_form(changeset)))}
+
+        {:error, reason} ->
+          Logger.error("Failed to create service account",
+            reason: inspect(reason),
+            account_id: account.id,
+            subject_actor_id: socket.assigns.subject.actor.id
+          )
+
+          {:noreply,
+           put_flash(
+             socket,
+             :error,
+             "A temporary error occurred while creating the service account. Please try again."
+           )}
+      end
+    else
+      {:noreply,
+       put_flash(socket, :error, "Service account limit reached for your account")}
+    end
+  end
+
+  def handle_event("save", %{"actor" => attrs}, socket) do
+    process_actor_save(attrs, socket, confirm_email_change?: false)
+  end
+
+  def handle_event("confirm_email_change", _params, socket) do
+    case socket.assigns.actor_form.pending_email_change do
+      nil ->
+        {:noreply, socket}
+
+      attrs ->
+        socket =
+          assign(socket, actor_form: %{socket.assigns.actor_form | pending_email_change: nil})
+
+        process_actor_save(attrs, socket, confirm_email_change?: true)
+    end
+  end
+
+  def handle_event("cancel_email_change", _params, socket) do
+    {:noreply,
+     assign(socket,
+       actor_form: %{socket.assigns.actor_form | pending_email_change: nil}
+     )}
+  end
+
+  def handle_event("confirm_disable_actor", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_disable_actor: true)}
+  end
+
+  def handle_event("cancel_disable_actor", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_disable_actor: false)}
+  end
+
+  def handle_event("confirm_delete_actor", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_actor: true)}
+  end
+
+  def handle_event("cancel_delete_actor", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_actor: false)}
+  end
+
+  def handle_event("delete", %{"id" => id}, socket) do
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject),
+         :ok <- ensure_not_self(actor, socket.assigns.subject),
+         {:ok, _actor} <- Database.delete(actor, socket.assigns.subject) do
+      {:noreply,
+       socket
+       |> put_flash(:success, "Actor deleted successfully")
+       |> LiveTable.reload_live_table!("actors")
+       |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors"))}
+    else
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Actor not found")}
+
+      {:error, :unauthorized} ->
+        {:noreply, put_flash(socket, :error, "You are not authorized to delete this actor")}
+
+      {:error, :self_operation} ->
+        {:noreply, put_flash(socket, :error, "You cannot delete yourself")}
+
+      {:error, _changeset} ->
+        {:noreply, put_flash(socket, :error, "Failed to delete actor")}
+    end
+  end
+
+  def handle_event("disable", %{"id" => id}, socket) do
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject),
+         :ok <- ensure_not_self(actor, socket.assigns.subject),
+         {:ok, updated_actor} <-
+           actor
+           |> change()
+           |> put_change(:is_disabled, true)
+           |> Database.update(socket.assigns.subject) do
+      socket =
+        socket
+        |> LiveTable.reload_live_table!("actors")
+        |> merge_state(:actor_panel, confirm_disable_actor: false)
+        |> maybe_update_actor_assign(id, updated_actor)
+
+      {:noreply, put_flash(socket, :success_inline, "Actor disabled successfully")}
+    else
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Actor not found")}
+
+      {:error, :unauthorized} ->
+        {:noreply, put_flash(socket, :error, "You are not authorized to disable this actor")}
+
+      {:error, :self_operation} ->
+        {:noreply, put_flash(socket, :error, "You cannot disable yourself")}
+
+      {:error, _changeset} ->
+        {:noreply, put_flash(socket, :error, "Failed to disable actor")}
+    end
+  end
+
+  def handle_event("enable", %{"id" => id}, socket) do
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject),
+         :ok <- Portal.Billing.check_actor_enable_limits(socket.assigns.account, actor) do
+      case actor
+           |> change()
+           |> put_change(:is_disabled, false)
+           |> Database.update(socket.assigns.subject) do
+        {:ok, updated_actor} ->
+          socket =
+            socket
+            |> LiveTable.reload_live_table!("actors")
+            |> maybe_update_actor_assign(id, updated_actor)
+
+          {:noreply, put_flash(socket, :success_inline, "Actor enabled successfully")}
+
+        {:error, _} ->
+          {:noreply, put_flash(socket, :error, "Failed to enable actor")}
+      end
+    else
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Actor not found")}
+
+      {:error, :unauthorized} ->
+        {:noreply, put_flash(socket, :error, "You are not authorized to enable this actor")}
+
+      {:error, :users_limit_reached} ->
+        {:noreply, put_flash(socket, :error, "User limit reached for your account")}
+
+      {:error, :admin_users_limit_reached} ->
+        {:noreply, put_flash(socket, :error, "Admin user limit reached for your account")}
+    end
+  end
+
+  def handle_event(
+        "change_tab",
+        %{"tab" => tab},
+        %{assigns: %{selected_actor: %Actor{} = actor}} = socket
+      ) do
+    {:noreply, push_patch(socket, to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor}", tab: tab))}
+  end
+
+  def handle_event("change_tab", _params, %{assigns: %{selected_actor: nil}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("validate_token", params, socket) do
+    token_expiration =
+      Map.get(params, "token_expiration", socket.assigns.actor_token.token_expiration)
+
+    {:noreply, merge_state(socket, :actor_token, token_expiration: token_expiration)}
+  end
+
+  def handle_event(
+        "create_token",
+        params,
+        %{assigns: %{selected_actor: %Actor{type: :service_account} = actor}} = socket
+      ) do
+    token_expiration = Map.get(params, "token_expiration")
+
+    case create_actor_token(actor, token_expiration, socket.assigns.subject) do
+      {:ok, {_token, encoded_token}} ->
+        tokens = Database.get_client_tokens_for_actor(actor.id, socket.assigns.subject)
+
+        {:noreply,
+         socket
+         |> merge_state(:actor_related, created_token: encoded_token, tokens: tokens)
+         |> merge_state(:actor_token, adding_token: false)}
+
+      _ ->
+        {:noreply, put_flash(socket, :error, "Failed to create token")}
+    end
+  end
+
+  def handle_event("create_token", _params, socket) do
+    {:noreply, put_flash(socket, :error, "Tokens can only be created for service accounts")}
+  end
+
+  def handle_event("confirm_delete_token", %{"id" => token_id}, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_token_id: token_id)}
+  end
+
+  def handle_event("cancel_delete_token", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_token_id: nil)}
+  end
+
+  def handle_event("confirm_delete_session", %{"id" => session_id}, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_session_id: session_id)}
+  end
+
+  def handle_event("cancel_delete_session", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_session_id: nil)}
+  end
+
+  def handle_event("open_add_token_form", _params, socket) do
+    default_expiration =
+      Date.utc_today()
+      |> Date.add(365)
+      |> Date.to_iso8601()
+
+    {:noreply,
+     merge_state(socket, :actor_token,
+       adding_token: true,
+       token_expiration: default_expiration
+     )}
+  end
+
+  def handle_event("cancel_add_token_form", _params, socket) do
+    {:noreply, merge_state(socket, :actor_token, adding_token: false)}
+  end
+
+  def handle_event("dismiss_created_token", _params, socket) do
+    {:noreply, merge_state(socket, :actor_related, created_token: nil)}
+  end
+
+  def handle_event("delete_token", %{"id" => token_id}, socket) do
+    token = Database.get_client_token_by_id(token_id, socket.assigns.subject)
+
+    entity =
+      if socket.assigns.selected_actor.type == :service_account, do: "token", else: "session"
+
+    if token do
+      case Database.delete(token, socket.assigns.subject) do
+        {:ok, _} ->
+          tokens =
+            Database.get_client_tokens_for_actor(
+              socket.assigns.selected_actor.id,
+              socket.assigns.subject
+            )
+
+          {:noreply,
+           socket
+           |> merge_state(:actor_related, tokens: tokens)
+           |> merge_state(:actor_panel, confirm_delete_token_id: nil)}
+
+        {:error, _} ->
+          {:noreply, put_flash(socket, :error, "Failed to delete #{entity}")}
+      end
+    else
+      {:noreply, put_flash(socket, :error, "#{String.capitalize(entity)} not found")}
+    end
+  end
+
+  def handle_event("delete_session", %{"id" => session_id}, socket) do
+    session = Database.get_portal_session_by_id(session_id, socket.assigns.subject)
+
+    if session do
+      :ok =
+        Authentication.delete_portal_session(%PortalSession{
+          account_id: socket.assigns.account.id,
+          id: session.id
+        })
+
+      # Reload sessions for the actor
+      sessions =
+        Database.get_portal_sessions_for_actor(
+          socket.assigns.selected_actor.id,
+          socket.assigns.subject
+        )
+
+      socket =
+        socket
+        |> merge_state(:actor_related, sessions: sessions)
+        |> merge_state(:actor_panel, confirm_delete_session_id: nil)
+
+      {:noreply, put_flash(socket, :success_inline, "Session deleted successfully")}
+    else
+      {:noreply, put_flash(socket, :error, "Session not found")}
+    end
+  end
+
+  def handle_event("confirm_delete_identity", %{"id" => identity_id}, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_identity_id: identity_id)}
+  end
+
+  def handle_event("cancel_delete_identity", _params, socket) do
+    {:noreply, merge_state(socket, :actor_panel, confirm_delete_identity_id: nil)}
+  end
+
+  def handle_event("delete_identity", %{"id" => identity_id}, socket) do
+    case Database.get_identity_by_id(identity_id, socket.assigns.subject) do
+      nil ->
+        {:noreply, put_flash(socket, :error, "Identity not found")}
+
+      identity ->
+        case Database.delete(identity, socket.assigns.subject) do
+          {:ok, _} ->
+            identities =
+              Database.get_identities_for_actor(
+                socket.assigns.selected_actor.id,
+                socket.assigns.subject
+              )
+
+            {:noreply,
+             socket
+             |> merge_state(:actor_related, identities: identities)
+             |> merge_state(:actor_panel, confirm_delete_identity_id: nil)}
+
+          {:error, _} ->
+            {:noreply, put_flash(socket, :error, "Failed to delete identity")}
+        end
+    end
+  end
+
+  def handle_event("send_welcome_email", %{"id" => actor_id}, socket) do
+    actor = socket.assigns.selected_actor
+
+    if actor.id == actor_id and actor.email do
+      Portal.Mailer.AuthEmail.new_user_email(
+        socket.assigns.account,
+        actor,
+        socket.assigns.subject
+      )
+      |> Portal.Mailer.deliver_with_rate_limit(
+        rate_limit: 3,
+        rate_limit_key: {:welcome_email, actor.id},
+        rate_limit_interval: :timer.minutes(3)
+      )
+      |> case do
+        {:ok, _} ->
+          Process.send_after(self(), :clear_welcome_email_sent, 3000)
+          {:noreply, merge_state(socket, :actor_panel, welcome_email_sent: true)}
+
+        {:error, :rate_limited} ->
+          socket =
+            socket
+            |> put_flash(
+              :error,
+              "You sent too many welcome emails to this address. Please try again later."
+            )
+
+          {:noreply, socket}
+
+        {:error, _} ->
+          socket =
+            socket
+            |> put_flash(:error, "Failed to send welcome email")
+
+          {:noreply, socket}
+      end
+    else
+      {:noreply, put_flash(socket, :error, "Cannot send welcome email to this actor")}
+    end
+  end
+
+  def handle_info(%Change{op: :insert, struct: %Actor{type: type}}, socket)
+      when type in [:account_user, :account_admin_user] do
+    {:noreply,
+     update(socket, :actors_count, fn
+       %AsyncResult{ok?: true} = ar -> AsyncResult.ok(ar, ar.result + 1)
+       ar -> ar
+     end)}
+  end
+
+  def handle_info(%Change{op: :delete, old_struct: %Actor{type: type}}, socket)
+      when type in [:account_user, :account_admin_user] do
+    {:noreply,
+     update(socket, :actors_count, fn
+       %AsyncResult{ok?: true} = ar -> AsyncResult.ok(ar, max(ar.result - 1, 0))
+       ar -> ar
+     end)}
+  end
+
+  # The :actors topic carries every actor type, so this page also sees service
+  # accounts and API clients, which have pages of their own. Those and user
+  # updates that leave the count alone change nothing here.
+  def handle_info(%Change{struct: %Actor{}}, socket), do: {:noreply, socket}
+  def handle_info(%Change{old_struct: %Actor{}}, socket), do: {:noreply, socket}
+
+  def handle_info(
+        %Phoenix.Socket.Broadcast{event: "presence_diff", topic: topic, payload: payload},
+        socket
+      ) do
+    actor = socket.assigns.selected_actor
+
+    cond do
+      is_nil(actor) ->
+        {:noreply, socket}
+
+      topic == "presences:portal_sessions:" <> actor.id ->
+        sessions = Database.get_portal_sessions_for_actor(actor.id, socket.assigns.subject)
+        {:noreply, merge_state(socket, :actor_related, sessions: sessions)}
+
+      topic == "presences:account_devices:" <> socket.assigns.account.id and
+          Presence.Devices.diff_includes_actor?(payload, actor.id) ->
+        tokens = Database.get_client_tokens_for_actor(actor.id, socket.assigns.subject)
+        {:noreply, merge_state(socket, :actor_related, tokens: tokens)}
+
+      true ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_info(:clear_welcome_email_sent, socket) do
+    {:noreply, merge_state(socket, :actor_panel, welcome_email_sent: false)}
+  end
+
+  def handle_info(message, socket), do: PortalWeb.Live.Helpers.handle_info_fallback(message, socket)
+
+  defp validate_role_change(changeset, actor, socket) do
+    new_type = get_change(changeset, :type)
+
+    cond do
+      # Prevent changing the last admin to account_user
+      actor.type == :account_admin_user and new_type == :account_user and
+          not other_enabled_admins_exist?(actor, socket.assigns.subject) ->
+        changeset =
+          changeset
+          |> add_error(
+            :type,
+            "Cannot change role. At least one admin must remain in the account."
+          )
+          |> Map.put(:action, :validate)
+
+        {:error, changeset}
+
+      # Prevent promoting to admin when admin limit is reached
+      actor.type != :account_admin_user and new_type == :account_admin_user and
+          not Portal.Billing.can_create_admin_users?(
+            Database.fetch_account(socket.assigns.subject)
+          ) ->
+        {:error, "Admin user limit reached for your account"}
+
+      # Role change allowed
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_otp_change(changeset, actor, socket) do
+    disabling_otp = get_change(changeset, :allow_email_otp_sign_in) == false
+    is_portal_user = actor.type in [:account_user, :account_admin_user]
+
+    if disabling_otp and is_portal_user do
+      identities = Database.get_identities_for_actor(actor.id, socket.assigns.subject)
+
+      if Enum.empty?(identities) do
+        {:error, "Cannot disable Email OTP. It is this actor's only sign-in method."}
+      else
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp save_actor(changeset, socket) do
+    identities_cleared? = Actor.email_meaningfully_changed?(changeset)
+
+    case Database.update_actor(changeset, socket.assigns.subject) do
+      {:ok, actor} ->
+        socket =
+          socket
+          |> apply_group_membership_changes(actor, socket.assigns.subject)
+          |> assign(selected_actor: actor)
+          |> maybe_clear_identities_assign(identities_cleared?)
+
+        flash_message =
+          if identities_cleared? do
+            "Actor updated successfully. All external identities, active sessions, and client tokens for this actor were removed because the email changed."
+          else
+            "Actor updated successfully."
+          end
+
+        {:noreply,
+         socket
+         |> put_flash(:success, flash_message)
+         |> LiveTable.reload_live_table!("actors")
+         |> push_patch(to: LiveTable.live_table_path(socket, ~p"/#{socket.assigns.account}/actors/#{actor.id}"))}
+
+      {:error, changeset} ->
+        {:noreply, assign(socket, actor_form: actor_form_state(to_form(changeset)))}
+    end
+  end
+
+  defp maybe_clear_identities_assign(socket, false), do: socket
+  defp maybe_clear_identities_assign(socket, true), do: merge_state(socket, :actor_related, identities: [])
+
+  defp process_actor_save(attrs, socket, opts) do
+    actor = socket.assigns.selected_actor
+    changeset = changeset(actor, attrs)
+    skip_confirmation? = Keyword.fetch!(opts, :confirm_email_change?)
+
+    with :ok <- validate_role_change(changeset, actor, socket),
+         :ok <- validate_otp_change(changeset, actor, socket) do
+      if not skip_confirmation? and Actor.email_meaningfully_changed?(changeset) do
+        {:noreply,
+         assign(socket,
+           actor_form: actor_form_state(to_form(changeset), pending_email_change: attrs)
+         )}
+      else
+        save_actor(changeset, socket)
+      end
+    else
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:noreply, assign(socket, actor_form: actor_form_state(to_form(changeset)))}
+
+      {:error, message} when is_binary(message) ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  defp load_actors(subject, list_opts) do
+    with {:ok, actors, metadata} <- Database.list_actors(subject, list_opts) do
+      {:ok, %{actors: actors, actors_metadata: metadata}}
+    end
+  end
+
+  defp subscribe_portal_sessions(socket, %{type: :service_account}), do: socket
+
+  defp subscribe_portal_sessions(socket, actor) do
+    if connected?(socket) and socket.assigns.portal_sessions_subscribed_actor_id != actor.id do
+      if prev_id = socket.assigns.portal_sessions_subscribed_actor_id do
+        Presence.PortalSessions.unsubscribe(prev_id)
+      end
+
+      Presence.PortalSessions.subscribe(actor.id)
+      assign(socket, portal_sessions_subscribed_actor_id: actor.id)
+    else
+      socket
+    end
+  end
+
+  defp unsubscribe_portal_sessions(socket) do
+    cond do
+      not connected?(socket) ->
+        socket
+
+      id = socket.assigns[:portal_sessions_subscribed_actor_id] ->
+        Presence.PortalSessions.unsubscribe(id)
+        assign(socket, portal_sessions_subscribed_actor_id: nil)
+
+      true ->
+        socket
+    end
+  end
+
+  defp maybe_update_actor_assign(socket, id, updated_actor) do
+    if Map.get(socket.assigns, :selected_actor) && socket.assigns.selected_actor.id == id do
+      assign(socket, selected_actor: updated_actor)
+    else
+      socket
+    end
+  end
+
+  defp handle_actor_show(socket, id, params) do
+    case actor_show_state(
+           id,
+           socket.assigns.subject,
+           Map.get(params, "tab"),
+           socket.assigns.actor_related.created_token
+         ) do
+      {:ok, actor, actor_panel, actor_related} ->
+        socket
+        |> assign(selected_actor: actor)
+        |> assign(base_actor_assigns())
+        |> assign(actor_panel: actor_panel, actor_related: actor_related)
+        |> subscribe_portal_sessions(actor)
+
+      :error ->
+        socket
+        |> put_flash(:error, "Actor not found")
+        |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")
+    end
+  end
+
+  defp actor_show_state(id, subject, requested_tab, created_token) do
+    case Database.get_actor(id, subject) do
+      {:ok, actor} ->
+        identities = Database.get_identities_for_actor(actor.id, subject)
+        groups = Database.get_groups_for_actor(actor.id, subject)
+        {tokens, sessions} = actor_related_records(actor, subject)
+        active_tab = requested_tab || default_actor_tab(actor)
+
+        {:ok, actor, actor_panel_state(view: :detail, active_tab: active_tab),
+         actor_related_state(
+           identities: identities,
+           groups: groups,
+           tokens: tokens,
+           sessions: sessions,
+           created_token: created_token
+         )}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp actor_related_records(%{type: :service_account} = actor, subject) do
+    {Database.get_client_tokens_for_actor(actor.id, subject), []}
+  end
+
+  defp actor_related_records(actor, subject) do
+    {
+      Database.get_client_tokens_for_actor(actor.id, subject),
+      Database.get_portal_sessions_for_actor(actor.id, subject)
+    }
+  end
+
+  def render(assigns) do
+    ~H"""
+    <div class="relative flex flex-col h-full overflow-hidden">
+      <Page.page_header>
+        <:icon>
+          <Core.icon name="ri-user-line" class="w-16 h-16 text-brand" />
+        </:icon>
+        <:title>People</:title>
+        <:description>
+          Admin users and regular users in this account.
+        </:description>
+        <:action>
+          <Navigation.docs_action show_label size="md" path="/deploy/users" />
+        </:action>
+        <:action>
+          <Form.button style="primary" icon="ri-add-line" phx-click="open_new_actor_panel">
+            New Person
+          </Form.button>
+        </:action>
+        <:stats>
+          <.async_result :let={count} assign={@actors_count}>
+            <:loading><Core.badge type="primary">Loading...</Core.badge></:loading>
+            <Core.dual_badge type="primary">
+              <:left>{count}</:left>
+              <:right>Total</:right>
+            </Core.dual_badge>
+          </.async_result>
+        </:stats>
+      </Page.page_header>
+
+      <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+        <LiveTable.live_table
+          id="actors"
+          loading={@loading_by_table_id["actors"]}
+          query_error={@query_error_by_table_id["actors"]}
+          rows={@actors}
+          row_id={&"actor-#{&1.id}"}
+          row_click={fn actor -> ~p"/#{@account}/actors/#{actor.id}?#{@query_params}" end}
+          row_selected={
+            fn actor -> not is_nil(@selected_actor) and actor.id == @selected_actor.id end
+          }
+          filters={@filters_by_table_id["actors"]}
+          filter={@filter_form_by_table_id["actors"]}
+          ordered_by={@order_by_table_id["actors"]}
+          metadata={@actors_metadata}
+          class="flex-1 min-h-0"
+        >
+          <:col :let={actor} field={{:actors, :name}} label="name">
+            <div class="flex items-center gap-2.5">
+              <ActorComponents.actor_type_icon_with_badge actor={actor} />
+              <div>
+                <div class="font-medium text-heading group-hover:text-brand transition-colors">
+                  {actor.name}
+                </div>
+                <div class="font-mono text-[11px] text-subtle mt-0.5">
+                  {actor.id}
+                </div>
+              </div>
+            </div>
+          </:col>
+          <:col :let={actor} field={{:actors, :email}} label="email" class="w-72">
+            <span class="text-body block truncate" title={actor.email}>
+              {actor.email || "-"}
+            </span>
+          </:col>
+          <:col :let={actor} label="status" class="w-32">
+            <ActorComponents.actor_status_badge
+              is_disabled={actor.is_disabled}
+              disabled_by_directory={not is_nil(actor.disabled_by_directory_id)}
+            />
+          </:col>
+          <:empty>
+            <span class="text-sm text-subtle">No people to display.</span>
+          </:empty>
+        </LiveTable.live_table>
+      </div>
+
+      <ActorComponents.actor_panel
+        account={@account}
+        actor={@selected_actor}
+        query_params={@query_params}
+        subject={@subject}
+        panel={@actor_panel}
+        form_state={@actor_form}
+        related_state={@actor_related}
+        token_state={@actor_token}
+        group_membership_state={@actor_group_membership}
+      />
+    </div>
+    """
+  end
+
+  defp base_actor_assigns do
+    [
+      actor_panel: actor_panel_state(),
+      actor_form: actor_form_state(),
+      actor_related: actor_related_state(),
+      actor_token: actor_token_state(),
+      actor_group_membership: actor_group_membership_state()
+    ]
+  end
+
+  defp actor_panel_state(overrides \\ []) do
+    %{
+      view: :detail,
+      active_tab: "identities",
+      creating_actor: false,
+      new_actor_type: nil,
+      is_last_admin: false,
+      welcome_email_sent: false,
+      confirm_disable_actor: false,
+      confirm_delete_actor: false,
+      confirm_delete_identity_id: nil,
+      confirm_delete_token_id: nil,
+      confirm_delete_session_id: nil
+    }
+    |> Map.merge(Map.new(overrides))
+  end
+
+  defp actor_form_state(form \\ nil, overrides \\ []) do
+    %{form: form, pending_email_change: nil}
+    |> Map.merge(Map.new(overrides))
+  end
+
+  defp actor_related_state(overrides \\ []) do
+    %{
+      identities: [],
+      groups: [],
+      tokens: [],
+      sessions: [],
+      created_token: nil
+    }
+    |> Map.merge(Map.new(overrides))
+  end
+
+  defp actor_token_state(overrides \\ []) do
+    %{
+      adding_token: false,
+      token_expiration: ""
+    }
+    |> Map.merge(Map.new(overrides))
+  end
+
+  defp actor_group_membership_state(overrides \\ []) do
+    %{
+      pending_group_additions: [],
+      pending_group_removals: [],
+      group_search_results: nil
+    }
+    |> Map.merge(Map.new(overrides))
+  end
+
+  defp merge_state(socket, key, updates) do
+    update(socket, key, &Map.merge(&1, Map.new(updates)))
+  end
+
+  defp default_token_expiration do
+    Date.utc_today()
+    |> Date.add(365)
+    |> Date.to_iso8601()
+  end
+
+  defp selected_actor_matches?(socket, id) do
+    match?(%{id: ^id}, socket.assigns.selected_actor)
+  end
+
+  defp default_actor_tab(%{type: :service_account}), do: "tokens"
+  defp default_actor_tab(_actor), do: "identities"
+
+  # Utility helpers
+  defp ensure_not_self(actor, subject) do
+    if actor.id == subject.actor.id, do: {:error, :self_operation}, else: :ok
+  end
+
+  # Changesets
+  defp changeset(actor, attrs) do
+    actor
+    |> cast(attrs, [:name, :email, :type, :allow_email_otp_sign_in])
+  end
+
+  defp apply_group_membership_changes(socket, actor, subject) do
+    addition_results =
+      Enum.map(socket.assigns.actor_group_membership.pending_group_additions, fn group ->
+        Database.add_group_member(group.id, actor, subject)
+      end)
+
+    removal_results =
+      Enum.map(socket.assigns.actor_group_membership.pending_group_removals, fn group_id ->
+        Database.remove_group_member(group_id, actor, subject)
+      end)
+
+    groups = Database.get_groups_for_actor(actor.id, subject)
+
+    errors =
+      (addition_results ++ removal_results)
+      |> Enum.filter(&match?({:error, _}, &1))
+
+    socket =
+      socket
+      |> assign(actor_group_membership: actor_group_membership_state())
+      |> merge_state(:actor_related, groups: groups)
+
+    if Enum.empty?(errors) do
+      socket
+    else
+      put_flash(socket, :error, "Failed to update some group memberships.")
+    end
+  end
+
+  # Helper functions
+  defp parse_date_to_datetime(date_string) do
+    case Date.from_iso8601(date_string) do
+      {:ok, date} ->
+        DateTime.new!(date, ~T[23:59:59], "Etc/UTC")
+
+      {:error, _} ->
+        nil
+    end
+  end
+
+  # Consolidated token creation function
+  defp create_actor_token(_actor, nil, _subject), do: {:ok, nil}
+  defp create_actor_token(_actor, "", _subject), do: {:ok, nil}
+
+  defp create_actor_token(actor, token_expiration, subject) do
+    case parse_date_to_datetime(token_expiration) do
+      nil ->
+        {:error, :invalid_date}
+
+      expires_at ->
+        # Build the token attributes
+        attrs = %{"expires_at" => expires_at}
+
+        case Authentication.create_non_interactive_client_token(actor, attrs, subject) do
+          {:ok, token} ->
+            encoded_token = Authentication.encode_fragment!(token)
+            {:ok, {token, encoded_token}}
+
+          error ->
+            error
+        end
+    end
+  end
+
+  defp other_enabled_admins_exist?(actor, subject) do
+    case actor do
+      %{type: :account_admin_user, account_id: account_id, id: id} ->
+        Database.other_enabled_admins_exist?(account_id, id, subject)
+
+      _ ->
+        false
+    end
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    import Portal.Repo.Query
+    alias Portal.ExternalIdentity
+    alias Portal.Actor
+    alias Portal.Device
+    alias Portal.Presence
+    alias Portal.Safe
+    alias Portal.Directory
+    alias Portal.Repo.Filter
+    alias Portal.Repo.OffsetPaginator
+
+    def all do
+      from(actors in Actor, as: :actors)
+      |> where([actors: actors], actors.type != :api_client)
+      |> select_merge([actors: actors], %{
+        email:
+          fragment(
+            "COALESCE(?, (SELECT email FROM external_identities WHERE actor_id = ? AND email IS NOT NULL ORDER BY inserted_at DESC LIMIT 1))",
+            actors.email,
+            actors.id
+          ),
+        identity_count:
+          fragment(
+            "(SELECT COUNT(*) FROM external_identities WHERE actor_id = ?)",
+            actors.id
+          )
+      })
+    end
+
+    def count_actors(subject) do
+      from(a in Actor, as: :actors)
+      |> where([actors: a], a.type in [:account_user, :account_admin_user])
+      |> Safe.scoped(subject)
+      |> Safe.aggregate(:count)
+    end
+
+    defp index_query do
+      from(actors in Actor, as: :actors)
+      |> where([actors: actors], actors.type in [:account_user, :account_admin_user])
+    end
+
+    def cursor_fields do
+      [
+        {:actors, :asc, :inserted_at},
+        {:actors, :asc, :id}
+      ]
+    end
+
+    def filters do
+      [
+        %Filter{
+          name: :name_or_email,
+          title: "Name or Email",
+          type: {:string, :websearch},
+          fun: &filter_by_name_or_email/2
+        },
+        %Filter{
+          name: :status,
+          title: "Status",
+          type: :string,
+          values: [
+            {"Active", "active"},
+            {"Disabled", "disabled"}
+          ],
+          fun: &filter_by_status/2
+        },
+        %Filter{
+          name: :type,
+          title: "Role",
+          type: {:string, :select},
+          values: [
+            {"Admins", "admin"},
+            {"Users", "user"}
+          ],
+          fun: &filter_by_type/2
+        },
+        %Filter{
+          name: :directory_id,
+          title: "Directory",
+          type: {:string, :select},
+          values: &directory_values/1,
+          fun: &filter_by_directory/2
+        }
+      ]
+    end
+
+    # Define a simple struct-like module for directory options
+    defmodule DirectoryOption do
+      defstruct [:id, :name]
+    end
+
+    defp directory_values(subject) do
+      directories =
+        from(d in Directory,
+          where: d.account_id == ^subject.account.id,
+          left_join: google in Portal.Google.Directory,
+          on: google.id == d.id and google.account_id == d.account_id and d.type == :google,
+          left_join: entra in Portal.Entra.Directory,
+          on: entra.id == d.id and entra.account_id == d.account_id and d.type == :entra,
+          left_join: okta in Portal.Okta.Directory,
+          on: okta.id == d.id and okta.account_id == d.account_id and d.type == :okta,
+          select: %{
+            id: d.id,
+            name: fragment("COALESCE(?, ?, ?)", google.name, entra.name, okta.name),
+            type: d.type
+          },
+          order_by: [asc: fragment("COALESCE(?, ?, ?)", google.name, entra.name, okta.name)]
+        )
+        |> Safe.scoped(subject)
+        |> Safe.all()
+        |> case do
+          {:error, _} ->
+            []
+
+          directories ->
+            directories
+            |> Enum.map(fn %{id: id, name: name} ->
+              %DirectoryOption{id: id, name: name}
+            end)
+        end
+
+      # Add Firezone option at the beginning
+      [%DirectoryOption{id: "firezone", name: "Firezone"} | directories]
+    end
+
+    def filter_by_status(queryable, "active") do
+      {queryable, dynamic([actors: actors], actors.is_disabled == false)}
+    end
+
+    def filter_by_status(queryable, "disabled") do
+      {queryable, dynamic([actors: actors], actors.is_disabled == true)}
+    end
+
+    def filter_by_type(queryable, "admin") do
+      {queryable, dynamic([actors: actors], actors.type == :account_admin_user)}
+    end
+
+    def filter_by_type(queryable, "user") do
+      {queryable, dynamic([actors: actors], actors.type == :account_user)}
+    end
+
+    def filter_by_type(queryable, "service_account") do
+      {queryable, dynamic([actors: actors], actors.type == :service_account)}
+    end
+
+    def filter_by_directory(queryable, "firezone") do
+      # Firezone directory - actors with no directory-linked identities
+      # (either no identities, or identities without directory_id)
+      identity_subquery =
+        from(i in ExternalIdentity,
+          where: not is_nil(i.directory_id),
+          select: i.actor_id,
+          distinct: true
+        )
+
+      {queryable, dynamic([actors: actors], actors.id not in subquery(identity_subquery))}
+    end
+
+    def filter_by_directory(queryable, directory_id) do
+      # Filter for actors that have identities from a specific directory
+      identity_subquery =
+        from(i in ExternalIdentity,
+          where: i.directory_id == ^directory_id,
+          select: i.actor_id,
+          distinct: true
+        )
+
+      {queryable, dynamic([actors: actors], actors.id in subquery(identity_subquery))}
+    end
+
+    def filter_by_name_or_email(queryable, search_term) do
+      {queryable,
+       dynamic(
+         [actors: actors],
+         fulltext_search(actors.name, ^search_term) or
+           fulltext_search(actors.email, ^search_term)
+       )}
+    end
+
+    def list_actors(subject, opts \\ []) do
+      {filter, opts} = Keyword.pop(opts, :filter, [])
+      {order_by, opts} = Keyword.pop(opts, :order_by, [])
+      {page_opts, _opts} = Keyword.pop(opts, :page, [])
+
+      with {:ok, paginator_opts} <- OffsetPaginator.init(__MODULE__, order_by, page_opts),
+           {:ok, filtered_query} <- Filter.filter(index_query(), __MODULE__, filter),
+           count when is_integer(count) <-
+             Safe.aggregate(Safe.scoped(filtered_query, subject), :count),
+           actor_ids <- list_actor_ids(filtered_query, paginator_opts, subject),
+           {actor_ids, metadata} <- OffsetPaginator.metadata(actor_ids, paginator_opts) do
+        actors = fetch_actors_page(actor_ids, subject)
+        {:ok, actors, %{metadata | count: count}}
+      else
+        {:error, :unauthorized} = error -> error
+        {:error, _reason} = error -> error
+      end
+    end
+
+    defp list_actor_ids(filtered_query, paginator_opts, subject) do
+      filtered_query
+      |> select([actors: actors], actors.id)
+      |> OffsetPaginator.query(paginator_opts)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+    end
+
+    defp fetch_actors_page([], _subject), do: []
+
+    defp fetch_actors_page(actor_ids, subject) do
+      actors =
+        all()
+        |> where([actors: actors], actors.id in ^actor_ids)
+        |> Safe.scoped(subject)
+        |> Safe.all()
+
+      actors_by_id = Map.new(actors, &{&1.id, &1})
+
+      actor_ids
+      |> Enum.map(&Map.get(actors_by_id, &1))
+      |> Enum.reject(&is_nil/1)
+    end
+
+    def fetch_account(subject) do
+      from(a in Portal.Account)
+      |> Safe.scoped(subject)
+      |> Safe.one!()
+    end
+
+    def get_actor(id, subject) do
+      result =
+        from(a in Actor, as: :actors)
+        |> where([actors: a], a.id == ^id)
+        |> where([actors: a], a.type != :api_client)
+        |> Safe.scoped(subject)
+        |> Safe.one()
+
+      case result do
+        nil -> {:error, :not_found}
+        {:error, :unauthorized} -> {:error, :unauthorized}
+        actor -> {:ok, actor}
+      end
+    end
+
+    def get_identities_for_actor(actor_id, subject) do
+      from(i in ExternalIdentity, as: :identities)
+      |> where([identities: i], i.actor_id == ^actor_id)
+      |> join(:left, [identities: i], d in assoc(i, :directory),
+        on: d.account_id == i.account_id,
+        as: :directory
+      )
+      |> join(:left, [directory: d], gd in Portal.Google.Directory,
+        on: gd.id == d.id and gd.account_id == d.account_id and d.type == :google,
+        as: :google_directory
+      )
+      |> join(:left, [directory: d], ed in Portal.Entra.Directory,
+        on: ed.id == d.id and ed.account_id == d.account_id and d.type == :entra,
+        as: :entra_directory
+      )
+      |> join(:left, [directory: d], od in Portal.Okta.Directory,
+        on: od.id == d.id and od.account_id == d.account_id and d.type == :okta,
+        as: :okta_directory
+      )
+      |> join(:left, [identities: i], ss in Portal.ExternalIdentitySyncState,
+        on: ss.external_identity_id == i.id and ss.account_id == i.account_id,
+        as: :sync_state
+      )
+      |> select_merge(
+        [directory: d, google_directory: gd, entra_directory: ed, okta_directory: od],
+        %{
+          directory_name:
+            fragment(
+              "COALESCE(?, ?, ?, 'Firezone')",
+              gd.name,
+              ed.name,
+              od.name
+            )
+        }
+      )
+      |> order_by([identities: i], desc: i.inserted_at)
+      |> preload([identities: i, sync_state: ss], sync_state: ss)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+    end
+
+    def other_enabled_admins_exist?(account_id, actor_id, subject) do
+      from(a in Actor,
+        where: a.account_id == ^account_id,
+        where: a.type == :account_admin_user,
+        where: a.id != ^actor_id,
+        where: a.is_disabled == false
+      )
+      |> Safe.scoped(subject)
+      |> Safe.exists?()
+    end
+
+    def get_client_tokens_for_actor(actor_id, subject) do
+      tokens =
+        from(c in ClientToken, as: :client_tokens)
+        |> where([client_tokens: c], c.actor_id == ^actor_id)
+        |> order_by([client_tokens: c], desc: c.inserted_at)
+        |> Safe.scoped(subject)
+        |> Safe.all()
+
+      tokens
+      |> preload_last_used_devices_for_tokens(subject)
+      |> Presence.Devices.preload_client_tokens_presence()
+    end
+
+    defp preload_last_used_devices_for_tokens(tokens, subject) do
+      token_ids = Enum.map(tokens, & &1.id)
+
+      devices_by_token_id =
+        from(d in Device,
+          where: d.client_token_id in ^token_ids,
+          distinct: d.client_token_id,
+          order_by: [asc: d.client_token_id, desc: d.last_seen_at]
+        )
+        |> Safe.scoped(subject)
+        |> Safe.all()
+        |> Map.new(&{&1.client_token_id, &1})
+
+      Enum.map(tokens, fn token ->
+        %{token | last_used_device: Map.get(devices_by_token_id, token.id)}
+      end)
+    end
+
+    def get_identity_by_id(identity_id, subject) do
+      from(i in ExternalIdentity, as: :identities)
+      |> where([identities: i], i.id == ^identity_id)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    def get_client_token_by_id(token_id, subject) do
+      from(c in ClientToken, as: :client_tokens)
+      |> where([client_tokens: c], c.id == ^token_id)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    def get_portal_sessions_for_actor(actor_id, subject) do
+      from(ps in PortalSession, as: :portal_sessions)
+      |> where([portal_sessions: ps], ps.actor_id == ^actor_id)
+      |> join(:left, [portal_sessions: ps], ap in assoc(ps, :auth_provider),
+        on: ap.account_id == ps.account_id,
+        as: :auth_provider
+      )
+      |> select_merge([auth_provider: ap], %{
+        auth_provider_type: type(ap.type, :string),
+        auth_provider_name:
+          fragment(
+            """
+            COALESCE(
+              (SELECT name FROM google_auth_providers WHERE id = ?),
+              (SELECT name FROM github_auth_providers WHERE id = ?),
+              (SELECT name FROM entra_auth_providers WHERE id = ?),
+              (SELECT name FROM okta_auth_providers WHERE id = ?),
+              (SELECT name FROM oidc_auth_providers WHERE id = ?),
+              (SELECT name FROM userpass_auth_providers WHERE id = ?),
+              (SELECT name FROM email_otp_auth_providers WHERE id = ?)
+            )
+            """,
+            ap.id,
+            ap.id,
+            ap.id,
+            ap.id,
+            ap.id,
+            ap.id,
+            ap.id
+          )
+      })
+      |> order_by([portal_sessions: ps], desc: ps.inserted_at)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> Presence.PortalSessions.preload_portal_sessions_presence()
+    end
+
+    def get_portal_session_by_id(session_id, subject) do
+      from(ps in PortalSession, as: :portal_sessions)
+      |> where([portal_sessions: ps], ps.id == ^session_id)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+
+    def get_groups_for_actor(actor_id, subject) do
+      from(g in Portal.Group, as: :groups)
+      |> join(:inner, [groups: g], m in Portal.Membership,
+        on: m.group_id == g.id and m.account_id == g.account_id,
+        as: :membership
+      )
+      |> join(:left, [groups: g], d in assoc(g, :directory),
+        on: d.account_id == g.account_id,
+        as: :directory
+      )
+      |> join(:left, [directory: d], gd in Portal.Google.Directory,
+        on: gd.id == d.id and gd.account_id == d.account_id and d.type == :google,
+        as: :google_directory
+      )
+      |> join(:left, [directory: d], ed in Portal.Entra.Directory,
+        on: ed.id == d.id and ed.account_id == d.account_id and d.type == :entra,
+        as: :entra_directory
+      )
+      |> join(:left, [directory: d], od in Portal.Okta.Directory,
+        on: od.id == d.id and od.account_id == d.account_id and d.type == :okta,
+        as: :okta_directory
+      )
+      |> where([membership: m], m.actor_id == ^actor_id)
+      |> select(
+        [groups: g, directory: d, google_directory: gd, entra_directory: ed, okta_directory: od],
+        %{
+          group: g,
+          directory_type: d.type,
+          directory_name: fragment("COALESCE(?, ?, ?)", gd.name, ed.name, od.name)
+        }
+      )
+      |> order_by([groups: g], asc: g.name)
+      |> Safe.scoped(subject)
+      |> Safe.all()
+    end
+
+    def create(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    def create_service_account_with_token(changeset, token_expiration, subject, token_creator_fn) do
+      Safe.transact(fn ->
+        with {:ok, actor} <- create(changeset, subject),
+             {:ok, token_result} <- token_creator_fn.(actor, token_expiration, subject) do
+          {:ok, {actor, token_result}}
+        end
+      end)
+    end
+
+    def update(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.update()
+    end
+
+    def update_actor(changeset, subject) do
+      if Actor.email_meaningfully_changed?(changeset) do
+        Safe.transact(fn -> update_actor_and_clear_identities(changeset, subject) end)
+      else
+        update_actor_changeset(changeset, subject)
+      end
+    end
+
+    defp update_actor_changeset(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.update()
+    end
+
+    defp update_actor_and_clear_identities(changeset, subject) do
+      actor_id = changeset.data.id
+
+      with {:ok, actor} <- update_actor_changeset(changeset, subject),
+           {count, _} when is_integer(count) <- clear_identities_for_actor(actor_id, subject),
+           {count, _} when is_integer(count) <- clear_portal_sessions_for_actor(actor_id, subject),
+           {count, _} when is_integer(count) <- clear_client_tokens_for_actor(actor_id, subject) do
+        {:ok, actor}
+      end
+    end
+
+    defp clear_identities_for_actor(actor_id, subject) do
+      from(i in ExternalIdentity, where: i.actor_id == ^actor_id)
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+    end
+
+    defp clear_portal_sessions_for_actor(actor_id, subject) do
+      from(s in PortalSession, where: s.actor_id == ^actor_id)
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+    end
+
+    defp clear_client_tokens_for_actor(actor_id, subject) do
+      from(c in ClientToken, where: c.actor_id == ^actor_id)
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+    end
+
+    def delete(actor, subject) do
+      actor
+      |> Safe.scoped(subject)
+      |> Safe.delete()
+    end
+
+    @spec search_groups_for_actor(
+            String.t(),
+            Ecto.UUID.t() | nil,
+            Portal.Authentication.Subject.t()
+          ) ::
+            {:error, any()} | list(Portal.Group.t())
+    def search_groups_for_actor(search_term, actor_id, subject) do
+      query =
+        from(g in Portal.Group, as: :groups)
+        |> where([groups: g], g.type == :static)
+        |> where([groups: g], ilike(g.name, ^"%#{search_term}%"))
+        |> limit(10)
+
+      query =
+        if actor_id do
+          existing_group_ids =
+            from(m in Portal.Membership, where: m.actor_id == ^actor_id, select: m.group_id)
+
+          where(query, [groups: g], g.id not in subquery(existing_group_ids))
+        else
+          query
+        end
+
+      query
+      |> Safe.scoped(subject)
+      |> Safe.all()
+      |> case do
+        {:error, _} = err -> err
+        groups -> groups
+      end
+    end
+
+    @spec add_group_member(Ecto.UUID.t(), Portal.Actor.t(), Portal.Authentication.Subject.t()) ::
+            {:ok, Portal.Membership.t()} | {:error, Ecto.Changeset.t()}
+    def add_group_member(group_id, actor, subject) do
+      import Ecto.Changeset
+
+      %Portal.Membership{}
+      |> change(%{account_id: actor.account_id, group_id: group_id, actor_id: actor.id})
+      |> Portal.Membership.changeset()
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    @spec remove_group_member(Ecto.UUID.t(), Portal.Actor.t(), Portal.Authentication.Subject.t()) ::
+            {:ok, Portal.Membership.t()} | {:error, any()} | nil
+    def remove_group_member(group_id, actor, subject) do
+      with %Portal.Membership{} = membership <- fetch_membership(group_id, actor, subject) do
+        Safe.scoped(membership, subject) |> Safe.delete()
+      end
+    end
+
+    defp fetch_membership(group_id, actor, subject) do
+      from(m in Portal.Membership, as: :memberships)
+      |> where([memberships: m], m.group_id == ^group_id and m.actor_id == ^actor.id)
+      |> Safe.scoped(subject)
+      |> Safe.one()
+    end
+  end
+end

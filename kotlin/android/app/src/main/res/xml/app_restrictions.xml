@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <restriction
+        android:description="@string/config_token_description"
+        android:key="token"
+        android:restrictionType="string"
+        android:title="@string/config_token_title" />
+
+    <restriction
+        android:description="@string/config_allowed_applications_description"
+        android:key="allowedApplications"
+        android:restrictionType="string"
+        android:title="@string/config_allowed_applications_title" />
+
+    <restriction
+        android:description="@string/config_disallowed_applications_description"
+        android:key="disallowedApplications"
+        android:restrictionType="string"
+        android:title="@string/config_disallowed_applications_title" />
+
+    <restriction
+        android:description="@string/config_device_name_description"
+        android:key="deviceName"
+        android:restrictionType="string"
+        android:title="@string/config_device_name_title" />
+
+    <restriction
+        android:description="@string/config_auth_url_description"
+        android:key="authUrl"
+        android:restrictionType="string"
+        android:title="@string/config_auth_url_title" />
+
+    <restriction
+        android:description="@string/config_api_url_description"
+        android:key="apiUrl"
+        android:restrictionType="string"
+        android:title="@string/config_api_url_title" />
+
+    <restriction
+        android:description="@string/config_log_filter_description"
+        android:key="logFilter"
+        android:restrictionType="string"
+        android:title="@string/config_log_filter_title" />
+
+    <restriction
+        android:description="@string/config_account_slug_description"
+        android:key="accountSlug"
+        android:restrictionType="string"
+        android:title="@string/config_account_slug_title" />
+
+    <restriction
+        android:description="@string/config_start_on_login_description"
+        android:key="startOnLogin"
+        android:restrictionType="bool"
+        android:title="@string/config_start_on_login_title" />
+
+    <restriction
+        android:description="@string/config_connect_on_start_description"
+        android:key="connectOnStart"
+        android:restrictionType="bool"
+        android:title="@string/config_connect_on_start_title" />
+
+    <restriction
+        android:description="@string/config_x509_certificate_description"
+        android:key="deviceCertificate"
+        android:restrictionType="bool"
+        android:title="@string/config_x509_certificate_title" />
+</restrictions>

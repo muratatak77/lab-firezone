@@ -1,0 +1,60 @@
+[package]
+name = "firezone-relay"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true, features = ["http1", "tokio", "query"] }
+backoff = { workspace = true }
+bin-shared = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+eventloop-budget = { workspace = true }
+futures = { workspace = true }
+logging = { workspace = true }
+mimalloc = { workspace = true }
+mio = { workspace = true, features = ["net"] }
+opentelemetry = { workspace = true, features = ["metrics"] }
+opentelemetry-http = { workspace = true, features = ["reqwest-blocking"] }
+opentelemetry-otlp = { workspace = true, features = ["metrics", "grpc-tonic"] }
+opentelemetry_sdk = { workspace = true }
+otel-attributes = { workspace = true }
+otel-instruments = { workspace = true }
+phoenix-channel = { workspace = true }
+rand = { workspace = true }
+relay-proto = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "query", "rustls-no-provider"] }
+rustls = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+socket-factory = { workspace = true }
+socket2 = { workspace = true }
+stun_codec = { workspace = true }
+telemetry = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+tracing = { workspace = true, features = ["log"] }
+tracing-core = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json", "fmt"] }
+url = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+ebpf-shared = { workspace = true, features = ["std"] }
+mimalloc = { workspace = true, features = ["local_dynamic_tls"] } # `local_dynamic_tls` keeps the allocator's TLS model compatible with our static musl builds.
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing", "metrics"] }
+tokio = { workspace = true, features = ["process", "macros", "net"] }
+
+[lints]
+workspace = true

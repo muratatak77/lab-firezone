@@ -1,0 +1,1163 @@
+defmodule PortalWeb.LiveTableTest do
+  use PortalWeb.ConnCase, async: true
+  import PortalWeb.LiveTable
+  import Portal.SubjectFixtures
+
+  test "paginator displays capped counts and row ranges beyond the cap" do
+    metadata = %Portal.Repo.OffsetPaginator.Metadata{
+      count: 10_000,
+      count_limited: true,
+      offset: 10_000,
+      limit: 50,
+      previous_offset: 9950,
+      next_offset: 10_050
+    }
+
+    html = render_component(&paginator/1, id: "logs", metadata: metadata, rows_count: 50)
+
+    assert html
+           |> Floki.parse_fragment!()
+           |> Floki.text()
+           |> String.replace(~r/[\s]+/, " ") =~ "Showing 10001—10050 of 10,000+"
+  end
+
+  describe "<.live_table /> component" do
+    setup do
+      assigns = %{
+        id: "table-id",
+        filters: [],
+        filter: filter_to_form(%{}, "table-id"),
+        ordered_by: {:assoc, :name},
+        metadata: %{
+          previous_offset: nil,
+          next_offset: nil,
+          offset: 0,
+          limit: 10,
+          count: 1,
+          has_previous_page: false,
+          has_next_page: false
+        },
+        col: [
+          %{
+            label: "name",
+            field: {:assoc, :name},
+            inner_block: fn _col, row ->
+              row
+            end
+          }
+        ],
+        rows: ["foo"]
+      }
+
+      %{assigns: assigns}
+    end
+
+    test "renders a data table", %{assigns: assigns} do
+      html = render_component(&live_table/1, assigns)
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("table")
+             |> Floki.attribute("id") == ["table-id"]
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("table thead")
+             |> Floki.attribute("id") == ["table-id-header"]
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("th")
+             |> Floki.text() =~ "name"
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("table tbody")
+             |> Floki.attribute("id") == ["table-id-rows"]
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("td")
+             |> Floki.text() =~ "foo"
+    end
+
+    test "renders fulltext search filter", %{assigns: assigns} do
+      assigns = %{
+        assigns
+        | filters: [
+            %Portal.Repo.Filter{
+              name: :search,
+              title: "Query",
+              type: {:string, :websearch}
+            }
+          ],
+          filter: filter_to_form(%{search: "foo"}, "table-id")
+      }
+
+      form =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("form#table-id-filters")
+
+      assert Floki.attribute(form, "id") == ["table-id-filters"]
+      assert Floki.attribute(form, "phx-change") == ["filter"]
+
+      input = form |> Floki.find("input[type=hidden]")
+      assert Floki.attribute(input, "name") == ["table_id"]
+      assert Floki.attribute(input, "value") == ["table-id"]
+
+      input = form |> Floki.find("input[type=text]")
+      assert Floki.attribute(input, "id") == ["table-id_search"]
+      assert Floki.attribute(input, "name") == ["table-id[search]"]
+      assert Floki.attribute(input, "placeholder") == ["Search by Query"]
+      assert Floki.attribute(input, "value") == ["foo"]
+    end
+
+    test "renders compact protocol and port filter", %{assigns: assigns} do
+      assigns = %{
+        assigns
+        | filters: [
+            %Portal.Repo.Filter{
+              name: :protocol_port,
+              title: "Protocol / port",
+              type: {:string, :protocol_port}
+            }
+          ],
+          filter: filter_to_form(%{protocol_port: "tcp/443"}, "table-id")
+      }
+
+      input =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("form#table-id-filters input[type=text]")
+
+      assert Floki.attribute(input, "id") == ["table-id_protocol_port"]
+      assert Floki.attribute(input, "name") == ["table-id[protocol_port]"]
+      assert Floki.attribute(input, "placeholder") == ["Port or tcp/443"]
+      assert Floki.attribute(input, "value") == ["tcp/443"]
+    end
+
+    test "renders the time range dropdown and hides the pickers for a preset", %{
+      assigns: assigns
+    } do
+      assigns = time_range_assigns(assigns, filter_to_form(%{}, %{}, "table-id", timestamp: "24h"))
+
+      document = render_component(&live_table/1, assigns) |> Floki.parse_fragment!()
+      range = Floki.find(document, "form#table-id-filters #table-id-timestamp-range")
+
+      # `contents` removes the wrapper box, so each control is an item of the
+      # filter row and wraps on its own.
+      assert Floki.attribute(range, "class") == ["contents"]
+
+      options = Floki.find(range, "select[name='table-id[timestamp][preset]'] option")
+
+      assert Enum.map(options, &(&1 |> Floki.text() |> String.trim())) == [
+               "Last hour",
+               "Last 12 hours",
+               "Last 24 hours",
+               "Last 3 days",
+               "Last 7 days",
+               "Last 30 days",
+               "Custom"
+             ]
+
+      assert Enum.map(options, &(&1 |> Floki.attribute("value") |> hd())) ==
+               ["1h", "12h", "24h", "3d", "7d", "30d", "custom"]
+
+      assert [selected] = Floki.find(range, "option[selected]")
+      assert Floki.attribute(selected, "value") == ["24h"]
+
+      assert Floki.find(range, "input[type=radio]") != []
+      assert Floki.find(range, "input[type=datetime-local]") == []
+    end
+
+    test "shows the from and to pickers for the custom preset", %{assigns: assigns} do
+      range = %Portal.Repo.Filter.Range{
+        from: ~U[2026-07-29 10:00:00Z],
+        to: ~U[2026-07-30 10:00:00Z]
+      }
+
+      form = filter_to_form(%{timestamp: range}, %{}, "table-id", timestamp: "custom")
+
+      document =
+        render_component(&live_table/1, time_range_assigns(assigns, form))
+        |> Floki.parse_fragment!()
+
+      assert [selected] = Floki.find(document, "#table-id-timestamp-range option[selected]")
+      assert Floki.attribute(selected, "value") == ["custom"]
+      assert length(Floki.find(document, "input[type=datetime-local]")) == 2
+
+      assert Floki.attribute(document, "input[data-canonical='from']", "value") ==
+               ["2026-07-29T10:00:00"]
+
+      assert Floki.attribute(document, "input[data-canonical='to']", "value") ==
+               ["2026-07-30T10:00:00"]
+    end
+
+    test "the default preset is not an active filter", %{assigns: assigns} do
+      range = %Portal.Repo.Filter.Range{from: ~U[2026-07-29 10:00:00Z]}
+
+      default =
+        render_component(
+          &live_table/1,
+          time_range_assigns(
+            assigns,
+            filter_to_form(%{timestamp: range}, %{}, "table-id", timestamp: "24h")
+          )
+        )
+        |> Floki.parse_fragment!()
+
+      assert Floki.find(default, "button[title='Clear all filters']") == []
+
+      other =
+        render_component(
+          &live_table/1,
+          time_range_assigns(
+            assigns,
+            filter_to_form(%{timestamp: range}, %{}, "table-id", timestamp: "7d")
+          )
+        )
+        |> Floki.parse_fragment!()
+
+      assert [_] = Floki.find(other, "button[title='Clear all filters']")
+    end
+
+    test "uses the filtered empty hint when filters are active and nothing matches", %{
+      assigns: assigns
+    } do
+      assigns =
+        Map.merge(assigns, %{
+          rows: [],
+          filters: [
+            %Portal.Repo.Filter{name: :search, title: "Query", type: {:string, :websearch}}
+          ],
+          filter: filter_to_form(%{search: "foo"}, "table-id"),
+          filtered_empty_hint: "Try broadening the time window."
+        })
+
+      text =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("#table-id-empty")
+        |> Floki.text()
+
+      assert text =~ "No results found"
+      assert text =~ "Try broadening the time window."
+    end
+
+    test "shows a running query status while loading", %{assigns: assigns} do
+      html = render_component(&live_table/1, Map.merge(assigns, %{rows: [], loading: true}))
+      document = Floki.parse_fragment!(html)
+
+      assert [_] = Floki.find(document, "#table-id-loading[role='status']")
+      assert Floki.text(Floki.find(document, "#table-id-loading")) =~ "Running query"
+      assert Floki.find(document, "#table-id-empty") == []
+    end
+
+    test "shows skeleton rows while the first load is running", %{assigns: assigns} do
+      html = render_component(&live_table/1, Map.merge(assigns, %{rows: [], loading: true}))
+      document = Floki.parse_fragment!(html)
+
+      assert [_] = Floki.find(document, "#table-id-skeleton[aria-hidden='true']")
+      assert length(Floki.find(document, "#table-id-skeleton tr")) == 5
+      assert length(Floki.find(document, "#table-id-skeleton tr:first-child td")) == length(assigns.col)
+      assert Floki.find(document, "table.opacity-50") == []
+    end
+
+    test "dims loaded rows instead of showing skeleton rows on reload", %{assigns: assigns} do
+      html = render_component(&live_table/1, Map.merge(assigns, %{loading: true}))
+      document = Floki.parse_fragment!(html)
+
+      assert Floki.find(document, "#table-id-skeleton") == []
+      assert [_] = Floki.find(document, "table.opacity-50")
+      assert html =~ "foo"
+    end
+
+    test "shows no skeleton rows when the query timed out", %{assigns: assigns} do
+      html =
+        render_component(
+          &live_table/1,
+          Map.merge(assigns, %{loading: true, query_error: :query_timeout})
+        )
+
+      assert Floki.find(Floki.parse_fragment!(html), "#table-id-skeleton") == []
+    end
+
+    test "explains a timed out query and hides stale rows", %{assigns: assigns} do
+      html =
+        render_component(&live_table/1, Map.merge(assigns, %{query_error: :query_timeout}))
+
+      document = Floki.parse_fragment!(html)
+      text = document |> Floki.find("#table-id-query-timeout") |> Floki.text()
+
+      assert text =~ "Your query includes too many results"
+      assert text =~ "Try reducing the time window."
+      refute html =~ "foo"
+      assert Floki.find(document, "#table-id-loading") == []
+    end
+
+    test "adds per-row classes", %{assigns: assigns} do
+      html =
+        render_component(
+          &live_table/1,
+          Map.put(assigns, :row_class, fn "foo" -> "bg-brand-muted" end)
+        )
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("#table-id-rows > tr")
+             |> Floki.attribute("class")
+             |> Enum.any?(&String.contains?(&1, "bg-brand-muted"))
+    end
+
+    test "renders email filter", %{assigns: assigns} do
+      assigns = %{
+        assigns
+        | filters: [
+            %Portal.Repo.Filter{
+              name: :email,
+              title: "Email",
+              type: {:string, :email}
+            }
+          ],
+          filter: filter_to_form(%{email: "foo@bar.com"}, "table-id")
+      }
+
+      form =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("form#table-id-filters")
+
+      assert Floki.attribute(form, "id") == ["table-id-filters"]
+      assert Floki.attribute(form, "phx-change") == ["filter"]
+
+      input = form |> Floki.find("input[type=hidden]")
+      assert Floki.attribute(input, "name") == ["table_id"]
+      assert Floki.attribute(input, "value") == ["table-id"]
+
+      input = form |> Floki.find("input[type=text]")
+      assert Floki.attribute(input, "id") == ["table-id_email"]
+      assert Floki.attribute(input, "name") == ["table-id[email]"]
+      assert Floki.attribute(input, "placeholder") == ["Search by Email"]
+      assert Floki.attribute(input, "value") == ["foo@bar.com"]
+    end
+
+    test "renders UUID dropdown filter", %{assigns: assigns} do
+      assigns = %{
+        assigns
+        | filters: [
+            %Portal.Repo.Filter{
+              name: :id,
+              title: "ID",
+              type: {:string, :uuid},
+              values: [
+                {"group1", [{"One", "1"}]},
+                {"group1", [{"Two", "2"}]},
+                {nil, [{"Three", "3"}]}
+              ]
+            }
+          ],
+          filter: filter_to_form(%{id: "1"}, "table-id")
+      }
+
+      form =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("form#table-id-filters")
+
+      assert Floki.attribute(form, "id") == ["table-id-filters"]
+      assert Floki.attribute(form, "phx-change") == ["filter"]
+
+      input = form |> Floki.find("input[type=hidden]")
+      assert Floki.attribute(input, "name") == ["table_id"]
+      assert Floki.attribute(input, "value") == ["table-id"]
+
+      select = form |> Floki.find("select")
+      assert Floki.attribute(select, "id") == ["table-id_id"]
+      assert Floki.attribute(select, "name") == ["table-id[id]"]
+
+      assert select |> List.first() |> elem(2) == [
+               {"option", [{"value", ""}], ["For any ID"]},
+               {"optgroup", [{"label", "group1"}],
+                [{"option", [{"selected", "selected"}, {"value", "1"}], ["One"]}]},
+               {"optgroup", [{"label", "group1"}], [{"option", [{"value", "2"}], ["Two"]}]},
+               {"option", [{"value", "3"}], ["Three"]}
+             ]
+    end
+
+    test "renders radio buttons for select from up to 5 values", %{assigns: assigns} do
+      assigns = %{
+        assigns
+        | filters: [
+            %Portal.Repo.Filter{
+              name: :btn,
+              title: "Button",
+              type: :string,
+              values: [
+                {"One", "1"},
+                {"Two", "2"}
+              ]
+            }
+          ],
+          filter: filter_to_form(%{id: "1"}, "table-id")
+      }
+
+      form =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("form#table-id-filters")
+
+      assert Floki.attribute(form, "id") == ["table-id-filters"]
+      assert Floki.attribute(form, "phx-change") == ["filter"]
+
+      input = form |> Floki.find("input[type=hidden]")
+      assert Floki.attribute(input, "name") == ["table_id"]
+      assert Floki.attribute(input, "value") == ["table-id"]
+
+      radio = form |> Floki.find("input[type=radio]")
+
+      assert Floki.attribute(radio, "id") == [
+               "table-id-btn-__all__",
+               "table-id-btn-1",
+               "table-id-btn-2"
+             ]
+
+      assert Floki.attribute(radio, "name") == [
+               "_reset:table-id[btn]",
+               "table-id[btn]",
+               "table-id[btn]"
+             ]
+
+      assert Floki.attribute(radio, "value") == [
+               "true",
+               "1",
+               "2"
+             ]
+    end
+
+    test "renders value dropdown when there are more than 5 values", %{assigns: assigns} do
+      assigns = %{
+        assigns
+        | filters: [
+            %Portal.Repo.Filter{
+              name: :select,
+              title: "Select",
+              type: :string,
+              values: [
+                {"One", "1"},
+                {"Two", "2"},
+                {"Three", "3"},
+                {"Four", "4"},
+                {"Five", "5"},
+                {"Six", "6"}
+              ]
+            }
+          ],
+          filter: filter_to_form(%{id: "1"}, "table-id")
+      }
+
+      form =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+        |> Floki.find("form#table-id-filters")
+
+      assert Floki.attribute(form, "id") == ["table-id-filters"]
+      assert Floki.attribute(form, "phx-change") == ["filter"]
+
+      input = form |> Floki.find("input[type=hidden]")
+      assert Floki.attribute(input, "name") == ["table_id"]
+      assert Floki.attribute(input, "value") == ["table-id"]
+
+      select = form |> Floki.find("select")
+      assert Floki.attribute(select, "id") == ["table-id_select"]
+      assert Floki.attribute(select, "name") == ["table-id[select]"]
+
+      assert select |> List.first() |> elem(2) == [
+               {"option", [{"value", ""}, {"selected", "selected"}], ["For any Select"]},
+               {"option", [{"value", "1"}], ["One"]},
+               {"option", [{"value", "2"}], ["Two"]},
+               {"option", [{"value", "3"}], ["Three"]},
+               {"option", [{"value", "4"}], ["Four"]},
+               {"option", [{"value", "5"}], ["Five"]},
+               {"option", [{"value", "6"}], ["Six"]}
+             ]
+    end
+
+    test "renders ordering buttons", %{assigns: assigns} do
+      # default order when it's unset
+      html = render_component(&live_table/1, assigns)
+      order_button = html |> Floki.parse_fragment!() |> Floki.find("th button")
+      assert Floki.attribute(order_button, "phx-click") == ["order_by"]
+      assert Floki.attribute(order_button, "phx-value-table_id") == ["table-id"]
+      assert Floki.attribute(order_button, "phx-value-order_by") == ["assoc:asc:name"]
+
+      # current order if it's set
+      assigns = %{assigns | ordered_by: {:assoc, :desc, :name}}
+      html = render_component(&live_table/1, assigns)
+      order_button = html |> Floki.parse_fragment!() |> Floki.find("th button")
+      assert Floki.attribute(order_button, "phx-value-order_by") == ["assoc:desc:name"]
+    end
+
+    test "renders page size selector and record range", %{assigns: assigns} do
+      assert render_component(&live_table/1, assigns)
+             |> Floki.parse_fragment!()
+             |> Floki.text()
+             |> String.replace(~r/[\s]+/, " ") =~ "Showing 1—1 of 1"
+
+      assert render_component(&live_table/1, %{
+               assigns
+               | metadata: %{assigns.metadata | count: 10, limit: 100},
+                 rows: Enum.map(1..10, fn _i -> ["foo"] end)
+             })
+             |> Floki.parse_fragment!()
+             |> Floki.text()
+             |> String.replace(~r/[\s]+/, " ") =~ "Showing 1—10 of 10"
+
+      assert render_component(&live_table/1, %{
+               assigns
+               | metadata: %{assigns.metadata | count: 100, limit: 10, offset: 20},
+                 rows: Enum.map(1..10, fn _i -> ["foo"] end)
+             })
+             |> Floki.parse_fragment!()
+             |> Floki.text()
+             |> String.replace(~r/[\s]+/, " ") =~ "Showing 21—30 of 100"
+    end
+
+    test "renders page size selector wired to change_limit", %{assigns: assigns} do
+      html =
+        render_component(&live_table/1, assigns)
+        |> Floki.parse_fragment!()
+      form = Floki.find(html, "form#table-id-pagination")
+      select = Floki.find(html, "select[name='page_size']")
+      hidden_input = Floki.find(html, "input[type='hidden'][name='table_id']")
+
+      assert Floki.attribute(form, "phx-change") == ["change_limit"]
+      assert Floki.attribute(hidden_input, "value") == ["table-id"]
+      assert Floki.attribute(select, "name") == ["page_size"]
+    end
+
+    test "renders pagination buttons", %{assigns: assigns} do
+      html = render_component(&live_table/1, assigns)
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("button[phx-click='paginate']")
+             |> Floki.attribute("disabled") == ["disabled", "disabled"]
+
+      assigns = %{assigns | metadata: %{assigns.metadata | next_offset: 10, has_next_page: true}}
+      html = render_component(&live_table/1, assigns)
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("button[phx-click='paginate']")
+             |> Floki.attribute("disabled") == ["disabled"]
+
+      enabled_button =
+        html
+        |> Floki.parse_fragment!()
+        |> Floki.find("button[phx-click='paginate']:not([disabled])")
+
+      assert Floki.attribute(enabled_button, "phx-click") == ["paginate"]
+      assert Floki.attribute(enabled_button, "phx-value-page") == ["2"]
+      assert Floki.attribute(enabled_button, "phx-value-table_id") == ["table-id"]
+
+      assigns = %{assigns | metadata: %{assigns.metadata | previous_offset: 0, has_previous_page: true}}
+      html = render_component(&live_table/1, assigns)
+
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("button[phx-click='paginate']")
+             |> Floki.attribute("disabled") == []
+
+      enabled_button =
+        html
+        |> Floki.parse_fragment!()
+        |> Floki.find("button[phx-click='paginate']:not([disabled])")
+
+      assert "1" in Floki.attribute(enabled_button, "phx-value-page")
+    end
+
+    test "does not render pagination when table is empty", %{assigns: assigns} do
+      assigns = %{assigns | rows: []}
+      html = render_component(&live_table/1, assigns)
+
+      # Should not find any paginate buttons when table is empty
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("button[phx-click='paginate']") == []
+    end
+  end
+
+  describe "assign_live_table/3" do
+    setup do
+      subject = subject_fixture()
+      socket = %Phoenix.LiveView.Socket{assigns: %{subject: subject, __changed__: %{}}}
+      %{socket: socket}
+    end
+
+    test "persists live table state in the socket", %{socket: socket} do
+      assert %{
+               assigns: %{
+                 __changed__: %{
+                   live_table_ids: true,
+                   callback_by_table_id: true,
+                   sortable_fields_by_table_id: true,
+                   filters_by_table_id: true,
+                   enforced_filters_by_table_id: true,
+                   limit_by_table_id: true
+                 },
+                 live_table_ids: ["table-id"],
+                 callback_by_table_id: %{"table-id" => _fun},
+                 sortable_fields_by_table_id: %{"table-id" => [actors: :name]},
+                 filters_by_table_id: %{"table-id" => []},
+                 enforced_filters_by_table_id: %{},
+                 limit_by_table_id: %{}
+               }
+             } =
+               assign_live_table(socket, "table-id",
+                 query_module: Actor.Query,
+                 sortable_fields: [
+                   {:actors, :name}
+                 ],
+                 callback: fn socket, list_opts ->
+                   {:ok, %{socket | private: %{list_opts: list_opts}}}
+                 end
+               )
+
+      assert %{
+               assigns: %{
+                 __changed__: %{
+                   live_table_ids: true,
+                   callback_by_table_id: true,
+                   sortable_fields_by_table_id: true,
+                   filters_by_table_id: true,
+                   enforced_filters_by_table_id: true,
+                   limit_by_table_id: true
+                 },
+                 live_table_ids: ["table-id"],
+                 callback_by_table_id: %{"table-id" => _fun},
+                 sortable_fields_by_table_id: %{"table-id" => [actors: :name]},
+                 filters_by_table_id: %{"table-id" => []},
+                 enforced_filters_by_table_id: %{"table-id" => [name: "foo"]},
+                 limit_by_table_id: %{"table-id" => 11}
+               }
+             } =
+               assign_live_table(socket, "table-id",
+                 query_module: Actor.Query,
+                 sortable_fields: [
+                   {:actors, :name}
+                 ],
+                 enforce_filters: [
+                   {:name, "foo"}
+                 ],
+                 hide_filters: [:email],
+                 limit: 11,
+                 callback: fn socket, list_opts ->
+                   {:ok, %{socket | private: %{list_opts: list_opts}}}
+                 end
+               )
+    end
+
+    test "uses browser page size preference from connect params", %{socket: socket} do
+      socket = %{socket | private: %{connect_params: %{"page_size" => "25"}}}
+
+      assert %{
+               assigns: %{
+                 limit_by_table_id: %{"table-id" => 25}
+               }
+             } =
+               assign_live_table(socket, "table-id",
+                 query_module: Actor.Query,
+                 sortable_fields: [
+                   {:actors, :name}
+                 ],
+                 callback: fn socket, list_opts ->
+                   {:ok, %{socket | private: %{list_opts: list_opts}}}
+                 end
+               )
+    end
+  end
+
+  describe "reload_live_table!/2" do
+    test "reloads the live table" do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn socket, list_opts ->
+            {:ok, %{socket | private: %{list_opts: list_opts}}}
+          end
+        )
+
+      assert %{
+               private: %{list_opts: []}
+             } = reload_live_table!(socket, "table-id")
+    end
+
+    test "reloads whole page on errors" do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns("/current_uri")
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn _socket, _list_opts -> {:error, :not_found} end
+        )
+
+      assert %{
+               redirected: {:live, :redirect, %{kind: :push, to: "/current_uri"}}
+             } = reload_live_table!(socket, "table-id")
+    end
+  end
+
+  describe "mark_stale_unless_reflected/4" do
+    setup do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{assigns: %{subject: subject, __changed__: %{}}}
+        |> put_uri_assigns("/current_uri")
+        |> Phoenix.Component.assign(stale: false)
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [{:actors, :name}],
+          callback: fn socket, list_opts -> {:ok, %{socket | private: %{list_opts: list_opts}}} end
+        )
+
+      actor = %Portal.Actor{id: Ecto.UUID.generate(), name: "Inserted"}
+
+      %{socket: socket, actor: actor}
+    end
+
+    test "leaves the table alone when the rows reflect the change", %{socket: socket, actor: actor} do
+      change = %Portal.Changes.Change{op: :insert, struct: actor}
+
+      socket = mark_stale_unless_reflected(socket, "table-id", [actor], change)
+
+      refute socket.assigns.stale
+    end
+
+    test "flags the table stale when the rows miss the change", %{socket: socket, actor: actor} do
+      change = %Portal.Changes.Change{op: :insert, struct: actor}
+
+      socket = mark_stale_unless_reflected(socket, "table-id", [], change)
+
+      assert socket.assigns.stale
+    end
+
+    test "restarts a running load instead of flagging the table stale", %{
+      socket: socket,
+      actor: actor
+    } do
+      change = %Portal.Changes.Change{op: :insert, struct: actor}
+      socket = Phoenix.Component.assign(socket, loading_by_table_id: %{"table-id" => true})
+
+      socket = mark_stale_unless_reflected(socket, "table-id", [], change)
+
+      refute socket.assigns.stale
+      assert %{list_opts: []} = socket.private
+    end
+  end
+
+  describe "handle_live_tables_params/3" do
+    setup do
+      subject = subject_fixture()
+
+      test_pid = self()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns("/actors")
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn socket, list_opts ->
+            send(test_pid, {:callback, socket, list_opts})
+            {:ok, %{socket | private: %{list_opts: list_opts}}}
+          end
+        )
+
+      %{socket: socket}
+    end
+
+    test "assigns the live table data from callbacks", %{socket: socket} do
+      assert %{
+               assigns: %{
+                 current_path: "/actors"
+               },
+               private: %{
+                 list_opts: [
+                   page: [offset: 0, limit: 10],
+                   filter: [],
+                   order_by: []
+                 ]
+               }
+             } = handle_live_tables_params(socket, %{}, "/actors")
+
+      assert %{
+               assigns: %{
+                 current_path: "/actors"
+               },
+               private: %{
+                 list_opts: [
+                   page: [offset: 10, limit: 10],
+                   filter: [{:name, "foo"}],
+                   order_by: [{:actors, :asc, :name}]
+                 ]
+               }
+             } =
+               handle_live_tables_params(
+                 socket,
+                 %{
+                   "table-id_page" => "2",
+                   "table-id_filter" => %{"name" => "foo"},
+                   "table-id_order_by" => "actors:asc:name"
+                 },
+                 "/actors"
+               )
+    end
+
+    test "does nothing when list opts are not changed", %{socket: socket} do
+      socket = handle_live_tables_params(socket, %{}, "/actors")
+      assert_receive {:callback, _socket, [page: [offset: 0, limit: 10], filter: [], order_by: []]}
+
+      handle_live_tables_params(socket, %{}, "/actors")
+      refute_receive {:callback, _socket, _list_opts}
+    end
+
+    test "raises if the table params are invalid" do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}, flash: %{}}
+        }
+        |> put_uri_assigns("/current_uri")
+
+      for {reason, message} <- [
+            {:invalid_page, "The page was reset due to invalid pagination page."},
+            {{:unknown_filter, []},
+             "The page was reset due to use of undefined pagination filter."},
+            {{:invalid_type, []},
+             "The page was reset due to invalid value of a pagination filter."},
+            {{:invalid_value, []},
+             "The page was reset due to invalid value of a pagination filter."}
+          ] do
+        socket =
+          assign_live_table(socket, "table-id",
+            query_module: Actor.Query,
+            sortable_fields: [
+              {:actors, :name}
+            ],
+            callback: fn _socket, _list_opts -> {:error, reason} end
+          )
+
+        socket = handle_live_tables_params(socket, %{}, "/foo")
+        assert socket.assigns.flash == %{"error" => message}
+      end
+    end
+
+    test "raises if the callback returns a generic error" do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns("/current_uri")
+
+      for {reason, exception} <- [
+            {:not_found, PortalWeb.LiveErrors.NotFoundError},
+            {:unauthorized, PortalWeb.LiveErrors.NotFoundError}
+          ] do
+        socket =
+          assign_live_table(socket, "table-id",
+            query_module: Actor.Query,
+            sortable_fields: [
+              {:actors, :name}
+            ],
+            callback: fn _socket, _list_opts -> {:error, reason} end
+          )
+
+        assert_raise exception, fn ->
+          handle_live_tables_params(socket, %{}, "/foo")
+        end
+      end
+    end
+  end
+
+  describe "handle_live_table_event/3 for pagination" do
+    setup do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns(
+          "/actors?table-id_page=2" <>
+            "&table-id_filter%5Bname%5D=buz" <>
+            "&table-id_order_by=actors%3Aasc%3Aname"
+        )
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn socket, list_opts ->
+            {:ok, %{socket | private: %{list_opts: list_opts}}}
+          end
+        )
+
+      %{socket: socket}
+    end
+
+    test "updates query parameters with new page", %{socket: socket} do
+      assert handle_live_table_event(
+               "paginate",
+               %{"table_id" => "table-id", "page" => "3"},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
+               "table-id_order_by" => "actors:asc:name",
+               "table-id_page" => "3",
+               "table-id_filter[name]" => "buz"
+             }
+    end
+  end
+
+  describe "handle_live_table_event/3 for page size" do
+    setup do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns(
+          "/actors?table-id_page=2" <>
+            "&table-id_filter%5Bname%5D=buz" <>
+            "&table-id_order_by=actors%3Aasc%3Aname"
+        )
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn socket, list_opts ->
+            {:ok, %{socket | private: %{list_opts: list_opts}}}
+          end
+        )
+
+      %{socket: socket}
+    end
+
+    test "updates query parameters with new page size and resets the page", %{socket: socket} do
+      assert handle_live_table_event(
+               "change_limit",
+               %{"table_id" => "table-id", "page_size" => "25"},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
+               "table-id_filter[name]" => "buz",
+               "table-id_page_size" => "25",
+               "table-id_order_by" => "actors:asc:name"
+             }
+    end
+  end
+
+  describe "handle_live_table_event/3 for filtering" do
+    setup do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns(
+          "/actors?table-id_page=2" <>
+            "&table-id_filter%5Bemail%5D=bar" <>
+            "&table-id_filter%5Bname%5D=buz" <>
+            "&table-id_order_by=actors%3Aasc%3Aname"
+        )
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn socket, list_opts ->
+            {:ok, %{socket | private: %{list_opts: list_opts}}}
+          end
+        )
+
+      %{socket: socket}
+    end
+
+    test "resets the query parameters with filter value is set to all", %{socket: socket} do
+      assert handle_live_table_event(
+               "filter",
+               %{"table_id" => "table-id", "_target" => ["_reset:table-id", "name"]},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
+               "table-id_filter[email]" => "bar",
+               "table-id_order_by" => "actors:asc:name"
+             }
+    end
+
+    test "updates query parameters with new filter and resets the page", %{socket: socket} do
+      assert handle_live_table_event(
+               "filter",
+               %{"table_id" => "table-id", "table-id" => %{"name" => "foo", "email" => "bar"}},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
+               "table-id_filter[email]" => "bar",
+               "table-id_filter[name]" => "foo",
+               "table-id_order_by" => "actors:asc:name"
+             }
+    end
+
+    test "clears all filter parameters when filter is empty", %{socket: socket} do
+      assert handle_live_table_event(
+               "filter",
+               %{"table_id" => "table-id"},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
+               "table-id_order_by" => "actors:asc:name"
+             }
+    end
+  end
+
+  describe "handle_live_table_event/3 for ordering" do
+    setup do
+      subject = subject_fixture()
+
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{subject: subject, __changed__: %{}}
+        }
+        |> put_uri_assigns(
+          "/actors?table-id_page=2&table-id_filter%5Bname%5D=bar&table-id_order_by=actors%3Aasc%3Aname"
+        )
+        |> assign_live_table("table-id",
+          query_module: Actor.Query,
+          sortable_fields: [
+            {:actors, :name}
+          ],
+          callback: fn socket, list_opts ->
+            {:ok, %{socket | private: %{list_opts: list_opts}}}
+          end
+        )
+
+      %{socket: socket}
+    end
+
+    test "updates query parameters with reverse order and resets the page", %{socket: socket} do
+      assert handle_live_table_event(
+               "order_by",
+               %{"table_id" => "table-id", "order_by" => "actors:desc:name"},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
+               "table-id_filter[name]" => "bar",
+               "table-id_order_by" => "actors:asc:name"
+             }
+    end
+  end
+
+  describe "live_table_path/3" do
+    setup do
+      socket =
+        %Phoenix.LiveView.Socket{
+          assigns: %{__changed__: %{}, live_table_ids: ["actors", "groups"]}
+        }
+        |> put_uri_assigns(
+          "/acc/actors/1?actors_page=2" <>
+            "&actors_filter%5Bname%5D=buz" <>
+            "&actors_order_by=actors%3Aasc%3Aname" <>
+            "&groups_page_size=25" <>
+            "&tab=groups&page=3&return_to=%2Facc%2Fgroups"
+        )
+
+      %{socket: socket}
+    end
+
+    test "keeps table state and return_to but drops panel keys", %{socket: socket} do
+      assert {"/acc/actors/new", query} = split_path(live_table_path(socket, "/acc/actors/new"))
+
+      assert query == %{
+               "actors_page" => "2",
+               "actors_filter[name]" => "buz",
+               "actors_order_by" => "actors:asc:name",
+               "groups_page_size" => "25",
+               "return_to" => "/acc/groups"
+             }
+    end
+
+    test "merges extra params and drops nil values", %{socket: socket} do
+      {_path, query} =
+        split_path(live_table_path(socket, "/acc/actors/1", tab: "groups", page: nil))
+
+      assert query["tab"] == "groups"
+      refute Map.has_key?(query, "page")
+      assert query["actors_filter[name]"] == "buz"
+    end
+
+    test "returns the bare path when there is nothing to carry" do
+      socket =
+        %Phoenix.LiveView.Socket{assigns: %{__changed__: %{}, live_table_ids: ["actors"]}}
+        |> put_uri_assigns("/acc/actors?tab=groups")
+
+      assert live_table_path(socket, "/acc/actors/new") == "/acc/actors/new"
+    end
+
+    test "accepts template assigns", %{socket: socket} do
+      assert live_table_path(socket.assigns, "/acc/actors/new") ==
+               live_table_path(socket, "/acc/actors/new")
+    end
+  end
+
+  defp split_path(path) do
+    %URI{path: path, query: query} = URI.parse(path)
+    {path, URI.decode_query(query || "")}
+  end
+
+  defp fetch_patched_query_params!(socket) do
+    assert {:noreply, %{redirected: {:live, :patch, %{kind: :push, to: to}}}} = socket
+    uri = URI.parse(to)
+    URI.decode_query(uri.query)
+  end
+
+  defp time_range_assigns(assigns, form) do
+    %{
+      assigns
+      | filters: [
+          %Portal.Repo.Filter{
+            name: :timestamp,
+            title: "Timestamp",
+            type: {:range, :datetime}
+          }
+        ],
+        filter: form
+    }
+  end
+end

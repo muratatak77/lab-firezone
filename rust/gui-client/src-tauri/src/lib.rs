@@ -1,0 +1,69 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::unwrap_in_result))]
+
+/// One-shot migration of MDM policy from the per-user registry hive into the
+/// machine-scope hive, owned by the Tunnel service.
+// TODO: remove once all clients have migrated.
+#[cfg(target_os = "windows")]
+mod mdm_migration;
+pub mod updates;
+mod uptime;
+mod view;
+
+pub use view::export_bindings;
+
+// TODO: See how many of these we can make private.
+pub mod auth;
+pub mod controller;
+pub mod deep_link;
+pub mod dialog;
+pub mod elevation;
+pub mod gui;
+pub mod launch_lock;
+pub mod logging;
+#[cfg(debug_assertions)]
+pub mod mock_tunnel;
+pub mod package_identity;
+pub mod service;
+pub mod settings;
+
+/// Bundle ID / App ID that the client uses to distinguish itself from other programs on the system
+///
+/// This should be identical to the `tauri.bundle.identifier` over in `tauri.conf.json`,
+/// but sometimes I need to use this before Tauri has booted up, or in a place where
+/// getting the Tauri app handle would be awkward.
+///
+/// Note: under the sparse MSIX identity this is *not* the
+/// AppUserModelId Windows uses to label notifications; that is derived
+/// from [`PACKAGE_FAMILY_NAME`] in `gui::os::notification_app_id`. It is
+/// still used as the toast AUMID for un-packaged dev builds, which have
+/// no package identity.
+pub const BUNDLE_ID: &str = "dev.firezone.client";
+
+/// The Sentry "release" we are part of.
+///
+/// Tunnel service and GUI client are always bundled into a single release.
+/// Hence, we have a single constant for Tunnel service and GUI client.
+pub const RELEASE: &str = concat!("gui-client@", env!("CARGO_PKG_VERSION"));
+
+/// Whether `FIREZONE_NO_TELEMETRY` was set when this binary was built.
+///
+/// CI stamps it into every build that is not a release, so the smoke test, the
+/// install test and any artifact from a pull request stay silent even where nothing
+/// sets the variable at run time.
+pub const NO_TELEMETRY: bool = cfg!(no_telemetry);
+
+pub const FIREZONE_CLIENT_GROUP: &str = "firezone-client";
+
+pub use windows_package_identity::PACKAGE_FAMILY_NAME;
+
+#[cfg(target_os = "linux")]
+pub fn firezone_client_group() -> anyhow::Result<nix::unistd::Group> {
+    use anyhow::Context as _;
+
+    let group = nix::unistd::Group::from_name(FIREZONE_CLIENT_GROUP)
+        .context("can't get group by name")?
+        .with_context(|| format!("`{FIREZONE_CLIENT_GROUP}` group must exist on the system"))?;
+
+    Ok(group)
+}

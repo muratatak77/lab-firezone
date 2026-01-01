@@ -1,0 +1,115 @@
+defmodule PortalAPI.Integrations.AzureCommunicationServices.WebhookController do
+  use PortalAPI, :controller
+
+  alias Portal.AzureCommunicationServices
+  require Logger
+
+  def handle_webhook(conn, _params) do
+    case get_req_header(conn, "aeg-event-type") do
+      [event_type] ->
+        case authenticate(conn, event_type) do
+          :ok ->
+            handle_body(conn, event_type)
+
+          {:error, :invalid_secret} ->
+            Logger.warning("ACS Event Grid webhook failed authentication")
+            send_resp(conn, 401, "Unauthorized")
+        end
+
+      [] ->
+        Logger.warning("ACS Event Grid webhook rejected", reason: :missing_event_type)
+        send_resp(conn, 400, "Bad Request: missing aeg-event-type header")
+
+      [_ | _] ->
+        Logger.warning("ACS Event Grid webhook rejected", reason: :multiple_event_types)
+        send_resp(conn, 400, "Bad Request: invalid aeg-event-type header")
+    end
+  end
+
+  defp handle_body(conn, event_type) do
+    case read_body(conn) do
+      {:ok, body, conn} ->
+        Portal.Conn.wrap_errors(conn, &dispatch_body(&1, event_type, body))
+
+      {:more, _, conn} ->
+        send_resp(conn, 413, "Request Entity Too Large")
+
+      {:error, reason} ->
+        Logger.error("ACS Event Grid webhook body could not be read", reason: inspect(reason))
+        send_resp(conn, 500, "Internal Error")
+    end
+  end
+
+  defp dispatch_body(conn, event_type, body) do
+    with {:ok, events} <- decode_events(body) do
+      case dispatch_event_type(conn, event_type, events) do
+        {:error, :invalid_validation_event} ->
+          send_resp(conn, 400, "Bad Request: invalid validation event")
+
+        {:error, reason} ->
+          Logger.error("ACS Event Grid webhook failed", reason: inspect(reason))
+          send_resp(conn, 500, "Internal Error")
+
+        conn ->
+          conn
+      end
+    else
+      {:error, :invalid_json} ->
+        send_resp(conn, 400, "Bad Request: invalid JSON")
+    end
+  end
+
+  defp dispatch_event_type(conn, "SubscriptionValidation", events) do
+    case validation_code(events) do
+      {:ok, code} -> json(conn, %{validationResponse: code})
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp dispatch_event_type(conn, "Notification", events) do
+    with :ok <- AzureCommunicationServices.handle_event_grid_events(events) do
+      send_resp(conn, 200, "")
+    end
+  end
+
+  defp dispatch_event_type(conn, "Unsubscribe", _events) do
+    send_resp(conn, 200, "")
+  end
+
+  defp dispatch_event_type(conn, _event_type, _events) do
+    send_resp(conn, 400, "Bad Request: unsupported aeg-event-type")
+  end
+
+  # Only Notification events carry the shared secret. Event Grid's validation
+  # handshake and unsubscribe notice do not.
+  defp authenticate(conn, "Notification"), do: verify_secret(conn)
+  defp authenticate(_conn, _event_type), do: :ok
+
+  defp verify_secret(conn) do
+    with secret when is_binary(secret) <-
+           AzureCommunicationServices.event_grid_webhook_signing_secret(),
+         [key] when is_binary(key) <- get_req_header(conn, "aeg-sas-key"),
+         true <- Plug.Crypto.secure_compare(key, secret) do
+      :ok
+    else
+      nil ->
+        Logger.error("ACS Event Grid webhook secret is not configured")
+        {:error, :invalid_secret}
+
+      _ ->
+        {:error, :invalid_secret}
+    end
+  end
+
+  defp validation_code([%{"data" => %{"validationCode" => code}} | _]) when is_binary(code),
+    do: {:ok, code}
+
+  defp validation_code(_events), do: {:error, :invalid_validation_event}
+
+  defp decode_events(body) do
+    case JSON.decode(body) do
+      {:ok, events} -> {:ok, events}
+      {:error, _reason} -> {:error, :invalid_json}
+    end
+  end
+end

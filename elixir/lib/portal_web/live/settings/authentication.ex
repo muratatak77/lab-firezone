@@ -1,0 +1,2464 @@
+defmodule PortalWeb.Settings.Authentication do
+  use PortalWeb, :live_view
+  alias Portal.Authentication.Credential
+
+  alias Portal.{
+    AuthProvider,
+    EmailOTP,
+    Userpass,
+    OIDC,
+    Entra,
+    Google,
+    GitHub,
+    Okta
+  }
+
+  alias PortalWeb.Settings.Components, as: SettingsComponents
+  alias __MODULE__.Database
+
+  import Ecto.Changeset
+
+  require Logger
+
+  @invalid_json_error_message "Discovery document contains invalid JSON. Please verify the Discovery Document URI returns valid OpenID Connect configuration."
+
+  @context_options [
+    {"Client Applications and Admin Portal", "clients_and_portal"},
+    {"Client Applications Only", "clients_only"},
+    {"Admin Portal Only", "portal_only"}
+  ]
+
+  @select_type_classes [
+    "flex items-center w-full p-4 rounded border transition-colors cursor-pointer",
+    "border-border bg-surface",
+    "hover:bg-raised hover:border-border-emphasis"
+  ]
+
+  @new_types ~w[google github entra okta oidc]
+  @edit_types @new_types ++ ~w[userpass email_otp]
+
+  @common_fields ~w[name context is_disabled issuer client_session_lifetime_secs portal_session_lifetime_secs]a
+
+  @fields %{
+    EmailOTP.AuthProvider => @common_fields,
+    Userpass.AuthProvider => @common_fields,
+    Google.AuthProvider => @common_fields ++ ~w[is_verified]a,
+    GitHub.AuthProvider => @common_fields ++ ~w[is_verified email_verification_method]a,
+    Entra.AuthProvider =>
+      (@common_fields -- [:issuer]) ++ ~w[is_verified email_claim sign_in_tenant_id]a,
+    Okta.AuthProvider => @common_fields ++ ~w[okta_domain client_id client_secret is_verified]a,
+    OIDC.AuthProvider =>
+      @common_fields ++
+        ~w[discovery_document_uri client_id client_secret email_verification_method is_verified is_legacy]a
+  }
+
+  def mount(_params, _session, socket) do
+    socket =
+      assign(socket,
+        page_title: "Authentication",
+        x509_auth_enabled?: Portal.Features.enabled?(:x509_auth)
+      )
+
+    if connected?(socket) do
+      :ok = Portal.PubSub.Changes.subscribe(socket.assigns.account.id, :client_tokens)
+      :ok = Portal.PubSub.Changes.subscribe(socket.assigns.account.id, :portal_sessions)
+    end
+
+    {:ok, init_if_connected(socket)}
+  end
+
+  # New Auth Provider
+  def handle_params(%{"type" => type}, _url, %{assigns: %{live_action: :new}} = socket)
+      when type in @new_types do
+    schema = AuthProvider.module!(type)
+    struct = struct(schema)
+    attrs = %{id: Ecto.UUID.generate()}
+    changeset = changeset(struct, attrs, socket)
+
+    socket =
+      socket
+      |> clear_verification_state()
+      |> assign(type: type, form: to_form(changeset), open_provider_actions_id: nil)
+
+    {:noreply, socket}
+  end
+
+  # Edit Auth Provider
+  def handle_params(
+        %{"type" => type, "id" => id},
+        _url,
+        %{assigns: %{live_action: :edit}} = socket
+      )
+      when type in @edit_types do
+    schema = AuthProvider.module!(type)
+    provider = Database.get_provider!(schema, id, socket.assigns.subject)
+    is_legacy = Map.get(provider, :is_legacy, false)
+
+    # Legacy providers can't be verified (must be deleted and recreated)
+    changeset = changeset(provider, %{is_verified: not is_legacy}, socket)
+
+    {:noreply,
+     socket
+     |> clear_verification_state()
+     |> assign(
+       provider_name: provider.name,
+       type: type,
+       form: to_form(changeset),
+       is_legacy: is_legacy,
+       open_provider_actions_id: nil
+     )}
+  end
+
+  # Default handler
+  def handle_params(_params, _url, socket) do
+    {:noreply, clear_verification_state(socket)}
+  end
+
+  def handle_event("close_panel", _params, socket) do
+    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/settings/authentication")}
+  end
+
+  def handle_event("handle_keydown", %{"key" => "Escape"}, socket)
+      when socket.assigns.live_action in [:select_type, :new, :edit] do
+    {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/settings/authentication")}
+  end
+
+  def handle_event("handle_keydown", _params, socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("validate", %{"auth_provider" => attrs}, socket) do
+    previous_changeset = socket.assigns.form.source
+    # Get the original struct (the data field contains the original provider)
+    original_struct = previous_changeset.data
+
+    # Preserve is_verified and issuer from the current changeset
+    # is_verified is virtual, issuer gets set during verification
+    current_is_verified = get_field(previous_changeset, :is_verified)
+    current_issuer = get_field(previous_changeset, :issuer)
+
+    attrs =
+      attrs
+      |> Map.put("is_verified", current_is_verified)
+      |> Map.put("issuer", current_issuer)
+
+    changeset =
+      original_struct
+      |> changeset(attrs, socket, verification_fields(previous_changeset))
+
+    clear_verification? = verification_trigger_fields_changed?(previous_changeset, changeset)
+
+    changeset =
+      changeset
+      |> clear_verification_if_trigger_fields_changed(clear_verification?)
+      |> Map.put(:action, :validate)
+
+    socket =
+      socket
+      |> maybe_clear_verification_state(clear_verification?)
+      |> assign(form: to_form(changeset))
+
+    {:noreply, socket}
+  end
+
+  def handle_event("start_verification", _params, socket) do
+    changeset = socket.assigns.form.source
+    type = socket.assigns.type
+
+    # Get values from changes (if modified) or from data (if not modified yet)
+    opts =
+      if type in ["okta", "oidc"] do
+        [
+          discovery_document_uri: get_field(changeset, :discovery_document_uri),
+          client_id: get_field(changeset, :client_id),
+          client_secret: get_field(changeset, :client_secret)
+        ]
+      else
+        []
+      end
+
+    with {:ok, %{config: config}} <- PortalWeb.OIDC.setup_verification(type, opts),
+         verifier = :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false),
+         verification_ref = Ecto.UUID.generate(),
+         lv_pid_string = PortalWeb.OIDC.serialize_pid(self()),
+         state_token <-
+           PortalWeb.OIDC.sign_verification_state(
+             lv_pid_string,
+             PortalWeb.OIDC.verification_state_type(type),
+             %{verification_ref: verification_ref}
+           ),
+         {:ok, uri} <- PortalWeb.OIDC.build_verification_uri(type, config, verifier, state_token) do
+      verification = %{
+        config: config,
+        verification_ref: verification_ref,
+        verifier: verifier,
+        require_email_verified:
+          type == "oidc" and get_field(changeset, :email_verification_method) == :claim
+      }
+
+      socket = assign(socket, active_verification: nil, pending_verification: verification)
+
+      {:noreply, push_event(socket, "open_url", %{url: uri})}
+    else
+      {:error, reason} ->
+        error = verification_start_error_message(reason)
+        {:noreply, assign(socket, verification_error: error)}
+    end
+  end
+
+  def handle_event("remove_verified_organization", %{"organization" => value}, socket)
+      when socket.assigns.type == "entra" do
+    previous = socket.assigns.form.source
+    values = verified_values(previous, "entra")
+
+    if value in Enum.drop(values, 1) do
+      fields = Map.put(verification_fields(previous), :tenant_ids, Enum.reject(values, &(&1 == value)))
+      attrs = provider_attrs(previous)
+
+      attrs =
+        if attrs[:sign_in_tenant_id] == value,
+          do: Map.put(attrs, :sign_in_tenant_id, nil),
+          else: attrs
+
+      changeset = changeset(previous.data, attrs, socket, fields)
+
+      {:noreply, socket |> clear_verification_state() |> assign(form: to_form(changeset), verification_error: nil)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("toggle_verified_domain", %{"domain" => domain}, socket)
+      when socket.assigns.type == "google" do
+    previous = socket.assigns.form.source
+    verified = socket.assigns.verified_domains
+    enabled = get_field(previous, :workspace_domains) || []
+
+    if domain in verified and enabled != [domain] do
+      enabled =
+        if domain in enabled,
+          do: enabled -- [domain],
+          else: Enum.filter(verified, &(&1 in [domain | enabled]))
+
+      fields = Map.put(verification_fields(previous), :workspace_domains, enabled)
+      changeset = changeset(previous.data, provider_attrs(previous), socket, fields)
+
+      {:noreply, assign(socket, form: to_form(changeset), verification_error: nil)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("reset_verification", _params, socket)
+      when socket.assigns.type in ["entra", "google"] do
+    {:noreply, socket}
+  end
+
+  def handle_event("reset_verification", _params, socket) do
+    changeset =
+      resubmit(socket.assigns.form.source, %{"is_verified" => false, "issuer" => nil}, socket)
+
+    {:noreply,
+     socket
+     |> clear_verification_state()
+     |> assign(verification_error: nil, form: to_form(changeset))}
+  end
+
+  def handle_event("submit_provider", _params, socket) do
+    submit_provider(socket)
+  end
+
+  def handle_event("delete_provider", %{"id" => id}, socket) do
+    provider = socket.assigns.providers |> Enum.find(fn p -> p.id == id end)
+
+    # Load providers again to ensure we have the latest state
+    socket = init(socket)
+
+    if id == Credential.auth_provider_id(socket.assigns.subject.credential) do
+      {:noreply,
+       put_flash(
+         socket,
+         :error,
+         "You cannot delete the provider you are currently signed in with."
+       )}
+    else
+      case Database.delete_provider!(provider, socket.assigns.subject) do
+        {:ok, _provider} ->
+          {:noreply,
+           socket
+           |> init()
+           |> put_flash(:success, "Authentication provider deleted successfully.")
+           |> push_patch(to: ~p"/#{socket.assigns.account}/settings/authentication")}
+
+        {:error, reason} ->
+          Logger.info("Failed to delete authentication provider", reason: reason)
+          {:noreply, put_flash(socket, :error, "Failed to delete authentication provider.")}
+      end
+    end
+  end
+
+  def handle_event("toggle_provider", %{"id" => id}, socket) do
+    provider = socket.assigns.providers |> Enum.find(fn p -> p.id == id end)
+    new_disabled_state = not provider.is_disabled
+
+    can_disable =
+      id != Credential.auth_provider_id(socket.assigns.subject.credential) or
+        not new_disabled_state
+
+    changeset =
+      if can_disable do
+        provider
+        |> change(is_disabled: new_disabled_state)
+        |> validate_not_disabling_default_provider()
+      else
+        provider
+        |> change(is_disabled: new_disabled_state)
+        |> add_error(
+          :is_disabled,
+          "You cannot disable the provider you are currently signed in with."
+        )
+      end
+
+    case Database.update_provider(changeset, socket.assigns.subject) do
+      {:ok, _provider} ->
+        action = if new_disabled_state, do: "disabled", else: "enabled"
+
+        {:noreply,
+         socket
+         |> init()
+         |> put_flash(:success, "Authentication provider #{action} successfully.")}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        Logger.info("Failed to toggle authentication provider",
+          errors: inspect(changeset.errors),
+          changes: inspect(changeset.changes)
+        )
+
+        {:noreply, put_flash(socket, :error, extract_disable_error(changeset))}
+
+      {:error, reason} ->
+        Logger.info("Failed to toggle authentication provider", reason: inspect(reason))
+        {:noreply, put_flash(socket, :error, "Failed to update authentication provider.")}
+    end
+  end
+
+  def handle_event("default_provider_change", _params, socket) do
+    {:noreply, assign(socket, default_provider_changed: true)}
+  end
+
+  def handle_event("request_confirm", %{"id" => id, "action" => "delete"}, socket) do
+    policy_count = Database.count_policies_referencing_provider(id, socket.assigns.subject)
+
+    {:noreply,
+     assign(socket,
+       pending_confirm: %{id: id, action: "delete", policy_count: policy_count},
+       open_provider_actions_id: nil
+     )}
+  end
+
+  def handle_event("request_confirm", %{"id" => id, "action" => action}, socket) do
+    {:noreply,
+     assign(socket, pending_confirm: %{id: id, action: action}, open_provider_actions_id: nil)}
+  end
+
+  def handle_event("cancel_confirm", _params, socket) do
+    {:noreply, assign(socket, pending_confirm: nil)}
+  end
+
+  def handle_event("toggle_provider_actions", %{"id" => id}, socket) do
+    current = socket.assigns.open_provider_actions_id
+    next = if current == id, do: nil, else: id
+
+    {:noreply, assign(socket, open_provider_actions_id: next)}
+  end
+
+  def handle_event("close_provider_actions", _params, socket) do
+    {:noreply, assign(socket, open_provider_actions_id: nil)}
+  end
+
+  def handle_event("set_default_provider", %{"id" => id}, socket) do
+    assign_default_provider(id, socket)
+  end
+
+  def handle_event("clear_default_provider", _params, socket) do
+    clear_default_provider(socket)
+  end
+
+  def handle_event("revoke_sessions", %{"id" => id}, socket) do
+    provider = socket.assigns.providers |> Enum.find(fn p -> p.id == id end)
+
+    case Database.revoke_sessions_for_provider(provider, socket.assigns.subject) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> init()
+         |> put_flash(:success, "All sessions for #{provider.name} have been revoked.")}
+
+      {:error, reason} ->
+        Logger.info("Failed to revoke sessions for provider", reason: inspect(reason))
+        {:noreply, put_flash(socket, :error, "Failed to revoke sessions.")}
+    end
+  end
+
+  def handle_event("default_provider_save", %{"provider_id" => ""}, socket) do
+    clear_default_provider(socket)
+  end
+
+  def handle_event("default_provider_save", %{"provider_id" => provider_id}, socket) do
+    assign_default_provider(provider_id, socket)
+  end
+
+  def handle_info(%Portal.Changes.Change{struct: %Portal.ClientToken{}}, socket) do
+    {:noreply, refresh_session_counts(socket)}
+  end
+
+  def handle_info(%Portal.Changes.Change{old_struct: %Portal.ClientToken{}}, socket) do
+    {:noreply, refresh_session_counts(socket)}
+  end
+
+  def handle_info(%Portal.Changes.Change{struct: %Portal.PortalSession{}}, socket) do
+    {:noreply, refresh_session_counts(socket)}
+  end
+
+  def handle_info(%Portal.Changes.Change{old_struct: %Portal.PortalSession{}}, socket) do
+    {:noreply, refresh_session_counts(socket)}
+  end
+
+  # Used after Entra admin consent to build the PKCE request without consuming
+  # the verifier before the authorization-code callback.
+  def handle_info({:peek_pending_verification, from}, socket) do
+    send(from, {:pending_verification, socket.assigns[:pending_verification]})
+    {:noreply, socket}
+  end
+
+  # Sent by VerificationController/OIDCController to fetch config+verifier for code exchange
+  def handle_info({:get_pending_verification, from}, socket) do
+    pending_verification = socket.assigns[:pending_verification]
+    send(from, {:pending_verification, pending_verification})
+
+    socket =
+      case pending_verification do
+        nil ->
+          assign(socket, pending_verification: nil)
+
+        pending_verification ->
+          assign(socket, pending_verification: nil, active_verification: pending_verification)
+      end
+
+    {:noreply, socket}
+  end
+
+  # Entra callbacks include their verification reference so a stale callback
+  # cannot consume a newer pending verifier.
+  def handle_info({:get_pending_verification, verification_ref, from}, socket) do
+    case socket.assigns[:pending_verification] do
+      %{verification_ref: ^verification_ref} = pending_verification ->
+        send(from, {:pending_verification, pending_verification})
+
+        {:noreply,
+         assign(socket,
+           pending_verification: nil,
+           active_verification: pending_verification
+         )}
+
+      _pending_verification ->
+        send(from, {:pending_verification, nil})
+        {:noreply, socket}
+    end
+  end
+
+  def handle_info({:google_verify_complete, issuer, domains, _name, verification_ref, ack_to}, socket) do
+    if socket.assigns.type == "google" and active_verification?(socket, verification_ref) do
+      maybe_send_verification_ack(ack_to)
+      {:noreply, complete_google_verification(socket, issuer, domains)}
+    else
+      maybe_send_verification_ack(ack_to)
+      {:noreply, socket}
+    end
+  end
+
+  # Sent directly by the OIDC verification controller after code exchange succeeds
+  def handle_info({:oidc_verify_complete, issuer, verification_ref, ack_to}, socket) do
+    if socket.assigns.type != "google" and active_verification?(socket, verification_ref) do
+      attrs = %{"is_verified" => true, "is_legacy" => false, "issuer" => issuer}
+
+      changeset =
+        socket.assigns.form.source
+        |> resubmit(attrs, socket)
+        |> maybe_set_okta_name(issuer, socket.assigns.live_action)
+
+      maybe_send_verification_ack(ack_to)
+      {:noreply, assign(socket, active_verification: nil, form: to_form(changeset))}
+    else
+      maybe_send_verification_ack(ack_to)
+      {:noreply, socket}
+    end
+  end
+
+  # Sent directly by the OIDC verification controller when code exchange fails
+  def handle_info({:oidc_verify_failed, reason}, socket) do
+    error = "Failed to verify: #{format_verification_error_reason(reason)}"
+    {:noreply, assign(socket, verification_error: error)}
+  end
+
+  # Every appended tenant has completed its own admin verification flow.
+  def handle_info(
+        {:entra_verify_complete, _issuer, tenant_id, _tenant_name, verification_ref, ack_to},
+        socket
+      ) do
+    if socket.assigns.type == "entra" and active_verification?(socket, verification_ref) do
+      previous = socket.assigns.form.source
+      tenant_ids = Enum.uniq(verified_values(previous, "entra") ++ [tenant_id])
+      attrs = Map.put(provider_attrs(previous), :is_verified, true)
+
+      changeset =
+        changeset(previous.data, attrs, socket, %{tenant_ids: tenant_ids})
+
+      maybe_send_verification_ack(ack_to)
+      {:noreply, assign(socket, active_verification: nil, verification_error: nil, form: to_form(changeset))}
+    else
+      maybe_send_verification_ack(ack_to)
+      {:noreply, socket}
+    end
+  end
+
+  def handle_info({:entra_verify_complete, issuer, tenant_id, verification_ref, ack_to}, socket) do
+    handle_info({:entra_verify_complete, issuer, tenant_id, nil, verification_ref, ack_to}, socket)
+  end
+
+  def handle_info({:entra_verify_complete, issuer, tenant_id, ack_to}, socket) do
+    handle_info({:entra_verify_complete, issuer, tenant_id, nil, ack_to}, socket)
+  end
+
+  def handle_info({:entra_verify_complete, issuer, tenant_id}, socket) do
+    handle_info({:entra_verify_complete, issuer, tenant_id, nil, nil}, socket)
+  end
+
+  # Sent directly by the verification controller on any failure
+  def handle_info({:verification_failed, reason, verification_ref}, socket) do
+    if active_verification?(socket, verification_ref) do
+      error = "Verification failed: #{format_verification_error_reason(reason)}"
+      {:noreply, assign(socket, active_verification: nil, verification_error: error)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_info({:verification_failed, reason}, socket) do
+    error = "Verification failed: #{format_verification_error_reason(reason)}"
+    {:noreply, assign(socket, verification_error: error)}
+  end
+
+  def handle_info(_message, socket) do
+    {:noreply, socket}
+  end
+
+  # Google proves the full list of Workspace domains. The list only lives in
+  # this form: the administrator's own domain is enabled first, any of them can
+  # be toggled as long as one stays enabled, and only the enabled domains are saved.
+  defp complete_google_verification(socket, issuer, domains) do
+    previous = socket.assigns.form.source
+    existing = get_field(previous, :workspace_domains) || []
+
+    cond do
+      is_nil(domains) and existing != [] ->
+        assign(socket,
+          active_verification: nil,
+          verification_error:
+            "Use a Google Workspace administrator to refresh this provider's domains. The existing domains have been kept."
+        )
+
+      is_nil(domains) ->
+        assign_google_verification(socket, previous, issuer, [], %{
+          workspace_domains: nil,
+          is_legacy_unrestricted: get_field(previous, :is_legacy_unrestricted)
+        })
+
+      existing == [] ->
+        assign_google_verification(socket, previous, issuer, domains, %{
+          workspace_domains: [hd(domains)],
+          is_legacy_unrestricted: false
+        })
+
+      Enum.any?(domains, &(&1 in existing)) ->
+        assign_google_verification(socket, previous, issuer, domains, %{
+          workspace_domains: Enum.filter(domains, &(&1 in existing)),
+          is_legacy_unrestricted: false
+        })
+
+      true ->
+        assign(socket,
+          active_verification: nil,
+          verification_error:
+            "Sign in as an administrator of the Google Workspace that this provider already uses."
+        )
+    end
+  end
+
+  defp assign_google_verification(socket, previous, issuer, verified_domains, fields) do
+    attrs = Map.merge(provider_attrs(previous), %{is_verified: true, issuer: issuer})
+    changeset = changeset(previous.data, attrs, socket, fields)
+
+    assign(socket,
+      active_verification: nil,
+      verification_error: nil,
+      verified_domains: verified_domains,
+      form: to_form(changeset)
+    )
+  end
+
+  defp verification_fields(%{data: %Entra.AuthProvider{}} = changeset),
+    do: %{tenant_ids: get_field(changeset, :tenant_ids)}
+
+  defp verification_fields(%{data: %Google.AuthProvider{}} = changeset),
+    do: %{
+      workspace_domains: get_field(changeset, :workspace_domains),
+      is_legacy_unrestricted: get_field(changeset, :is_legacy_unrestricted)
+    }
+
+  defp verification_fields(_changeset), do: %{}
+
+  defp provider_attrs(changeset) do
+    Map.new(Map.fetch!(@fields, changeset.data.__struct__), &{&1, get_field(changeset, &1)})
+  end
+
+  defp verified_values(changeset, "entra"), do: get_field(changeset, :tenant_ids) || []
+  defp verified_values(changeset, "google"), do: get_field(changeset, :workspace_domains) || []
+
+  defp maybe_set_okta_name(%{data: %Okta.AuthProvider{}} = changeset, issuer, :new) do
+    if get_field(changeset, :name) == "Okta" do
+      put_change(changeset, :name, URI.parse(issuer).host)
+    else
+      changeset
+    end
+  end
+
+  defp maybe_set_okta_name(changeset, _issuer, _action), do: changeset
+
+  defp maybe_send_verification_ack({pid, ref}) when is_pid(pid) do
+    send(pid, {:verification_ack, ref})
+    :ok
+  end
+
+  defp maybe_send_verification_ack(_), do: :ok
+
+  defp active_verification?(socket, verification_ref) do
+    case socket.assigns[:active_verification] do
+      %{verification_ref: ^verification_ref} when is_binary(verification_ref) ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp maybe_clear_verification_state(socket, true) do
+    clear_verification_state(socket)
+  end
+
+  defp maybe_clear_verification_state(socket, false) do
+    socket
+  end
+
+  defp clear_verification_state(socket) do
+    assign(socket,
+      pending_verification: nil,
+      active_verification: nil,
+      verification_error: nil,
+      verified_domains: []
+    )
+  end
+
+  defp format_verification_error_reason(reason) when is_binary(reason), do: reason
+  defp format_verification_error_reason(reason), do: inspect(reason)
+
+  defp verification_start_error_message(:invalid_discovery_document_uri) do
+    "The Discovery Document URI is invalid. Please check your provider configuration."
+  end
+
+  defp verification_start_error_message(:private_ip_blocked) do
+    "The Discovery Document URI must not point to a private or reserved IP address."
+  end
+
+  defp verification_start_error_message({404, _body}),
+    do: "Discovery document not found (HTTP 404). Please verify the Discovery Document URI."
+
+  defp verification_start_error_message({status, _body})
+       when is_integer(status) and status >= 500,
+       do: "Identity provider is unavailable (HTTP #{status}). Please try again shortly."
+
+  defp verification_start_error_message({status, _body}) when is_integer(status),
+    do:
+      "Failed to fetch discovery document (HTTP #{status}). Please verify your provider configuration."
+
+  defp verification_start_error_message(%Req.TransportError{reason: :nxdomain}),
+    do:
+      "Unable to fetch discovery document: DNS lookup failed. Please verify the provider domain."
+
+  defp verification_start_error_message(%Req.TransportError{reason: :econnrefused}),
+    do: "Unable to fetch discovery document: Connection refused by the remote server."
+
+  defp verification_start_error_message(%Req.TransportError{reason: :timeout}),
+    do: "Unable to fetch discovery document: Connection timed out."
+
+  defp verification_start_error_message(%Req.TransportError{}),
+    do: "Unable to fetch discovery document due to a network error."
+
+  defp verification_start_error_message({:unexpected_end, _}),
+    do: @invalid_json_error_message
+
+  defp verification_start_error_message({tag, _, _})
+       when tag in [:invalid_byte, :unexpected_sequence],
+       do: @invalid_json_error_message
+
+  defp verification_start_error_message(reason) do
+    Logger.error("Unhandled verification start error", reason: inspect(reason))
+    "Failed to start verification."
+  end
+
+  defp clear_verification_if_trigger_fields_changed(changeset, true) do
+    put_change(changeset, :is_verified, false)
+  end
+
+  defp clear_verification_if_trigger_fields_changed(changeset, false) do
+    changeset
+  end
+
+  defp verification_trigger_fields_changed?(previous_changeset, changeset) do
+    fields = verification_trigger_fields(changeset)
+
+    Enum.any?(fields, fn field ->
+      get_field(previous_changeset, field) != get_field(changeset, field)
+    end)
+  end
+
+  defp verification_trigger_fields(changeset) do
+    schema = changeset.data.__struct__
+
+    # Provider-specific trigger fields:
+    # - Okta: okta_domain is user-editable, discovery_document_uri is computed from it
+    # - OIDC: discovery_document_uri is user-editable
+    # - Google/GitHub/Entra: no user-editable OIDC config fields
+    case schema do
+      Okta.AuthProvider ->
+        [:client_id, :client_secret, :okta_domain]
+
+      OIDC.AuthProvider ->
+        [:client_id, :client_secret, :discovery_document_uri, :email_verification_method]
+
+      _ ->
+        []
+    end
+  end
+
+  defp refresh_session_counts(socket) do
+    providers =
+      Database.enrich_with_session_counts(socket.assigns.providers, socket.assigns.subject)
+
+    assign(socket, providers: providers)
+  end
+
+  # The static render shows a skeleton instead, so the providers are only
+  # queried once, by the connected mount.
+  defp init_if_connected(socket) do
+    if connected?(socket),
+      do: init(socket),
+      else:
+        assign(socket,
+          providers: nil,
+          has_trust_anchors?: false,
+          verification_error: nil,
+          verified_domains: [],
+          pending_confirm: nil,
+          open_provider_actions_id: nil
+        )
+  end
+
+  defp init(socket) do
+    providers =
+      Database.list_all_providers(
+        socket.assigns.subject,
+        socket.assigns.x509_auth_enabled?
+      )
+      |> Database.enrich_with_session_counts(socket.assigns.subject)
+
+    assign(socket,
+      providers: providers,
+      has_trust_anchors?: Database.has_trust_anchors?(socket.assigns.subject),
+      verification_error: nil,
+      verified_domains: [],
+      pending_confirm: nil,
+      open_provider_actions_id: nil
+    )
+  end
+
+  def render(assigns) do
+    ~H"""
+    <div class="flex flex-col h-full">
+      <Navigation.settings_nav
+        account={@account}
+        current_path={@current_path}
+      />
+
+      <div class="flex-1 flex flex-col overflow-hidden">
+        <div class="flex items-center justify-between px-6 py-3 border-b border-border shrink-0">
+          <div class="flex items-center gap-2">
+            <h2 class="text-xs font-semibold text-heading">Identity Providers</h2>
+            <span :if={@providers} class="text-xs text-subtle tabular-nums">
+              {length(@providers)}
+            </span>
+          </div>
+          <div class="flex items-center gap-2">
+            <Navigation.docs_action show_label path="/authenticate" />
+            <Navigation.link
+              patch={~p"/#{@account}/settings/authentication/new"}
+              class="flex items-center gap-1 px-2.5 py-1 rounded text-xs border border-border-strong text-body hover:text-heading hover:border-border-emphasis bg-surface transition-colors"
+            >
+              <Core.icon name="ri-add-line" class="w-3 h-3" /> Add
+            </Navigation.link>
+          </div>
+        </div>
+
+        <div class="flex-1 overflow-auto">
+          <SettingsComponents.skeleton :if={is_nil(@providers)} id="providers-skeleton" />
+          <table :if={@providers} class="w-full text-sm border-collapse">
+            <thead class="sticky top-0 z-10 bg-raised">
+              <tr class="border-b border-border-strong">
+                <th class="px-6 py-2.5 text-left text-[10px] font-semibold tracking-widest uppercase text-subtle">
+                  Provider
+                </th>
+                <th class="px-6 py-2.5 text-left text-[10px] font-semibold tracking-widest uppercase text-subtle w-32">
+                  Context
+                </th>
+                <th class="px-6 py-2.5 text-left text-[10px] font-semibold tracking-widest uppercase text-subtle">
+                  Organization
+                </th>
+                <th class="px-6 py-2.5 text-left text-[10px] font-semibold tracking-widest uppercase text-subtle w-28">
+                  Portal TTL
+                </th>
+                <th class="px-6 py-2.5 text-left text-[10px] font-semibold tracking-widest uppercase text-subtle w-28">
+                  Client TTL
+                </th>
+                <th class="px-6 py-2.5 text-left text-[10px] font-semibold tracking-widest uppercase text-subtle w-48">
+                  Sessions
+                </th>
+                <th class="px-6 py-2.5 w-14"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <.provider_row
+                :for={provider <- @providers}
+                type={provider_type(provider)}
+                account={@account}
+                provider={provider}
+                has_trust_anchors?={@has_trust_anchors?}
+                pending_confirm={@pending_confirm}
+                open_provider_actions_id={@open_provider_actions_id}
+              />
+            </tbody>
+          </table>
+        </div>
+
+    <!-- Add Provider Panel -->
+        <div
+          id="add-provider-panel"
+          class={[
+            "fixed top-14 right-0 bottom-0 z-20 flex flex-col w-full lg:w-3/4 xl:w-1/2",
+            "bg-elevated border-l border-border-strong",
+            "shadow-[-4px_0px_20px_rgba(0,0,0,0.07)]",
+            "transition-transform duration-200 ease-in-out",
+            (@live_action in [:select_type, :new] && "translate-x-0") || "translate-x-full"
+          ]}
+          phx-window-keydown="handle_keydown"
+          phx-key="Escape"
+        >
+          <!-- Select Provider Type -->
+          <div :if={@live_action == :select_type} class="flex flex-col h-full overflow-hidden">
+            <div class="shrink-0 flex items-center justify-between px-5 py-4 border-b border-border">
+              <h2 class="text-sm font-semibold text-heading">Select Provider Type</h2>
+              <Form.icon_button icon="ri-close-line" title="Close (Esc)" phx-click="close_panel" />
+            </div>
+            <div class="flex-1 overflow-y-auto px-5 py-4">
+              <p class="mb-4 text-xs text-subtle">
+                Select an authentication provider type to add:
+              </p>
+              <ul class="flex flex-col gap-2">
+                <li>
+                  <Navigation.link
+                    patch={~p"/#{@account}/settings/authentication/google/new"}
+                    class={select_type_classes()}
+                  >
+                    <span class="flex items-center gap-3 w-2/5 shrink-0">
+                      <Core.provider_icon provider="google" size="xl" />
+                      <span class="text-sm font-medium text-heading">Google</span>
+                    </span>
+                    <span class="text-xs text-body">
+                      Authenticate users against a Google account.
+                    </span>
+                  </Navigation.link>
+                </li>
+                <li>
+                  <Navigation.link
+                    patch={~p"/#{@account}/settings/authentication/github/new"}
+                    class={select_type_classes()}
+                  >
+                    <span class="flex items-center gap-3 w-2/5 shrink-0">
+                      <Core.provider_icon provider="github" size="xl" />
+                      <span class="text-sm font-medium text-heading">GitHub</span>
+                    </span>
+                    <span class="text-xs text-body">
+                      Authenticate users against a GitHub account.
+                    </span>
+                  </Navigation.link>
+                </li>
+                <li>
+                  <Navigation.link
+                    patch={~p"/#{@account}/settings/authentication/entra/new"}
+                    class={select_type_classes()}
+                  >
+                    <span class="flex items-center gap-3 w-2/5 shrink-0">
+                      <Core.provider_icon provider="entra" size="xl" />
+                      <span class="text-sm font-medium text-heading">Entra</span>
+                    </span>
+                    <span class="text-xs text-body">
+                      Authenticate users against a Microsoft Entra account.
+                    </span>
+                  </Navigation.link>
+                </li>
+                <li>
+                  <Navigation.link
+                    patch={~p"/#{@account}/settings/authentication/okta/new"}
+                    class={select_type_classes()}
+                  >
+                    <span class="flex items-center gap-3 w-2/5 shrink-0">
+                      <Core.provider_icon provider="okta" size="xl" />
+                      <span class="text-sm font-medium text-heading">Okta</span>
+                    </span>
+                    <span class="text-xs text-body">
+                      Authenticate users against an Okta account.
+                    </span>
+                  </Navigation.link>
+                </li>
+                <li>
+                  <Navigation.link
+                    patch={~p"/#{@account}/settings/authentication/oidc/new"}
+                    class={select_type_classes()}
+                  >
+                    <span class="flex items-center gap-3 w-2/5 shrink-0">
+                      <Core.provider_icon provider="oidc" size="xl" />
+                      <span class="text-sm font-medium text-heading">OIDC</span>
+                    </span>
+                    <span class="text-xs text-body">
+                      Authenticate users against any OpenID Connect compliant identity provider.
+                    </span>
+                  </Navigation.link>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+    <!-- New Provider Form -->
+          <div
+            :if={@live_action == :new and assigns[:form] != nil}
+            class="flex flex-col h-full overflow-hidden"
+          >
+            <div class="shrink-0 flex items-center justify-between px-5 py-4 border-b border-border">
+              <div class="flex items-center gap-2">
+                <Navigation.link
+                  patch={~p"/#{@account}/settings/authentication/new"}
+                  class="flex items-center justify-center w-6 h-6 rounded text-subtle hover:text-heading hover:bg-raised transition-colors"
+                  title="Back"
+                >
+                  <Core.icon name="ri-arrow-left-line" class="w-4 h-4" />
+                </Navigation.link>
+                <div class="flex items-center gap-2">
+                  <Core.provider_icon provider={@type} size="md" />
+                  <h2 class="text-sm font-semibold text-heading">
+                    Add {titleize(@type)} Provider
+                  </h2>
+                  <Navigation.docs_action path={"/authenticate/#{@type}"} />
+                </div>
+              </div>
+              <Form.icon_button icon="ri-close-line" title="Close (Esc)" phx-click="close_panel" />
+            </div>
+            <div class="flex-1 overflow-y-auto px-5 py-4">
+              <.provider_form
+                account_id={@account.id}
+                verification_error={@verification_error}
+                verified_domains={@verified_domains}
+                form={@form}
+                type={@type}
+                submit_event="submit_provider"
+              />
+            </div>
+            <Form.panel_footer>
+              <Form.panel_footer_button phx-click="close_panel">
+                Cancel
+              </Form.panel_footer_button>
+              <Form.panel_footer_button
+                form="auth-provider-form"
+                type="submit"
+                style="primary"
+                disabled={not @form.source.valid?}
+              >
+                Create
+              </Form.panel_footer_button>
+            </Form.panel_footer>
+          </div>
+        </div>
+      </div>
+
+    <!-- Edit Provider Panel -->
+      <div
+        id="edit-provider-panel"
+        class={[
+          "fixed top-14 right-0 bottom-0 z-20 flex flex-col w-full lg:w-3/4 xl:w-1/2",
+          "bg-elevated border-l border-border-strong",
+          "shadow-[-4px_0px_20px_rgba(0,0,0,0.07)]",
+          "transition-transform duration-200 ease-in-out",
+          (@live_action == :edit && assigns[:form] != nil && "translate-x-0") || "translate-x-full"
+        ]}
+        phx-window-keydown="handle_keydown"
+        phx-key="Escape"
+      >
+        <div
+          :if={@live_action == :edit and assigns[:form] != nil}
+          class="flex flex-col h-full overflow-hidden"
+        >
+          <Form.panel_header title={"Edit #{@provider_name}"} variant="plain">
+            <:leading><Core.provider_icon provider={@type} size="md" /></:leading>
+            <:adornment><Navigation.docs_action path={"/authenticate/#{@type}"} /></:adornment>
+          </Form.panel_header>
+          <div class="flex-1 overflow-y-auto px-5 py-4">
+            <Core.flash :if={assigns[:is_legacy]} kind={:warning_inline} class="mb-4">
+              This provider uses legacy configuration. We recommend setting up a new authentication
+              provider for your identity service to take advantage of improved security and features.
+            </Core.flash>
+            <.provider_form
+              account_id={@account.id}
+              verification_error={@verification_error}
+              verified_domains={@verified_domains}
+              form={@form}
+              type={@type}
+              submit_event="submit_provider"
+              is_legacy={assigns[:is_legacy]}
+            />
+          </div>
+          <Form.panel_footer>
+            <Form.panel_footer_button phx-click="close_panel">
+              Cancel
+            </Form.panel_footer_button>
+            <Form.panel_footer_button
+              form="auth-provider-form"
+              type="submit"
+              style="primary"
+              disabled={
+                not @form.source.valid? or Enum.empty?(@form.source.changes) or not verified?(@form)
+              }
+            >
+              Save
+            </Form.panel_footer_button>
+          </Form.panel_footer>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp provider_row(assigns) do
+    assigns =
+      assign(assigns, provider_row_state(assigns.provider, assigns.type, assigns.pending_confirm))
+
+    ~H"""
+    <%!-- Dim the cells, not the row: opacity on the row also dims the actions menu. --%>
+    <tr class={[
+      "border-b transition-colors",
+      @is_pending_toggle && "border-warning/30 bg-warning-light",
+      @is_pending_delete && "border-danger/30 bg-danger-light",
+      @is_pending_revoke && "border-warning/30 bg-warning-light",
+      !@is_pending_toggle && !@is_pending_delete && !@is_pending_revoke &&
+        "border-border hover:bg-raised",
+      @provider.is_disabled && !@is_pending_toggle && !@is_pending_delete && !@is_pending_revoke &&
+        "[&>td:not(:last-child)]:opacity-60"
+    ]}>
+      <td class="px-6 py-3">
+        <div class="flex items-center gap-3">
+          <Core.provider_icon provider={@type} size="lg" />
+          <div>
+            <div class="flex items-center gap-1.5">
+              <span class={[
+                "text-sm font-medium",
+                @is_pending_toggle && "text-warning",
+                @is_pending_delete && "text-danger",
+                @is_pending_revoke && "text-warning",
+                !@is_pending_toggle && !@is_pending_delete && !@is_pending_revoke &&
+                  "text-heading"
+              ]}>
+                {@provider.name}
+              </span>
+              <span
+                :if={@is_default && !@is_pending_toggle && !@is_pending_delete && !@is_pending_revoke}
+                class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-brand-muted text-brand"
+              >
+                Default
+              </span>
+              <span
+                :if={
+                  @provider.is_disabled && !@is_pending_toggle && !@is_pending_delete &&
+                    !@is_pending_revoke
+                }
+                class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-raised text-subtle border border-border"
+              >
+                Disabled
+              </span>
+              <span
+                :if={
+                  Map.get(@provider, :is_legacy) && !@is_pending_toggle && !@is_pending_delete &&
+                    !@is_pending_revoke
+                }
+                class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-warning-light text-warning"
+              >
+                Legacy
+              </span>
+            </div>
+            <div class="font-mono text-[10px] text-subtle mt-0.5">{@provider.id}</div>
+            <p
+              :if={@type == "x509" and not @has_trust_anchors?}
+              class="flex items-start gap-1.5 mt-1.5 max-w-md text-xs text-warning"
+            >
+              <Core.icon name="ri-error-warning-line" class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span>
+                No devices will be able to use this authentication provider until you add one or more
+                <Navigation.link
+                  navigate={~p"/#{@account}/settings/trust_anchors"}
+                  class="underline hover:no-underline"
+                >Trust Anchors</Navigation.link>.
+              </span>
+            </p>
+          </div>
+        </div>
+      </td>
+      <%= if @is_pending_revoke do %>
+        <td colspan="6" class="px-6 py-3">
+          <div class="flex items-center gap-4">
+            <span class="text-xs text-warning">
+              Revoke all sessions for this provider? This will immediately sign out all users authenticated this provider.
+            </span>
+            <div class="flex items-center gap-2 ml-auto shrink-0">
+              <Form.button
+                phx-click="cancel_confirm"
+                size="xs"
+              >
+                Cancel
+              </Form.button>
+              <Form.button
+                phx-click="revoke_sessions"
+                phx-value-id={@provider.id}
+                size="xs"
+                style="warning"
+              >
+                Revoke sessions
+              </Form.button>
+            </div>
+          </div>
+        </td>
+      <% else %>
+        <%= if @is_pending_toggle do %>
+          <td colspan="6" class="px-6 py-3">
+            <div class="flex items-center gap-4">
+              <span class="text-xs text-warning">
+                {if @provider.is_disabled,
+                  do: "Enable this provider?",
+                  else:
+                    "Disable this provider? Users will not be able to sign in while it is disabled."}
+              </span>
+              <div class="flex items-center gap-2 ml-auto shrink-0">
+                <Form.button
+                  phx-click="cancel_confirm"
+                  size="xs"
+                >
+                  Cancel
+                </Form.button>
+                <Form.button
+                  phx-click="toggle_provider"
+                  phx-value-id={@provider.id}
+                  size="xs"
+                  style="warning"
+                >
+                  {if @provider.is_disabled, do: "Enable", else: "Disable"}
+                </Form.button>
+              </div>
+            </div>
+          </td>
+        <% else %>
+          <%= if @is_pending_delete do %>
+            <td colspan="6" class="px-6 py-3">
+              <div class="flex items-center gap-4">
+                <div class="text-xs text-danger space-y-1">
+                  <p>
+                    Delete this provider? This will immediately sign out all users authenticated via this provider and cannot be undone.
+                  </p>
+                  <p :if={@referencing_policy_count > 0} id={"provider-#{@provider.id}-policy-warning"}>
+                    {@referencing_policy_count} {ngettext(
+                      "policy references",
+                      "policies reference",
+                      @referencing_policy_count
+                    )} this provider and will need to be updated.
+                  </p>
+                </div>
+                <div class="flex items-center gap-2 ml-auto shrink-0">
+                  <Form.button
+                    phx-click="cancel_confirm"
+                    size="xs"
+                  >
+                    Cancel
+                  </Form.button>
+                  <Form.button
+                    phx-click="delete_provider"
+                    phx-value-id={@provider.id}
+                    size="xs"
+                    style="danger"
+                  >
+                    Delete
+                  </Form.button>
+                </div>
+              </div>
+            </td>
+          <% else %>
+            <td class="px-6 py-3">
+              <.context_badge context={@provider.context} />
+            </td>
+            <td class="px-6 py-3">
+              <span class="font-mono text-xs text-body">
+                {provider_organizations(@provider)}
+              </span>
+            </td>
+            <td class="px-6 py-3 text-sm tabular-nums text-body">
+              {@portal_ttl || "—"}
+            </td>
+            <td class="px-6 py-3 text-sm tabular-nums text-body">
+              {@client_ttl || "—"}
+            </td>
+            <td class="px-6 py-3">
+              <div class="flex items-center gap-2.5 text-xs text-body tabular-nums">
+                <span :if={@type != "x509"}>
+                  <span class="font-medium text-heading">
+                    {@provider.portal_sessions_count}
+                  </span>
+                  portal
+                </span>
+                <span :if={@type != "x509"} class="w-px h-3 bg-border-strong shrink-0"></span>
+                <span>
+                  <span class="font-medium text-heading">
+                    {@provider.client_tokens_count}
+                  </span>
+                  client
+                </span>
+              </div>
+            </td>
+            <td class="px-6 py-3">
+              <div class="flex justify-end">
+                <Core.actions_dropdown
+                  open={@open_provider_actions_id == @provider.id}
+                  close_event="close_provider_actions"
+                  phx-click="toggle_provider_actions"
+                  phx-value-id={@provider.id}
+                >
+                  <button
+                    :if={@can_be_default and not @is_default}
+                    phx-click="set_default_provider"
+                    phx-value-id={@provider.id}
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left hover:bg-raised transition-colors text-body"
+                  >
+                    <Core.icon name="ri-star-line" class="w-3.5 h-3.5 shrink-0" /> Make default
+                  </button>
+                  <button
+                    :if={@can_be_default and @is_default}
+                    phx-click="clear_default_provider"
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left hover:bg-raised transition-colors text-body"
+                  >
+                    <Core.icon name="ri-star-fill" class="w-3.5 h-3.5 shrink-0" /> Remove default
+                  </button>
+                  <button
+                    :if={@show_default_action and not @can_be_default}
+                    disabled
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left text-subtle cursor-default"
+                  >
+                    <Core.icon name="ri-star-line" class="w-3.5 h-3.5 shrink-0" /> Make default
+                  </button>
+                  <div :if={@show_default_action} class="my-1 border-t border-border"></div>
+                  <Navigation.link
+                    :if={@can_be_edited}
+                    patch={~p"/#{@account}/settings/authentication/#{@type}/#{@provider.id}/edit"}
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left hover:bg-raised transition-colors text-body"
+                  >
+                    <Core.icon name="ri-pencil-line" class="w-3.5 h-3.5 shrink-0" /> Edit
+                  </Navigation.link>
+                  <div class="my-1 border-t border-border"></div>
+                  <button
+                    :if={@has_sessions}
+                    phx-click="request_confirm"
+                    phx-value-id={@provider.id}
+                    phx-value-action="revoke"
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left hover:bg-raised transition-colors text-body"
+                  >
+                    <Core.icon name="ri-logout-box-r-line" class="w-3.5 h-3.5 shrink-0" />
+                    Revoke sessions
+                  </button>
+                  <button
+                    :if={not @has_sessions}
+                    disabled
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left text-subtle cursor-default"
+                  >
+                    <Core.icon name="ri-logout-box-r-line" class="w-3.5 h-3.5 shrink-0" />
+                    Revoke sessions
+                  </button>
+                  <div class="my-1 border-t border-border"></div>
+                  <button
+                    phx-click="request_confirm"
+                    phx-value-id={@provider.id}
+                    phx-value-action="toggle"
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left hover:bg-raised transition-colors text-body"
+                  >
+                    <Core.icon
+                      name={
+                        if @provider.is_disabled,
+                          do: "ri-checkbox-circle-line",
+                          else: "ri-close-circle-line"
+                      }
+                      class="w-3.5 h-3.5 shrink-0"
+                    />
+                    {if @provider.is_disabled, do: "Enable", else: "Disable"}
+                  </button>
+                  <button
+                    :if={@can_be_deleted}
+                    phx-click="request_confirm"
+                    phx-value-id={@provider.id}
+                    phx-value-action="delete"
+                    class="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-left hover:bg-raised transition-colors text-error"
+                  >
+                    <Core.icon name="ri-delete-bin-line" class="w-3.5 h-3.5 shrink-0" /> Delete
+                  </button>
+                </Core.actions_dropdown>
+              </div>
+            </td>
+          <% end %>
+        <% end %>
+      <% end %>
+    </tr>
+    """
+  end
+
+  defp provider_row_state(provider, type, pending_confirm) do
+    pending_state = provider_pending_state(provider, pending_confirm)
+
+    %{
+      is_default: provider_default?(provider),
+      can_be_default: provider_action_allowed?(type),
+      show_default_action: type != "x509",
+      can_be_deleted: provider_action_allowed?(type),
+      can_be_edited: type != "x509",
+      has_sessions: provider_has_sessions?(provider),
+      is_pending_toggle: pending_state == :toggle,
+      is_pending_delete: pending_state == :delete,
+      is_pending_revoke: pending_state == :revoke,
+      referencing_policy_count: provider_referencing_policy_count(pending_state, pending_confirm),
+      portal_ttl: provider_portal_ttl(provider),
+      client_ttl: provider_client_ttl(provider)
+    }
+  end
+
+  defp provider_default?(provider), do: Map.get(provider, :is_default, false)
+
+  defp provider_action_allowed?(type), do: type not in ["email_otp", "userpass", "x509"]
+
+  defp provider_has_sessions?(provider) do
+    provider.client_tokens_count > 0 or provider.portal_sessions_count > 0
+  end
+
+  defp provider_pending_state(provider, %{id: id, action: action}) when id == provider.id,
+    do: String.to_existing_atom(action)
+
+  defp provider_pending_state(_provider, _pending_confirm), do: nil
+
+  defp provider_referencing_policy_count(:delete, %{policy_count: count}), do: count
+  defp provider_referencing_policy_count(_pending_state, _pending_confirm), do: 0
+
+  defp provider_portal_ttl(%{context: context} = provider)
+       when context in [:clients_and_portal, :portal_only] do
+    format_duration(
+      Map.get(provider, :portal_session_lifetime_secs) ||
+        provider.__struct__.default_portal_session_lifetime_secs()
+    )
+  end
+
+  defp provider_portal_ttl(_provider), do: nil
+
+  defp provider_client_ttl(%{context: context} = provider)
+       when context in [:clients_and_portal, :clients_only] and
+              is_map_key(provider, :client_session_lifetime_secs) do
+    format_duration(
+      Map.get(provider, :client_session_lifetime_secs) ||
+        provider.__struct__.default_client_session_lifetime_secs()
+    )
+  end
+
+  defp provider_client_ttl(_provider), do: nil
+
+  attr :account_id, :string, required: true
+  attr :form, :any, required: true
+  attr :type, :string, required: true
+  attr :submit_event, :string, required: true
+  attr :verification_error, :any, default: nil
+  attr :verified_domains, :list, default: []
+  attr :is_legacy, :boolean, default: false
+
+  defp provider_form(assigns) do
+    redirect_uri =
+      if assigns[:is_legacy] do
+        account_id = assigns.account_id
+        provider_id = Ecto.Changeset.get_field(assigns.form.source, :id)
+
+        PortalWeb.Endpoint.url() <>
+          "/#{account_id}/sign_in/providers/#{provider_id}/handle_callback"
+      else
+        PortalWeb.Endpoint.url() <> "/auth/oidc/callback"
+      end
+
+    assigns = assign(assigns, :redirect_uri, redirect_uri)
+
+    ~H"""
+    <.form
+      id="auth-provider-form"
+      for={@form}
+      phx-change="validate"
+      phx-submit={@submit_event}
+    >
+      <div class="space-y-5">
+        <%!-- General --%>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label
+              for={@form[:name].id}
+              class="block text-xs font-medium text-body mb-1.5"
+            >
+              Name <span class="text-error">*</span>
+            </label>
+            <Form.input
+              field={@form[:name]}
+              type="text"
+              autocomplete="off"
+              phx-debounce="300"
+              data-1p-ignore
+              required
+            />
+          </div>
+          <div>
+            <label
+              for={@form[:context].id}
+              class="block text-xs font-medium text-body mb-1.5"
+            >
+              Context <span class="text-error">*</span>
+            </label>
+            <Form.input
+              field={@form[:context]}
+              type="select"
+              options={context_options()}
+              required
+            />
+          </div>
+        </div>
+
+        <%!-- Session lifetimes --%>
+        <div class="pt-4 border-t border-border">
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-3">
+            Session Lifetimes
+          </p>
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label
+                for={@form[:portal_session_lifetime_secs].id}
+                class="block text-xs font-medium text-body mb-1.5"
+              >
+                Portal (seconds)
+              </label>
+              <Form.input
+                field={@form[:portal_session_lifetime_secs]}
+                type="number"
+                placeholder="28800"
+                phx-debounce="300"
+              />
+              <p class="mt-2 text-xs text-subtle">
+                Portal default: 8 hours
+              </p>
+            </div>
+            <div>
+              <label
+                for={@form[:client_session_lifetime_secs].id}
+                class="block text-xs font-medium text-body mb-1.5"
+              >
+                Client (seconds)
+              </label>
+              <Form.input
+                field={@form[:client_session_lifetime_secs]}
+                type="number"
+                placeholder="604800"
+                phx-debounce="300"
+              />
+              <p class="mt-2 text-xs text-subtle">
+                Client default: 7 days. Clients will be <strong>signed out</strong>
+                after this and forced to re-authenticate.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <%!-- Entra-specific config --%>
+        <div :if={@type == "entra"} class="pt-4 border-t border-border space-y-4">
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+            Provider Configuration
+          </p>
+          <p class="text-xs text-subtle">
+            Only users from the verified tenants below can use this authentication provider.
+            Verify another tenant to allow users from another organization to use the same sign-in option.
+          </p>
+          <div>
+            <label
+              for={@form[:email_claim].id}
+              class="block text-xs font-medium text-body mb-1.5"
+            >
+              Email Claim <span class="text-error">*</span>
+            </label>
+            <Form.input
+              field={@form[:email_claim]}
+              type="select"
+              options={[
+                {"UPN (upn)", "upn"},
+                {"Email (email)", "email"},
+                {"Preferred Username (preferred_username)", "preferred_username"}
+              ]}
+              required
+            />
+            <p class="mt-1 text-xs text-subtle">
+              The OIDC claim to use as the user's email address during sign-in.
+            </p>
+          </div>
+          <div :if={(get_field(@form.source, :tenant_ids) || []) != []}>
+            <label
+              for={@form[:sign_in_tenant_id].id}
+              class="block text-xs font-medium text-body mb-1.5"
+            >
+              Sign-in Tenant
+            </label>
+            <Form.input
+              field={@form[:sign_in_tenant_id]}
+              type="select"
+              prompt="Each user's home tenant"
+              options={get_field(@form.source, :tenant_ids)}
+            />
+            <p class="mt-1 text-xs text-subtle">
+              Users sign in through this tenant instead of their home tenant.
+              Select a tenant to allow B2B guest users of that tenant to sign in.
+              Guest users have an external UPN, so use the Email claim for them.
+            </p>
+          </div>
+        </div>
+
+        <%!-- GitHub-specific config --%>
+        <div :if={@type == "github"} class="pt-4 border-t border-border space-y-4">
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+            Provider Configuration
+          </p>
+          <fieldset>
+            <legend class="block text-xs font-medium text-body mb-3">
+              Email Verification <span class="text-error">*</span>
+            </legend>
+            <% email_verification_method = get_field(@form.source, :email_verification_method) %>
+            <div class="grid gap-3 md:grid-cols-2">
+              <label class={[
+                "flex flex-col p-3 border rounded cursor-pointer transition-all",
+                if(email_verification_method == :proof,
+                  do: "border-brand bg-raised",
+                  else: "border-border hover:border-border-emphasis"
+                )
+              ]}>
+                <input
+                  type="radio"
+                  name={@form[:email_verification_method].name}
+                  value="proof"
+                  checked={email_verification_method == :proof}
+                  class="sr-only"
+                  required
+                />
+                <span class="text-sm font-semibold text-heading mb-1">
+                  Proof
+                </span>
+                <span class="text-xs text-body">
+                  Send a one-time passcode to the user's email before linking their GitHub account for the first time.
+                  <strong class="block mt-1">Default.</strong>
+                </span>
+              </label>
+
+              <label class={[
+                "flex flex-col p-3 border rounded cursor-pointer transition-all",
+                if(email_verification_method == :none,
+                  do: "border-brand bg-raised",
+                  else: "border-border hover:border-border-emphasis"
+                )
+              ]}>
+                <input
+                  type="radio"
+                  name={@form[:email_verification_method].name}
+                  value="none"
+                  checked={email_verification_method == :none}
+                  class="sr-only"
+                  required
+                />
+                <span class="text-sm font-semibold text-heading mb-1">
+                  None
+                </span>
+                <span class="text-xs text-body">
+                  Link a GitHub account to the user with the same email, as long as GitHub has verified that email.
+                  GitHub does not re-check addresses, so a former owner of an email can still sign in as its current user.
+                  <strong class="block mt-1">Not recommended.</strong>
+                </span>
+              </label>
+            </div>
+          </fieldset>
+        </div>
+
+        <%!-- Provider-specific config (Okta / OIDC) --%>
+        <div :if={@type in ["okta", "oidc"]} class="pt-4 border-t border-border space-y-4">
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+            Provider Configuration
+          </p>
+
+          <div :if={@type == "okta"}>
+            <label
+              for={@form[:okta_domain].id}
+              class="block text-xs font-medium text-body mb-1.5"
+            >
+              Okta Domain <span class="text-error">*</span>
+            </label>
+            <Form.input
+              field={@form[:okta_domain]}
+              type="text"
+              placeholder="example.okta.com"
+              autocomplete="off"
+              phx-debounce="300"
+              data-1p-ignore
+              required
+            />
+          </div>
+
+          <div :if={@type == "oidc"}>
+            <label
+              for={@form[:discovery_document_uri].id}
+              class="block text-xs font-medium text-body mb-1.5"
+            >
+              Discovery Document URI <span class="text-error">*</span>
+            </label>
+            <Form.input
+              field={@form[:discovery_document_uri]}
+              type="text"
+              placeholder="https://example.com/.well-known/openid-configuration"
+              autocomplete="off"
+              phx-debounce="300"
+              data-1p-ignore
+              required
+            />
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label
+                for={@form[:client_id].id}
+                class="block text-xs font-medium text-body mb-1.5"
+              >
+                Client ID <span class="text-error">*</span>
+              </label>
+              <Form.input
+                field={@form[:client_id]}
+                type="text"
+                autocomplete="off"
+                phx-debounce="300"
+                data-1p-ignore
+                required
+              />
+            </div>
+            <div>
+              <label
+                for={@form[:client_secret].id}
+                class="block text-xs font-medium text-body mb-1.5"
+              >
+                Client Secret <span class="text-error">*</span>
+              </label>
+              <Form.input
+                field={@form[:client_secret]}
+                type="password"
+                autocomplete="off"
+                phx-debounce="300"
+                data-1p-ignore
+                required
+              />
+            </div>
+          </div>
+
+          <fieldset :if={@type == "oidc"}>
+            <legend class="block text-xs font-medium text-body mb-3">
+              Email Verification <span class="text-error">*</span>
+            </legend>
+            <% email_verification_method = get_field(@form.source, :email_verification_method) %>
+            <div class="grid gap-3 md:grid-cols-3">
+              <label class={[
+                "flex flex-col p-3 border rounded cursor-pointer transition-all",
+                if(email_verification_method == :none,
+                  do: "border-brand bg-raised",
+                  else: "border-border hover:border-border-emphasis"
+                )
+              ]}>
+                <input
+                  type="radio"
+                  name={@form[:email_verification_method].name}
+                  value="none"
+                  checked={email_verification_method == :none}
+                  class="sr-only"
+                  required
+                />
+                <span class="text-sm font-semibold text-heading mb-1">
+                  None
+                </span>
+                <span class="text-xs text-body">
+                  Do not require the identity provider to confirm email ownership before linking an identity.
+                  <strong class="block mt-1">Not recommended.</strong>
+                </span>
+              </label>
+
+              <label class={[
+                "flex flex-col p-3 border rounded cursor-pointer transition-all",
+                if(email_verification_method == :claim,
+                  do: "border-brand bg-raised",
+                  else: "border-border hover:border-border-emphasis"
+                )
+              ]}>
+                <input
+                  type="radio"
+                  name={@form[:email_verification_method].name}
+                  value="claim"
+                  checked={email_verification_method == :claim}
+                  class="sr-only"
+                  required
+                />
+                <span class="text-sm font-semibold text-heading mb-1">
+                  Claim
+                </span>
+                <span class="text-xs text-body">
+                  Trust the email address only when the identity provider returns
+                  <code class="text-xs"><strong>email_verified=true</strong></code>.
+                  Authentication fails when the claim is missing or false.
+                  <strong class="block mt-1">Default.</strong>
+                </span>
+              </label>
+
+              <label class={[
+                "flex flex-col p-3 border rounded cursor-pointer transition-all",
+                if(email_verification_method == :proof,
+                  do: "border-brand bg-raised",
+                  else: "border-border hover:border-border-emphasis"
+                )
+              ]}>
+                <input
+                  type="radio"
+                  name={@form[:email_verification_method].name}
+                  value="proof"
+                  checked={email_verification_method == :proof}
+                  class="sr-only"
+                  required
+                />
+                <span class="text-sm font-semibold text-heading mb-1">
+                  Proof
+                </span>
+                <span class="text-xs text-body">
+                  Send a one-time passcode to the claimed email address before linking a new OIDC identity.
+                  Use this when the provider cannot reliably send
+                  <code class="text-xs"><strong>email_verified=true</strong></code>.
+                </span>
+              </label>
+            </div>
+          </fieldset>
+
+          <%!-- Redirect URI --%>
+          <div>
+            <label class="block text-xs font-medium text-body mb-1.5">
+              Redirect URI
+            </label>
+            <div
+              class="flex items-center gap-2 px-3 py-2 rounded border border-border bg-raised"
+              id="redirect-uri"
+              phx-hook="CopyClipboard"
+            >
+              <span id="redirect-uri-text" class="hidden">{@redirect_uri}</span>
+              <code class="flex-1 text-xs font-mono text-body truncate">
+                {@redirect_uri}
+              </code>
+              <button
+                type="button"
+                data-copy-to-clipboard-target="redirect-uri-text"
+                class="shrink-0 text-subtle hover:text-heading transition-colors"
+              >
+                <span id="redirect-uri-default-message">
+                  <Core.icon name="ri-clipboard-line" class="w-4 h-4" />
+                </span>
+                <span id="redirect-uri-success-message" class="hidden">
+                  <Core.icon name="ri-check-line" class="w-4 h-4 text-success" />
+                </span>
+              </button>
+            </div>
+            <p class="mt-1 text-xs text-subtle">
+              Add this to your {titleize(@type)} application's allowed redirect URIs.
+            </p>
+          </div>
+        </div>
+
+        <%!-- Verification --%>
+        <.verified_organizations
+          :if={@type in ["entra", "google"]}
+          form={@form}
+          type={@type}
+          verification_error={@verification_error}
+          verified_domains={@verified_domains}
+        />
+        <div
+          :if={@type in ["github", "okta", "oidc"] and not @is_legacy}
+          class="pt-4 border-t border-border"
+        >
+          <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle mb-3">
+            Verification
+          </p>
+          <Core.flash :if={@verification_error} kind={:error} class="mb-3">
+            {@verification_error}
+          </Core.flash>
+          <div class="rounded border border-border overflow-hidden">
+            <div class="flex items-center justify-between px-4 py-3">
+              <p class="text-sm text-body">
+                {verification_help_text(@form, @type)}
+              </p>
+              <div class="ml-4 shrink-0">
+                <.verification_status_badge id="verify-button" form={@form} />
+              </div>
+            </div>
+            <div
+              :if={verified?(@form)}
+              class="flex items-center justify-between px-4 py-2.5 border-t border-border bg-raised"
+            >
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="text-xs text-subtle shrink-0">Issuer</span>
+                <span class="text-xs font-mono text-heading truncate">
+                  {get_field(@form.source, :issuer)}
+                </span>
+              </div>
+              <Form.button
+                type="button"
+                phx-click="reset_verification"
+                size="xs"
+              >
+                Reset
+              </Form.button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </.form>
+    """
+  end
+
+  attr :form, :any, required: true
+  attr :type, :string, required: true
+  attr :verification_error, :any, default: nil
+  attr :verified_domains, :list, default: []
+
+  defp verified_organizations(assigns) do
+    toggles? = assigns.type == "google" and assigns.verified_domains != []
+
+    assigns = assign(assigns,
+      values: if(toggles?, do: assigns.verified_domains, else: verified_values(assigns.form.source, assigns.type)),
+      toggles?: toggles?,
+      enabled: get_field(assigns.form.source, :workspace_domains) || [],
+      label: if(assigns.type == "entra", do: "tenant", else: "domain"),
+      verified?: verified?(assigns.form)
+    )
+
+    ~H"""
+    <div class="pt-4 border-t border-border space-y-3">
+      <p class="text-[10px] font-semibold tracking-widest uppercase text-subtle">
+        {if @type == "google" and @values == [], do: "Verification", else: "Verified #{if @type == "entra", do: "tenants", else: "domains"}"}
+        <span :if={@type == "entra" or not @verified?} class="text-error">*</span>
+      </p>
+      <p :if={@type == "google" and @values != []} class="text-xs text-subtle">
+        Only users whose Google Workspace domain is enabled can use this provider.
+        Sign in again as a Workspace administrator to see all of your organization's domains
+        and change which are enabled.
+      </p>
+      <p :if={@type == "google" and @values == []} class="text-xs text-subtle">
+        Verifying with a Google Workspace account needs a Workspace administrator. It saves the
+        organization's verified domains and enables the administrator's own domain. New providers
+        verified with a personal account accept personal Google accounts only.
+      </p>
+      <p :if={@type == "google" and @values == [] and @verified?} class="text-xs text-success">
+        <Core.icon name="ri-checkbox-circle-line" class="inline w-3.5 h-3.5" />
+        <%= if get_field(@form.source, :is_legacy_unrestricted) do %>
+          Existing provider. Personal and Workspace Google accounts can sign in.
+        <% else %>
+          Verified provider. Personal Google accounts only.
+        <% end %>
+      </p>
+      <p :if={@values == [] and @type == "entra"} class="text-xs text-subtle">
+        Verify at least one {@label} to save this provider.
+      </p>
+      <Core.flash :if={@verification_error} kind={:error} class="mb-3">
+        {@verification_error}
+      </Core.flash>
+      <div :if={@values != []} class="rounded border border-border overflow-hidden">
+        <table id="verified-organizations" class="w-full text-sm border-collapse">
+          <thead class="bg-raised">
+            <tr class="border-b border-border">
+              <th scope="col" class="px-3 py-2 text-left text-xs font-medium text-subtle">
+                {if @type == "entra", do: "Tenant ID", else: "Domain"}
+              </th>
+              <th scope="col" class="px-3 py-2 text-left text-xs font-medium text-subtle">
+                {if @toggles?, do: "Enabled", else: "Status"}
+              </th>
+              <th :if={@type == "entra"} scope="col" class="w-10">
+                <span class="sr-only">Actions</span>
+              </th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-border bg-surface">
+            <tr :for={{value, index} <- Enum.with_index(@values)} id={"verified-organization-#{index}"}>
+              <td class="px-3 py-2 font-mono text-xs text-body break-all">
+                {value}
+                <span :if={@toggles? and index == 0} class="ml-1 font-sans text-subtle">
+                  (primary)
+                </span>
+              </td>
+              <td :if={not @toggles?} class="px-3 py-2">
+                <span class="inline-flex items-center gap-1 text-xs text-success">
+                  <Core.icon name="ri-checkbox-circle-line" class="w-3.5 h-3.5" /> Verified
+                </span>
+              </td>
+              <td :if={@toggles?} class="px-3 py-2">
+                <span title={if @enabled == [value], do: "At least one domain must be enabled"}>
+                  <Core.toggle
+                    id={"verified-domain-toggle-#{index}"}
+                    size="sm"
+                    checked={value in @enabled}
+                    disabled={@enabled == [value]}
+                    aria-label={"Enable #{value}"}
+                    phx-click="toggle_verified_domain"
+                    phx-value-domain={value}
+                  />
+                </span>
+              </td>
+              <td :if={@type == "entra"} class="px-2 py-2 text-right">
+                <Form.icon_button
+                  :if={index > 0}
+                  icon="ri-delete-bin-line"
+                  title={"Remove #{@label} #{value}"}
+                  size="sm"
+                  phx-click="remove_verified_organization"
+                  phx-value-organization={value}
+                />
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <Form.button
+        type="button"
+        id="verify-button"
+        style="primary"
+        size="xs"
+        icon="ri-external-link-line"
+        phx-click="start_verification"
+        phx-hook="OpenURL"
+        disabled={not ready_to_verify?(@form)}
+      >
+        {verify_button_label(@type, @values, @label)}
+      </Form.button>
+    </div>
+    """
+  end
+
+  defp verify_button_label(_type, [], _label), do: "Verify Now"
+  defp verify_button_label("google", _values, _label), do: "Refresh domains"
+  defp verify_button_label(_type, _values, label), do: "Verify another #{label}"
+
+  defp verification_help_text(form, type) do
+    if verified?(form) do
+      "This provider has been successfully verified."
+    else
+      "Sign in with your #{titleize(type)} account to verify the configuration."
+    end
+  end
+
+  defp verification_status_badge(assigns) do
+    ~H"""
+    <div
+      :if={verified?(@form)}
+      class="flex items-center gap-1.5 text-xs font-medium text-success bg-success-light px-2.5 py-1 rounded"
+    >
+      <Core.icon name="ri-checkbox-circle-line" class="w-3.5 h-3.5" /> Verified
+    </div>
+    <Form.button
+      :if={not verified?(@form) and ready_to_verify?(@form)}
+      type="button"
+      id="verify-button"
+      style="primary"
+      icon="ri-external-link-line"
+      phx-click="start_verification"
+      phx-hook="OpenURL"
+    >
+      Verify Now
+    </Form.button>
+    <Form.button
+      :if={not verified?(@form) and not ready_to_verify?(@form)}
+      type="button"
+      style="primary"
+      icon="ri-external-link-line"
+      disabled
+    >
+      Verify Now
+    </Form.button>
+    """
+  end
+
+  defp submit_provider(%{assigns: %{live_action: :new, form: %{source: changeset}}} = socket) do
+    Database.insert_provider(changeset, socket.assigns.subject)
+    |> handle_submit(socket)
+  end
+
+  defp submit_provider(%{assigns: %{live_action: :edit, form: %{source: changeset}}} = socket) do
+    Database.update_provider(changeset, socket.assigns.subject)
+    |> handle_submit(socket)
+  end
+
+  defp handle_submit({:ok, _provider}, socket) do
+    {:noreply,
+     socket
+     |> init()
+     |> put_flash(:success, "Authentication provider saved successfully.")
+     |> push_patch(to: ~p"/#{socket.assigns.account}/settings/authentication")}
+  end
+
+  defp handle_submit({:error, changeset}, socket) do
+    verification_error = verification_errors(changeset)
+    {:noreply, assign(socket, verification_error: verification_error, form: to_form(changeset))}
+  end
+
+  defp verification_errors(changeset) do
+    changeset.errors
+    |> Enum.filter(fn {field, _error} ->
+      field in [:issuer, :tenant_ids, :workspace_domains]
+    end)
+    |> case do
+      [] -> nil
+      errors -> Enum.map_join(errors, " ", fn {_field, {message, _opts}} -> message end)
+    end
+  end
+
+  defp ready_to_verify?(form) do
+    Enum.all?(form.source.errors, fn
+      # We'll set these fields during verification
+      {excluded, _errors}
+      when excluded in [:is_verified, :issuer, :tenant_ids, :workspace_domains] ->
+        true
+
+      {_field, _errors} ->
+        false
+    end)
+  end
+
+  defp provider_organizations(%Entra.AuthProvider{tenant_ids: tenant_ids}),
+    do: Enum.join(tenant_ids, ", ")
+
+  defp provider_organizations(%Google.AuthProvider{workspace_domains: [_ | _] = domains}),
+    do: Enum.join(domains, ", ")
+
+  defp provider_organizations(%Google.AuthProvider{workspace_domains: nil, is_legacy_unrestricted: true}),
+    do: "Unrestricted Google accounts"
+
+  defp provider_organizations(%Google.AuthProvider{workspace_domains: nil}),
+    do: "Personal Google accounts"
+
+  defp provider_organizations(provider), do: Map.get(provider, :issuer) || "—"
+
+  defp context_badge(assigns) do
+    {label, classes} =
+      case assigns.context do
+        :clients_and_portal ->
+          {"All", "bg-brand-muted text-brand"}
+
+        :clients_only ->
+          {"Clients", "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"}
+
+        :portal_only ->
+          {"Portal", "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"}
+
+        _ ->
+          {"—", "text-subtle"}
+      end
+
+    assigns = assign(assigns, label: label, classes: classes)
+
+    ~H"""
+    <span class={["text-[10px] font-semibold px-1.5 py-0.5 rounded", @classes]}>
+      {@label}
+    </span>
+    """
+  end
+
+  defp context_options, do: @context_options
+
+  defp select_type_classes, do: @select_type_classes
+
+  defp titleize("google"), do: "Google"
+  defp titleize("github"), do: "GitHub"
+  defp titleize("entra"), do: "Microsoft Entra"
+  defp titleize("okta"), do: "Okta"
+  defp titleize("oidc"), do: "OpenID Connect"
+
+  defp maybe_initialize_with_parent(changeset, account_id) do
+    if is_nil(get_field(changeset, :id)) do
+      id = Ecto.UUID.generate()
+      # Get the type based on the schema module
+      type = AuthProvider.type!(changeset.data.__struct__) |> String.to_existing_atom()
+
+      changeset
+      |> put_change(:id, id)
+      |> put_assoc(:auth_provider, %AuthProvider{id: id, account_id: account_id, type: type})
+    else
+      changeset
+    end
+  end
+
+  defp changeset(struct, attrs, socket, verified_fields \\ %{}) do
+    schema = struct.__struct__
+    changeset = cast(struct, attrs, Map.get(@fields, schema))
+
+    changeset
+    |> Form.keep_when_blank([:client_secret])
+    |> cast(verified_fields, Map.keys(verified_fields))
+    |> maybe_initialize_with_parent(socket.assigns.subject.account.id)
+    |> schema.changeset()
+    |> Form.reset_on_change(:client_secret, issuer_fields(schema))
+  end
+
+  # Verification and sign-in both send the client secret to the issuer.
+  defp issuer_fields(Okta.AuthProvider), do: [okta_domain: "Okta domain"]
+  defp issuer_fields(OIDC.AuthProvider), do: [discovery_document_uri: "discovery document URI"]
+  defp issuer_fields(_schema), do: []
+
+  # Rebuilt from the stored record so the typed changes stay changes and reach
+  # the update; applying them first would leave them out of the save.
+  defp resubmit(previous, attrs, socket) do
+    changeset(previous.data, Map.merge(previous.params, attrs), socket)
+  end
+
+  defp extract_disable_error(changeset) do
+    case Keyword.get(changeset.errors, :is_disabled) do
+      {msg, _} ->
+        msg
+
+      nil ->
+        # Get the first error message if is_disabled is not the issue
+        case changeset.errors do
+          [{_field, {msg, _}} | _] -> msg
+          [] -> "Failed to update authentication provider."
+        end
+    end
+  end
+
+  defp validate_not_disabling_default_provider(changeset) do
+    # Only run this validation if is_disabled is being changed
+    case get_change(changeset, :is_disabled) do
+      true ->
+        data = changeset.data
+
+        # Check if the provider is currently the default
+        if Map.has_key?(data, :is_default) && data.is_default do
+          add_error(
+            changeset,
+            :is_disabled,
+            "Cannot disable the default authentication provider. Please set a different provider as default first."
+          )
+        else
+          changeset
+        end
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp verified?(form) do
+    case form.source.data.__struct__ do
+      Entra.AuthProvider -> get_field(form.source, :tenant_ids) not in [nil, []]
+      Google.AuthProvider -> get_field(form.source, :is_verified) == true
+      schema when schema in [EmailOTP.AuthProvider, Userpass.AuthProvider] -> true
+      _schema -> get_field(form.source, :is_verified) == true
+    end
+  end
+
+  defp provider_type(module) do
+    AuthProvider.type!(module.__struct__)
+  end
+
+  defp assign_default_provider(provider_id, socket) do
+    provider =
+      socket.assigns.providers
+      |> Enum.find(fn provider -> provider.id == provider_id end)
+
+    with true <- provider_type(provider) not in ["email_otp", "userpass", "x509"],
+         {:ok, _result} <- Database.set_default_provider(provider, socket.assigns) do
+      socket =
+        socket
+        |> put_flash(:success, "Default authentication provider set to #{provider.name}")
+        |> init()
+
+      {:noreply, socket}
+    else
+      false ->
+        socket =
+          socket
+          |> put_flash(:error, "Built-in providers cannot be set as default.")
+
+        {:noreply, socket}
+
+      error ->
+        Logger.info("Failed to set default auth provider",
+          error: inspect(error)
+        )
+
+        socket =
+          socket
+          |> put_flash(
+            :error,
+            "Failed to update default auth provider. Contact support if this issue persists."
+          )
+
+        {:noreply, socket}
+    end
+  end
+
+  defp clear_default_provider(socket) do
+    with {:ok, _result} <- Database.clear_default_provider(socket.assigns) do
+      socket =
+        socket
+        |> put_flash(:success, "Default authentication provider cleared")
+        |> init()
+
+      {:noreply, socket}
+    else
+      error ->
+        Logger.info("Failed to clear default auth provider",
+          error: inspect(error)
+        )
+
+        socket =
+          socket
+          |> put_flash(
+            :error,
+            "Failed to update default auth provider. Contact support if this issue persists."
+          )
+
+        {:noreply, socket}
+    end
+  end
+
+  defp format_duration(seconds) when seconds < 60, do: "#{seconds}s"
+
+  defp format_duration(seconds) when seconds < 3_600 do
+    minutes = div(seconds, 60)
+    "#{minutes}m"
+  end
+
+  defp format_duration(seconds) when seconds < 86_400 do
+    hours = div(seconds, 3_600)
+    "#{hours}h"
+  end
+
+  defp format_duration(seconds) do
+    days = div(seconds, 86_400)
+    "#{days}d"
+  end
+
+  defmodule Database do
+    alias Portal.{AuthProvider, EmailOTP, X509, Userpass, OIDC, Entra, Google, GitHub, Okta, Safe}
+    import Ecto.Query
+    import Ecto.Changeset
+
+    def list_all_providers(subject, include_x509?) do
+      providers = [
+        EmailOTP.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
+        Userpass.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
+        Google.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
+        GitHub.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
+        Entra.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
+        Okta.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
+        OIDC.AuthProvider |> Safe.scoped(subject) |> Safe.all()
+      ]
+
+      providers =
+        if include_x509? do
+          [X509.AuthProvider |> Safe.scoped(subject) |> Safe.all() | providers]
+        else
+          providers
+        end
+
+      providers
+      |> List.flatten()
+    end
+
+    def has_trust_anchors?(subject) do
+      Portal.TrustAnchorCertificate
+      |> Safe.scoped(subject)
+      |> Safe.exists?()
+    end
+
+    def get_provider!(schema, id, subject) do
+      from(p in schema, where: p.id == ^id)
+      |> Safe.scoped(subject)
+      |> Safe.one!()
+    end
+
+    def insert_provider(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    def update_provider(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.update()
+    end
+
+    def delete_provider!(%X509.AuthProvider{}, _subject), do: {:error, :cannot_delete}
+
+    def delete_provider!(provider, subject) do
+      # Delete the parent auth_provider, which will CASCADE delete the child and tokens
+      parent =
+        from(p in AuthProvider, where: p.id == ^provider.id)
+        |> Safe.scoped(subject)
+        |> Safe.one!()
+
+      parent |> Safe.scoped(subject) |> Safe.delete()
+    end
+
+    # Policies keep referencing a deleted provider, so admins are warned how many need updating.
+    def count_policies_referencing_provider(provider_id, subject) do
+      from(p in Portal.Policy,
+        where:
+          fragment(
+            """
+            EXISTS (
+              SELECT 1 FROM unnest(?) AS c
+              WHERE c->>'property' = 'auth_provider_id' AND jsonb_exists(c->'values', ?)
+            )
+            """,
+            p.conditions,
+            ^provider_id
+          )
+      )
+      |> Safe.scoped(subject)
+      |> Safe.aggregate(:count)
+    end
+
+    def set_default_provider(provider, assigns) do
+      Safe.transact(fn ->
+        with :ok <- clear_all_defaults(assigns.providers, assigns.subject) do
+          # Then set is_default on the selected provider
+          changeset = change(provider, is_default: true)
+          changeset |> Safe.scoped(assigns.subject) |> Safe.update()
+        end
+      end)
+    end
+
+    def clear_default_provider(assigns) do
+      Safe.transact(fn ->
+        case clear_all_defaults(assigns.providers, assigns.subject) do
+          :ok -> {:ok, :cleared}
+          error -> error
+        end
+      end)
+    end
+
+    defp clear_all_defaults(providers, subject) do
+      Enum.reduce_while(providers, :ok, fn p, _acc ->
+        try_clear_default(p, subject)
+      end)
+    end
+
+    defp try_clear_default(p, subject) do
+      if Map.has_key?(p, :is_default) && p.is_default do
+        changeset = change(p, is_default: false)
+
+        case changeset |> Safe.scoped(subject) |> Safe.update() do
+          {:ok, _} -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      else
+        {:cont, :ok}
+      end
+    end
+
+    def enrich_with_session_counts(providers, subject) do
+      provider_ids = Enum.map(providers, & &1.id)
+
+      client_tokens_counts =
+        from(ct in Portal.ClientToken,
+          where: ct.auth_provider_id in ^provider_ids,
+          group_by: ct.auth_provider_id,
+          select: {ct.auth_provider_id, count(ct.id)}
+        )
+        |> Safe.scoped(subject)
+        |> Safe.all()
+        |> Map.new()
+
+      portal_sessions_counts =
+        from(ps in Portal.PortalSession,
+          where: ps.auth_provider_id in ^provider_ids,
+          group_by: ps.auth_provider_id,
+          select: {ps.auth_provider_id, count(ps.id)}
+        )
+        |> Safe.scoped(subject)
+        |> Safe.all()
+        |> Map.new()
+
+      Enum.map(providers, fn provider ->
+        provider
+        |> Map.put(:client_tokens_count, Map.get(client_tokens_counts, provider.id, 0))
+        |> Map.put(:portal_sessions_count, Map.get(portal_sessions_counts, provider.id, 0))
+      end)
+    end
+
+    # Already handled by cascade delete
+    def revoke_sessions_for_provider(nil, _subject), do: {:ok, 0}
+
+    def revoke_sessions_for_provider(provider, subject) do
+      Safe.transact(fn ->
+        {client_tokens_deleted, _} =
+          from(ct in Portal.ClientToken, where: ct.auth_provider_id == ^provider.id)
+          |> Safe.scoped(subject)
+          |> Safe.delete_all()
+
+        {portal_sessions_deleted, _} =
+          from(ps in Portal.PortalSession, where: ps.auth_provider_id == ^provider.id)
+          |> Safe.scoped(subject)
+          |> Safe.delete_all()
+
+        {:ok, client_tokens_deleted + portal_sessions_deleted}
+      end)
+    end
+  end
+end

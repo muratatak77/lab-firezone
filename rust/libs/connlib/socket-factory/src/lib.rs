@@ -1,0 +1,1542 @@
+use anyhow::{Context as _, Result};
+use bufferpool::Bytes;
+use ip_packet::{Ecn, Ipv4HeaderSlice, Ipv6HeaderSlice, UdpSlice};
+use opentelemetry::KeyValue;
+use quinn_udp::{EcnCodepoint, Transmit, UdpSockRef};
+use smallvec::SmallVec;
+use std::io;
+use std::io::IoSliceMut;
+use std::ops::Index;
+use std::time::Instant;
+use std::{
+    future::Future as _,
+    net::{IpAddr, SocketAddr},
+    task::{Context, Poll},
+};
+
+use std::any::Any;
+use std::pin::Pin;
+use tokio::io::Interest;
+
+mod buffer_sizes;
+mod pool;
+#[cfg(any(windows, test))]
+mod uro;
+
+pub use buffer_sizes::{
+    MAX_RECV_BATCH_MEMORY, MAX_RECV_BUFFER_MEMORY, RECV_BUFFER_SIZE, SEND_BUFFER_SIZE,
+};
+
+use pool::{OwnedSocket, Socket, SocketPool};
+
+pub trait SocketFactory<S>: Send + Sync + 'static {
+    fn bind(&self, local: SocketAddr) -> io::Result<S>;
+    fn reset(&self);
+}
+
+/// A socket could not be excluded from our own tunnel, so its traffic would loop back into it.
+///
+/// Platforms that route their own traffic around the tunnel - Android's `VpnService.protect`,
+/// and anything equivalent elsewhere - report a failure of that mechanism this way. Unlike a
+/// family that won't bind or an address that isn't up yet, this does not pass: every socket
+/// bound afterwards loops the same way, so consumers give up instead of rebinding forever.
+#[derive(thiserror::Error, Debug)]
+#[error("Failed to prevent a routing loop")]
+pub struct RoutingLoopPreventionFailed {
+    #[source]
+    cause: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl RoutingLoopPreventionFailed {
+    pub fn new(cause: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self {
+            cause: cause.into(),
+        }
+    }
+}
+
+impl From<RoutingLoopPreventionFailed> for io::Error {
+    fn from(value: RoutingLoopPreventionFailed) -> Self {
+        io::Error::other(value)
+    }
+}
+
+/// How many times we at most try to re-send a packet if we encounter ENOBUFS on MacOS / iOS or 10055 on Windows.
+#[cfg(any(apple, target_os = "windows"))]
+const MAX_ENOBUFS_RETRIES: u32 = 24;
+
+/// Upper bound (as a power of two) for how many times we busy-spin between send retries.
+///
+/// `2^6 = 64` iterations of [`std::hint::spin_loop`] stay well below a microsecond.
+const SPIN_LIMIT: u32 = 6;
+
+/// The Windows equivalent of ENOBUFS.
+///
+/// "An operation on a socket could not be performed because the system lacked sufficient buffer space or because a queue was full. (os error 10055)"
+#[cfg(target_os = "windows")]
+const WINDOWS_ENOBUFS: i32 = 10055;
+
+impl<F, S> SocketFactory<S> for F
+where
+    F: Fn(SocketAddr) -> io::Result<S> + Send + Sync + 'static,
+{
+    fn bind(&self, local: SocketAddr) -> io::Result<S> {
+        (self)(local)
+    }
+
+    fn reset(&self) {}
+}
+
+pub fn tcp(addr: SocketAddr) -> io::Result<TcpSocket> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+
+    socket.set_nodelay(true)?;
+
+    Ok(TcpSocket {
+        inner: socket,
+        backpack: None,
+    })
+}
+
+pub fn udp(std_addr: SocketAddr) -> io::Result<UdpSocket> {
+    let addr = socket2::SockAddr::from(std_addr);
+    let socket = socket2::Socket::new(addr.domain(), socket2::Type::DGRAM, None)?;
+
+    // Note: for AF_INET sockets IPV6_V6ONLY is not a valid flag
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+        prefer_stable_ipv6_source(&socket);
+    }
+
+    socket.set_nonblocking(true)?;
+
+    // On Apple, connected flow sockets share the catch-all socket's local port (see `pool::apple`).
+    // Darwin only lets sockets share a port if every one of them - including the one bound first -
+    // opts into `SO_REUSEPORT`, so set it (and `SO_REUSEADDR`, to match the flow sockets) before
+    // binding. Without this the first flow `bind()` fails with `EADDRINUSE` and the fast path
+    // latches off.
+    #[cfg(apple)]
+    {
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+    }
+
+    // Darwin attaches the destination-address control message when it enqueues a datagram,
+    // not when we read it, so the option must be on before the socket can receive anything.
+    let state = quinn_udp::UdpSocketState::new(UdpSockRef::from(&socket))?;
+
+    socket.bind(&addr)?;
+
+    let socket = std::net::UdpSocket::from(socket);
+    let socket = tokio::net::UdpSocket::try_from(socket)?;
+    let socket = UdpSocket::new(socket, state)?;
+
+    Ok(socket)
+}
+
+/// The socket option to prefer a stable IPv6 source address, with the value that selects it.
+///
+/// On Apple, `IPV6_PREFER_TEMPADDR` (from xnu's `netinet6/in6.h`, not exposed by `libc`)
+/// overrides the system-wide `prefer_tempaddr` sysctl per socket; `0` selects the stable
+/// address. Linux and Android implement RFC 5014 instead.
+#[cfg(apple)]
+const STABLE_IPV6_SOURCE_OPTION: (libc::c_int, libc::c_int) = (63, 0);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const STABLE_IPV6_SOURCE_OPTION: (libc::c_int, libc::c_int) =
+    (libc::IPV6_ADDR_PREFERENCES, libc::IPV6_PREFER_SRC_PUBLIC);
+
+/// Prefers a stable IPv6 source address over a temporary (RFC 8981) one for this socket.
+///
+/// The kernel selects the source address for every socket that does not pin one: per
+/// `connect` for connected sockets and per datagram for unconnected ones, and it prefers
+/// temporary addresses by default. Temporary addresses rotate periodically, which
+/// silently changes the selected source: connected sockets keep their now-deprecated
+/// address until it is removed and sends fail with `EADDRNOTAVAIL`, and every rotation
+/// changes the host candidate our peers learn, costing us relay allocations and
+/// connectivity re-checks. The stable address lives as long as the network attachment
+/// itself, which is exactly the lifetime of our sockets.
+///
+/// Failure is logged and otherwise ignored: without the preference the socket still
+/// works, it merely keeps following the rotating addresses.
+#[cfg(any(apple, target_os = "linux", target_os = "android"))]
+fn prefer_stable_ipv6_source(socket: &socket2::Socket) {
+    use std::os::fd::AsRawFd as _;
+
+    let (option, value) = STABLE_IPV6_SOURCE_OPTION;
+
+    // SAFETY: `value` outlives the call and the option length matches its type.
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            option,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+
+    if ret != 0 {
+        let error = io::Error::last_os_error();
+
+        tracing::warn!(%error, "Failed to prefer stable IPv6 source address");
+    }
+}
+
+#[cfg(not(any(apple, target_os = "linux", target_os = "android")))]
+fn prefer_stable_ipv6_source(_socket: &socket2::Socket) {}
+
+pub struct TcpSocket {
+    inner: tokio::net::TcpSocket,
+    /// A location to store additional data with the [`TcpSocket`].
+    backpack: Option<Box<dyn Any + Send + Sync + Unpin + 'static>>,
+}
+
+impl TcpSocket {
+    pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
+        let tcp_stream = self.inner.connect(addr).await?;
+
+        Ok(TcpStream {
+            inner: tcp_stream,
+            _backpack: self.backpack,
+        })
+    }
+
+    pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {
+        self.inner.bind(addr)
+    }
+
+    /// Pack some custom data into the backpack of this [`TcpSocket`].
+    ///
+    /// The data will be carried around until the [`TcpSocket`] is dropped.
+    pub fn pack(&mut self, luggage: impl Any + Send + Sync + Unpin + 'static) {
+        self.backpack = Some(Box::new(luggage));
+    }
+}
+
+pub struct TcpStream {
+    inner: tokio::net::TcpStream,
+    /// A location to store additional data with the [`TcpStream`].
+    _backpack: Option<Box<dyn Any + Send + Sync + Unpin + 'static>>,
+}
+
+impl tokio::io::AsyncWrite for TcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.as_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.as_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.as_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl tokio::io::AsyncRead for TcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.as_mut().inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for TcpSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for TcpSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+pub struct UdpSocket {
+    inner: tokio::net::UdpSocket,
+    state: quinn_udp::UdpSocketState,
+    source_ip_resolver:
+        Option<Box<dyn Fn(IpAddr) -> std::io::Result<IpAddr> + Send + Sync + 'static>>,
+    port: u16,
+}
+
+/// A UDP socket with performance optimisations for fast send & receive.
+pub struct PerfUdpSocket {
+    /// The socket(s) we send and receive on; see [`SocketPool`].
+    pool: SocketPool,
+
+    /// How many bytes each buffer of a batched receive holds.
+    recv_buf_size: usize,
+
+    batch_histogram: opentelemetry::metrics::Histogram<u64>,
+    send_retry_histogram: opentelemetry::metrics::Histogram<u64>,
+    #[cfg(apple)]
+    dropped_packets: opentelemetry::metrics::Counter<u64>,
+    send_blocked_histogram: opentelemetry::metrics::Histogram<f64>,
+    source_ip_resolver:
+        Option<Box<dyn Fn(IpAddr) -> std::io::Result<IpAddr> + Send + Sync + 'static>>,
+    port: u16,
+}
+
+impl UdpSocket {
+    fn new(inner: tokio::net::UdpSocket, state: quinn_udp::UdpSocketState) -> io::Result<Self> {
+        let socket_addr = inner.local_addr()?;
+        let port = socket_addr.port();
+
+        Ok(UdpSocket {
+            port,
+            inner,
+            state,
+            source_ip_resolver: None,
+        })
+    }
+
+    /// Upgrade this [`UdpSocket`] to a [`PerfUdpSocket`] for optimized IO.
+    pub fn into_perf(self) -> io::Result<PerfUdpSocket> {
+        let quinn_state = self.state;
+
+        #[cfg(apple)]
+        // SAFETY: All versions of MacOS / iOS that we tested support these APIs.
+        unsafe {
+            quinn_state.set_apple_fast_path();
+        }
+
+        // A single `recv` may receive several datagrams coalesced into one buffer via
+        // generic receive offload (GRO). The kernel coalesces up to `gro_segments`
+        // datagrams of at most `MAX_FZ_PAYLOAD` bytes each, so the buffer must be large
+        // enough to hold that entire batch. On platforms without GRO `gro_segments` is 1,
+        // sizing the buffer to a single datagram.
+        let recv_buf_size = ip_packet::MAX_FZ_PAYLOAD * quinn_state.gro_segments();
+
+        let wildcard = OwnedSocket::new(self.inner, quinn_state, false);
+
+        Ok(PerfUdpSocket {
+            pool: SocketPool::new(wildcard),
+            recv_buf_size,
+            batch_histogram: otel_instruments::network_packets_batch_count(),
+            send_retry_histogram: otel_instruments::network_retries(),
+            #[cfg(apple)]
+            dropped_packets: otel_instruments::network_packet_dropped(),
+            send_blocked_histogram: otel_instruments::network_send_blocked_duration(),
+            source_ip_resolver: self.source_ip_resolver,
+            port: self.port,
+        })
+    }
+
+    /// Configures a new source IP resolver for this UDP socket.
+    ///
+    /// In case [`DatagramOut::src`] is [`None`], this function will be used to set a source IP given the destination IP of the datagram.
+    /// If set, this function will be called for _every_ packet and should therefore be fast.
+    ///
+    /// Errors during resolution result in the packet being dropped.
+    pub fn with_source_ip_resolver(
+        mut self,
+        resolver: Box<dyn Fn(IpAddr) -> std::io::Result<IpAddr> + Send + Sync + 'static>,
+    ) -> Self {
+        self.source_ip_resolver = Some(resolver);
+        self
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for UdpSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for UdpSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+/// An inbound UDP datagram of a [`DatagramBatch`], possibly GRO / URO-coalesced from several segments
+/// that all come from the same remote address.
+pub struct DatagramIn {
+    buffer: Bytes,
+    local: SocketAddr,
+    from: SocketAddr,
+    ecn: Ecn,
+    len: usize,
+    stride: usize,
+}
+
+/// Where a segment lies within its [`DatagramIn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    start: usize,
+    end: usize,
+}
+
+/// An outbound UDP datagram.
+pub struct DatagramOut {
+    pub src: Option<SocketAddr>,
+    pub dst: SocketAddr,
+    pub packet: Bytes,
+    pub segment_size: usize,
+    pub ecn: Ecn,
+}
+
+/// The most segments one GSO send may carry (`UDP_MAX_SEGMENTS` in `linux/udp.h`; `quinn-udp` reports the same on Linux).
+pub const MAX_GSO_SEGMENTS: usize = 64;
+
+impl DatagramOut {
+    /// The largest [`DatagramOut::packet`] that can be flushed to `dst` in a single GSO send.
+    ///
+    /// One send's payload is bounded by the maximum IP packet size less IP/UDP header overhead,
+    /// and by the kernel's segment limit; the result is a whole number of segments.
+    /// Returns zero if not even a single segment fits.
+    ///
+    /// Actual sends are additionally subject to the socket's runtime GSO support and may get
+    /// chunked below this, but never above it.
+    pub fn max_len(dst: SocketAddr, segment_size: usize) -> usize {
+        let header_overhead = match dst {
+            SocketAddr::V4(_) => Ipv4HeaderSlice::MAX_LEN + UdpSlice::HEADER_LEN,
+            SocketAddr::V6(_) => Ipv6HeaderSlice::LEN + UdpSlice::HEADER_LEN,
+        };
+
+        let max_segments_by_size = (u16::MAX as usize - header_overhead) / segment_size.max(1);
+        let max_segments = std::cmp::min(MAX_GSO_SEGMENTS, max_segments_by_size);
+
+        segment_size * max_segments
+    }
+}
+
+impl PerfUdpSocket {
+    /// Receives a batch of datagrams from whichever of our sockets becomes ready first.
+    pub async fn recv_from(&self) -> Result<DatagramBatch> {
+        std::future::poll_fn(|cx| {
+            self.pool
+                .poll_recv(cx, |socket| self.try_recv_batch(socket))
+        })
+        .await
+    }
+
+    /// Attempts to receive a batch of datagrams from the given socket without blocking.
+    ///
+    /// Returns `WouldBlock` if the socket is not readable, clearing tokio's cached
+    /// readiness in the process so that waiting for readiness actually suspends.
+    fn try_recv_batch(&self, socket: Socket<'_>) -> io::Result<DatagramBatch> {
+        let mut batch = RecvBatch::pull(self.recv_buf_size);
+
+        let len = socket.inner.try_io(Interest::READABLE, || {
+            // The loop only re-iterates on Apple, where connected sockets surface (one-shot)
+            // ICMP errors on receive that we skip past; hence the `never_loop` allow elsewhere.
+            #[cfg_attr(not(apple), allow(clippy::never_loop))]
+            loop {
+                let (mut io_bufs, metas) = batch.recv_slices();
+
+                match socket.recv(&mut io_bufs, metas) {
+                    // Connected sockets surface (one-shot) ICMP errors on receive; they are not fatal.
+                    #[cfg(apple)]
+                    Err(e) if socket.connected && is_icmp_unreachable(&e) => {
+                        tracing::trace!("Ignoring ICMP error on connected UDP socket: {e}");
+                        continue;
+                    }
+                    result => break result,
+                }
+            }
+        })?;
+
+        #[cfg(windows)]
+        if uro::detect_broken_coalescing(
+            batch
+                .buffers
+                .iter()
+                .map(|b| &b[..])
+                .zip(batch.metas.iter_mut())
+                .take(len),
+        ) {
+            socket.disable_gro();
+        }
+
+        let batch = DatagramBatch::new(batch.buffers, batch.metas, self.port, len);
+
+        // `len` only counts the buffers the syscall filled; with GRO a single buffer holds
+        // several datagrams, so the segments across all buffers are what we want here.
+        self.batch_histogram.record(
+            batch.len() as u64,
+            &[
+                KeyValue::new("network.transport", "udp"),
+                KeyValue::new("network.io.direction", "receive"),
+            ],
+        );
+
+        Ok(batch)
+    }
+
+    pub async fn send(&self, datagram: DatagramOut) -> Result<()> {
+        let transmit = self.prepare_transmit(
+            datagram.dst,
+            datagram.src.map(|s| s.ip()),
+            &datagram.packet,
+            datagram.segment_size,
+            datagram.ecn,
+        )?;
+
+        let datagrams = transmit.contents.len().div_ceil(datagram.segment_size);
+        let pooled =
+            self.pool
+                .get_send_socket(transmit.src_ip, datagram.dst, datagrams, self.recv_buf_size);
+
+        self.send_transmit(pooled.as_socket(), &transmit).await
+    }
+
+    /// The number of connected per-destination "flow" sockets currently cached.
+    ///
+    /// Exposed for integration tests. Always `0` on non-Apple platforms, where all
+    /// traffic uses the single catch-all socket.
+    #[doc(hidden)]
+    pub fn flow_socket_count(&self) -> usize {
+        self.pool.flow_socket_count()
+    }
+
+    pub fn set_buffer_sizes(
+        &mut self,
+        requested_send_buffer_size: usize,
+        requested_recv_buffer_size: usize,
+    ) {
+        self.pool.set_buffer_sizes(
+            requested_send_buffer_size,
+            requested_recv_buffer_size,
+            self.port,
+        );
+    }
+
+    /// Sends a [`Transmit`] over the given socket, chunked to honor GSO limits.
+    ///
+    /// Connected sockets participate in Darwin's flow advisories: under congestion the kernel
+    /// drops the datagram, returns `ENOBUFS` and fails all further sends instantly until the
+    /// interface queue drains, which it signals via write-readiness. For those, we park until
+    /// that signal instead of spinning.
+    async fn send_transmit(&self, socket: Socket<'_>, transmit: &Transmit<'_>) -> Result<()> {
+        let segment_size = transmit
+            .segment_size
+            .expect("`segment_size` must always be set");
+        // On a connected socket the source is pinned by the binding, so we drop the cmsg.
+        let src = if socket.connected {
+            None
+        } else {
+            transmit.src_ip
+        };
+        let dst = transmit.destination;
+
+        let total = transmit.contents.len();
+
+        // Offset of the next byte that still needs to be sent. On a retryable error
+        // we resume from here instead of restarting the whole transmit, so a batch
+        // the kernel already accepted is never re-sent.
+        let mut offset = 0;
+        let mut attempt = 0;
+        let mut blocked_since = None;
+
+        while offset < total {
+            // Recompute every iteration: an `EIO` makes `quinn-udp` disable GSO, so
+            // the remaining data needs to be re-split into smaller batches.
+            let chunk_size = self.calculate_chunk_size(socket.state, segment_size, dst)?;
+
+            let end = std::cmp::min(offset + chunk_size, total);
+            let contents = &transmit.contents[offset..end];
+
+            let chunk = Transmit {
+                destination: dst,
+                ecn: transmit.ecn,
+                contents,
+                segment_size: Some(segment_size),
+                src_ip: src,
+            };
+
+            #[cfg(debug_assertions)]
+            tracing::trace!(target: "wire::net::send", ?src, %dst, ecn = ?chunk.ecn, num_packets = %contents.len().div_ceil(segment_size), %segment_size, connected = %socket.connected);
+
+            let result = if socket.connected {
+                // Connected sockets never return `EWOULDBLOCK` on Darwin; issue the syscall
+                // directly instead of going through tokio's (always-set) write-readiness.
+                socket
+                    .state
+                    .try_send(UdpSockRef::from(socket.inner), &chunk)
+            } else {
+                let mut send = std::pin::pin!(socket.inner.async_io(Interest::WRITABLE, || {
+                    socket
+                        .state
+                        .try_send(UdpSockRef::from(socket.inner), &chunk)
+                }));
+
+                std::future::poll_fn(|cx| {
+                    let result = send.as_mut().poll(cx);
+                    if result.is_pending() {
+                        blocked_since.get_or_insert_with(Instant::now);
+                    }
+                    result
+                })
+                .await
+            };
+
+            match result {
+                Ok(sent) => {
+                    // The kernel may accept only a prefix of the batch, e.g. `sendmsg_x`
+                    // under memory pressure; resume from the first unsent datagram.
+                    let sent_bytes = match chunk.advance(sent) {
+                        Some(remainder) => contents.len() - remainder.contents.len(),
+                        None => contents.len(),
+                    };
+
+                    self.record_send_batch_size(sent.get());
+                    self.record_send_retries(attempt);
+                    self.record_send_blocked_duration(
+                        blocked_since.take(),
+                        socket.connected,
+                        "progress",
+                    );
+
+                    offset += sent_bytes;
+                    attempt = 0; // Each batch gets its own retry budget.
+                }
+                // Connected sockets get a write-readiness wakeup from the kernel's flow advisory
+                // once the interface queue drains, so we park until then.
+                #[cfg(apple)]
+                Err(e) if socket.connected && should_retry(&e, attempt) => {
+                    blocked_since.get_or_insert_with(Instant::now);
+                    wait_for_send_capacity(socket.inner).await;
+                    attempt += 1;
+                }
+                // The unconnected catch-all gets no such signal; spin, since the `ENOBUFS`
+                // clears off-thread (driver / NIC) within microseconds.
+                Err(e) if should_retry(&e, attempt) => {
+                    #[cfg(any(apple, target_os = "windows"))]
+                    blocked_since.get_or_insert_with(Instant::now);
+                    spin_and_yield(attempt).await;
+                    attempt += 1;
+                }
+                #[cfg(apple)]
+                Err(e) if socket.connected && is_icmp_unreachable(&e) => {
+                    self.record_send_retries(attempt);
+                    self.dropped_packets.add(
+                        chunk.datagram_count() as u64,
+                        &[
+                            KeyValue::new("network.transport", "udp"),
+                            KeyValue::new("network.io.direction", "transmit"),
+                            KeyValue::new(
+                                "error.code",
+                                e.raw_os_error().unwrap_or_default() as i64,
+                            ),
+                        ],
+                    );
+                    self.record_send_blocked_duration(
+                        blocked_since.take(),
+                        socket.connected,
+                        "failure",
+                    );
+
+                    // The kernel received an ICMP error for this path; the error is one-shot.
+                    // Drop the packet: either the path recovers or connlib migrates / times out.
+                    tracing::debug!(%dst, "Dropping packet for unreachable destination: {e}");
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.record_send_retries(attempt);
+                    self.record_send_blocked_duration(
+                        blocked_since.take(),
+                        socket.connected,
+                        "failure",
+                    );
+
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to send {} bytes at offset {offset}/{total} with segment_size {segment_size} to {dst}",
+                            contents.len()
+                        )
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Records the number of segments sent in a single batched syscall.
+    fn record_send_batch_size(&self, num_segments: usize) {
+        self.batch_histogram.record(
+            num_segments as u64,
+            &[
+                KeyValue::new("network.transport", "udp"),
+                KeyValue::new("network.io.direction", "transmit"),
+            ],
+        );
+    }
+
+    /// Records how many times a single batch had to be retried before it went through or was dropped.
+    ///
+    /// Batches that succeed on the first try (the common case) are not recorded, keeping the hot path cheap.
+    fn record_send_retries(&self, attempt: u32) {
+        if attempt == 0 {
+            return;
+        }
+
+        self.send_retry_histogram.record(
+            attempt as u64,
+            &[
+                KeyValue::new("network.transport", "udp"),
+                KeyValue::new("network.io.direction", "transmit"),
+            ],
+        );
+    }
+
+    fn record_send_blocked_duration(
+        &self,
+        blocked_since: Option<Instant>,
+        connected: bool,
+        outcome: &'static str,
+    ) {
+        let Some(blocked_since) = blocked_since else {
+            return;
+        };
+
+        self.send_blocked_histogram.record(
+            blocked_since.elapsed().as_secs_f64(),
+            &[
+                KeyValue::new("network.transport", "udp"),
+                KeyValue::new("network.io.direction", "transmit"),
+                KeyValue::new("network.socket.connected", connected),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+    }
+
+    /// Calculate the chunk size for a given segment size.
+    ///
+    /// A chunk is bounded by [`DatagramOut::max_len`] and by the socket's runtime GSO support:
+    /// in case GSO is not supported at all by the kernel, `quinn_udp` will detect this and set
+    /// `max_gso_segments` to 1.
+    ///
+    /// Fails if `segment_size` exceeds the maximum UDP payload, in which case not even a single segment fits.
+    fn calculate_chunk_size(
+        &self,
+        state: &quinn_udp::UdpSocketState,
+        segment_size: usize,
+        dst: SocketAddr,
+    ) -> Result<usize> {
+        let chunk_size = std::cmp::min(
+            segment_size * state.max_gso_segments(),
+            DatagramOut::max_len(dst, segment_size),
+        );
+
+        anyhow::ensure!(
+            chunk_size > 0,
+            "segment_size {segment_size} exceeds the maximum UDP payload for {dst}"
+        );
+
+        Ok(chunk_size)
+    }
+
+    fn prepare_transmit<'a>(
+        &self,
+        dst: SocketAddr,
+        src_ip: Option<IpAddr>,
+        packet: &'a [u8],
+        segment_size: usize,
+        ecn: Ecn,
+    ) -> Result<quinn_udp::Transmit<'a>> {
+        let src_ip = match src_ip {
+            Some(src_ip) => Some(src_ip),
+            None => self.resolve_source_for(dst.ip()).with_context(|| {
+                format!(
+                    "Failed to select egress interface for packet to {}",
+                    dst.ip()
+                )
+            })?,
+        };
+
+        let transmit = quinn_udp::Transmit {
+            destination: dst,
+            ecn: ecn_codepoint(ecn),
+            contents: packet,
+            segment_size: Some(segment_size),
+            src_ip,
+        };
+
+        Ok(transmit)
+    }
+
+    /// Attempt to resolve the source IP to use for sending to the given destination IP.
+    fn resolve_source_for(&self, dst: IpAddr) -> std::io::Result<Option<IpAddr>> {
+        let Some(resolver) = self.source_ip_resolver.as_ref() else {
+            // If we don't have a resolver, let the operating system decide.
+            return Ok(None);
+        };
+
+        let src = (resolver)(dst)?;
+
+        Ok(Some(src))
+    }
+}
+
+impl UdpSocket {
+    /// Performs a single request-response handshake with the specified destination socket address.
+    ///
+    /// This consumes `self` because we want to enforce that we only receive a single message on this socket.
+    /// UDP is stateless and therefore, anybody can just send a packet to the destination.
+    ///
+    /// To simulate a handshake, we therefore only wait for a single message arriving on this socket,
+    /// after that, we discard it, freeing up the used source port.
+    ///
+    /// This is similar to the `connect` functionality but that one doesn't seem to work reliably in a cross-platform way.
+    pub async fn handshake<const BUF_SIZE: usize>(
+        self,
+        dst: SocketAddr,
+        payload: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        let src_ip = self
+            .source_ip_resolver
+            .as_ref()
+            .map(|resolve| resolve(dst.ip()))
+            .transpose()?;
+
+        // A plain `send_to` cannot carry a source IP; sending via [`quinn_udp`] pins the
+        // resolved source through a control message, like all other sends on our sockets.
+        let state = &self.state;
+        let transmit = Transmit {
+            destination: dst,
+            ecn: None,
+            contents: payload,
+            segment_size: None,
+            src_ip,
+        };
+
+        // A `Transmit` without a `segment_size` is a single datagram, so a successful send is complete.
+        let _ = self
+            .inner
+            .async_io(Interest::WRITABLE, || {
+                state.try_send(UdpSockRef::from(&self.inner), &transmit)
+            })
+            .await?;
+
+        let mut buffer = vec![0u8; BUF_SIZE];
+
+        let (num_received, sender) = self.inner.recv_from(&mut buffer).await?;
+
+        // Even though scopes are technically important for link-local IPv6 addresses, they can be ignored for our purposes.
+        // We only want to ensure that the reply is from the expected source after we have already received the packet.
+        if !is_equal_modulo_scope_for_ipv6_link_local(dst, sender) {
+            return Err(io::Error::other(format!(
+                "Unexpected reply source: {sender}; expected: {dst}"
+            )));
+        }
+
+        buffer.truncate(num_received);
+
+        Ok(buffer)
+    }
+}
+
+/// Applies the requested buffer size to a socket, halving it until the kernel accepts it.
+///
+/// Apple platforms reject buffer sizes above `kern.ipc.maxsockbuf` with `ENOBUFS` instead of
+/// clamping them like Linux does.
+pub(crate) fn apply_buffer_size(
+    requested: usize,
+    mut set: impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<()> {
+    /// Buffer sizes below this are not worth trading for an error message; all platforms accept it.
+    const FLOOR: usize = 64 * 1024;
+
+    let mut size = requested;
+
+    loop {
+        match set(size) {
+            Ok(()) => return Ok(()),
+            Err(_) if size > FLOOR => size /= 2,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Compares the two [`SocketAddr`]s for equality, ignored IPv6 scopes for link-local addresses.
+fn is_equal_modulo_scope_for_ipv6_link_local(expected: SocketAddr, actual: SocketAddr) -> bool {
+    match (expected, actual) {
+        (SocketAddr::V6(expected), SocketAddr::V6(mut actual))
+            if expected.scope_id() == 0 && actual.ip().is_unicast_link_local() =>
+        {
+            actual.set_scope_id(0);
+
+            expected == actual
+        }
+        (SocketAddr::V4(expected), SocketAddr::V4(actual)) => expected == actual,
+        (SocketAddr::V6(expected), SocketAddr::V6(actual)) => expected == actual,
+        (SocketAddr::V6(_), SocketAddr::V4(_)) | (SocketAddr::V4(_), SocketAddr::V6(_)) => false,
+    }
+}
+
+/// Whether the error originates from an ICMP message for a connected socket's path.
+#[cfg(apple)]
+fn is_icmp_unreachable(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::ECONNREFUSED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::EHOSTDOWN
+                | libc::ENETDOWN
+        )
+    )
+}
+
+/// Whether a failed send should be retried for the given attempt.
+fn should_retry(e: &io::Error, attempt: u32) -> bool {
+    let Some(raw_os_error) = e.raw_os_error() else {
+        return false;
+    };
+
+    // On Linux / Android, `EIO` or `EINVAL` means `quinn-udp` just disabled GSO; we retry
+    // once to re-send the data split into smaller batches.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if (raw_os_error == libc::EIO || raw_os_error == libc::EINVAL) && attempt < 1 {
+        return true;
+    }
+
+    // On MacOS / iOS, the kernel returns `ENOBUFS` when the interface queue fills up.
+    #[cfg(apple)]
+    if raw_os_error == libc::ENOBUFS && attempt < MAX_ENOBUFS_RETRIES {
+        return true;
+    }
+
+    // On Windows, error 10055 is the equivalent of `ENOBUFS`; same transient condition.
+    #[cfg(target_os = "windows")]
+    if raw_os_error == WINDOWS_ENOBUFS && attempt < MAX_ENOBUFS_RETRIES {
+        return true;
+    }
+
+    false
+}
+
+/// Briefly back off after a retryable send error before trying again.
+///
+/// We avoid `tokio::time::sleep`: its timer wheel rounds up to ~1ms (~15ms on
+/// Windows), far longer than the microseconds an `ENOBUFS` needs to clear. Instead
+/// we spin a few (escalating) times and then cooperatively yield. The yield matters:
+/// send and receive share a single-threaded runtime, so a pure spin would starve the
+/// receive task.
+async fn spin_and_yield(attempt: u32) {
+    for _ in 0..(1u32 << attempt.min(SPIN_LIMIT)) {
+        std::hint::spin_loop();
+    }
+
+    tokio::task::yield_now().await;
+}
+
+/// Parks until the kernel signals send capacity on the given (connected) socket, bounded by a timeout.
+///
+/// After a flow-advisory `ENOBUFS`, the kernel marks the socket not-writable and fires
+/// `EVFILT_WRITE` once the interface queue drains. tokio's cached write-readiness is stale
+/// at that point (UDP sends never return `EWOULDBLOCK` on Darwin, so it is never cleared),
+/// which is why we clear it explicitly before parking.
+///
+/// The timeout is a liveness backstop: `ENOBUFS` without a flow advisory (e.g. from mbuf
+/// exhaustion) never produces a wakeup. An early timeout merely costs one failed send
+/// before we park again.
+#[cfg(apple)]
+async fn wait_for_send_capacity(socket: &tokio::net::UdpSocket) {
+    let _ = socket.try_io(Interest::WRITABLE, || {
+        Err::<(), io::Error>(io::ErrorKind::WouldBlock.into())
+    });
+
+    let timeout = std::time::Duration::from_millis(10);
+    let _ = tokio::time::timeout(timeout, socket.writable()).await;
+}
+
+/// The storage for one receive batch: a datagram buffer plus its metadata per slot.
+///
+/// The buffers and metas live in heap-allocated `Vec`s rather than inline in
+/// [`DatagramBatch`]: the batch is sent over a channel and inline storage would make
+/// every channel slot (and thus tokio's block allocations) carry the full batch size.
+pub(crate) struct RecvBatch {
+    buffers: Vec<Bytes>,
+    metas: Vec<quinn_udp::RecvMeta>,
+}
+
+impl RecvBatch {
+    /// Pulls the storage for one receive batch of `recv_buf_size`-byte buffers.
+    pub(crate) fn pull(recv_buf_size: usize) -> Self {
+        Self {
+            buffers: std::iter::repeat_with(|| {
+                let mut buffer = Bytes::fitting(recv_buf_size);
+                buffer.expose(recv_buf_size);
+
+                buffer
+            })
+            .take(quinn_udp::BATCH_SIZE)
+            .collect(),
+            metas: vec![quinn_udp::RecvMeta::default(); quinn_udp::BATCH_SIZE],
+        }
+    }
+
+    /// The batch's datagram buffers as scatter slices, paired with the meta array the
+    /// kernel fills in — the two arguments a `recvmmsg`-style read expects. Borrows the
+    /// batch for the duration of the read; afterwards the buffers are handed to a
+    /// [`DatagramBatch`].
+    fn recv_slices(
+        &mut self,
+    ) -> (
+        SmallVec<[IoSliceMut<'_>; quinn_udp::BATCH_SIZE]>,
+        &mut [quinn_udp::RecvMeta],
+    ) {
+        let io_bufs = self
+            .buffers
+            .iter_mut()
+            .map(|b| IoSliceMut::new(b))
+            .collect();
+
+        (io_bufs, &mut self.metas)
+    }
+}
+
+/// A batch of datagrams, received from the socket in a single syscall and exchanged
+/// over the socket channels as a single item.
+///
+/// The datagrams stay in the receive buffers the kernel filled; the buffers and metas
+/// live in heap-allocated `Vec`s (see `RecvBatch`), so moving a batch only copies a
+/// couple of pointers. Callers consume a batch with [`DatagramBatch::drain`],
+/// which yields each buffer as a [`DatagramIn`] that segments GRO / URO-coalesced
+/// datagrams apart again.
+///
+#[derive(Clone, derive_more::Debug)]
+pub struct DatagramBatch {
+    #[debug(skip)]
+    buffers: Vec<Bytes>,
+    #[debug(skip)]
+    metas: Vec<quinn_udp::RecvMeta>,
+
+    port: u16,
+    num_packets: usize,
+}
+
+impl DatagramBatch {
+    pub fn new(
+        mut buffers: Vec<Bytes>,
+        mut metas: Vec<quinn_udp::RecvMeta>,
+        port: u16,
+        len: usize,
+    ) -> Self {
+        // Drop the unused buffers / metas.
+        buffers.truncate(len);
+        metas.truncate(len);
+
+        let num_packets = metas.iter().map(num_segments).sum::<usize>();
+
+        Self {
+            buffers,
+            metas,
+            port,
+            num_packets,
+        }
+    }
+
+    /// Creates the batch a socket bound to the datagrams' `dst` receives in one syscall.
+    ///
+    /// A datagram longer than its `segment_size` arrives coalesced, as with GRO.
+    ///
+    /// # Panics
+    ///
+    /// If a datagram has no `src`.
+    pub fn from_datagrams(datagrams: impl IntoIterator<Item = DatagramOut>) -> Self {
+        let mut port = 0;
+        let (buffers, metas): (Vec<_>, Vec<_>) = datagrams
+            .into_iter()
+            .map(|datagram| {
+                port = datagram.dst.port();
+
+                let mut meta = quinn_udp::RecvMeta::default();
+                meta.addr = datagram
+                    .src
+                    .expect("received datagrams should have a `src`");
+                meta.len = datagram.packet.len();
+                meta.stride = datagram.segment_size;
+                meta.dst_ip = Some(datagram.dst.ip());
+                meta.ecn = ecn_codepoint(datagram.ecn);
+
+                (datagram.packet, meta)
+            })
+            .unzip();
+        let len = buffers.len();
+
+        Self::new(buffers, metas, port, len)
+    }
+
+    /// How many datagrams this batch carries, as counted from the kernel's receive metadata.
+    ///
+    /// [`DatagramBatch::drain`] may yield fewer datagrams than this: receives with
+    /// nonsensical metadata are dropped during iteration. A drained batch reports zero.
+    pub fn len(&self) -> usize {
+        self.num_packets
+    }
+
+    /// Whether this batch carries no datagrams at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Removes all datagrams from the batch, in order; draining again yields nothing.
+    ///
+    /// Datagrams with nonsensical metadata are dropped.
+    pub fn drain(&mut self) -> impl Iterator<Item = DatagramIn> + '_ {
+        let port = self.port;
+        self.num_packets = 0;
+
+        self.buffers
+            .drain(..)
+            .zip(self.metas.drain(..))
+            .filter_map(move |(buffer, meta)| DatagramIn::new(buffer, meta, port))
+    }
+}
+
+/// The number of datagrams packed into a single received buffer.
+///
+/// Without offloads, the buffer holds exactly one datagram (`stride` equals `len`). With GRO
+/// (Linux) or URO (Windows) the kernel coalesces several into one buffer at `stride` increments,
+/// the last of which may be short.
+fn num_segments(meta: &quinn_udp::RecvMeta) -> usize {
+    meta.len.div_ceil(meta.stride.max(1))
+}
+
+impl DatagramIn {
+    /// Validates what [`quinn_udp`] reported about the buffer.
+    fn new(buffer: Bytes, meta: quinn_udp::RecvMeta, port: u16) -> Option<Self> {
+        if meta.len == 0 {
+            return None;
+        }
+
+        let Some(local_ip) = meta.dst_ip else {
+            tracing::warn!("Skipping packet without local IP");
+
+            return None;
+        };
+
+        if meta.stride > meta.len {
+            tracing::warn!(
+                "stride ({}) is larger than buffer len ({})",
+                meta.stride,
+                meta.len
+            );
+
+            return None;
+        }
+
+        // A zero stride would never advance past the first segment; nothing sane
+        // reports one, so drop the receive.
+        if meta.stride == 0 {
+            tracing::warn!(len = %meta.len, "Dropping receive with a zero segment size");
+
+            return None;
+        }
+
+        // No Firezone peer sends a datagram this large; the receive is either broken
+        // coalescing (see `uro`) or junk from an unrelated sender.
+        if meta.stride > ip_packet::MAX_FZ_PAYLOAD {
+            tracing::trace!(stride = %meta.stride, len = %meta.len, "Dropping receive with an impossibly large segment size");
+
+            return None;
+        }
+
+        Some(Self {
+            buffer,
+            local: SocketAddr::new(local_ip, port),
+            from: meta.addr,
+            ecn: match meta.ecn {
+                Some(EcnCodepoint::Ce) => Ecn::Ce,
+                Some(EcnCodepoint::Ect0) => Ecn::Ect0,
+                Some(EcnCodepoint::Ect1) => Ecn::Ect1,
+                None => Ecn::NonEct,
+            },
+            len: meta.len,
+            stride: meta.stride,
+        })
+    }
+
+    pub fn local(&self) -> SocketAddr {
+        self.local
+    }
+
+    pub fn from(&self) -> SocketAddr {
+        self.from
+    }
+
+    pub fn ecn(&self) -> Ecn {
+        self.ecn
+    }
+
+    /// How many segments the datagram holds.
+    pub fn num_segments(&self) -> usize {
+        self.len.div_ceil(self.stride)
+    }
+
+    /// Iterates over the segments of the datagram, i.e. the datagrams GRO / URO coalesced into it.
+    pub fn segments(&self) -> impl Iterator<Item = Segment> + use<> {
+        let Self { len, stride, .. } = *self;
+        #[cfg(debug_assertions)]
+        let (from, local, ecn) = (self.from, self.local, self.ecn);
+
+        (0..len).step_by(stride).map(move |start| {
+            let end = std::cmp::min(start + stride, len);
+
+            #[cfg(debug_assertions)]
+            tracing::trace!(target: "wire::net::recv", src = %from, dst = %local, ecn = ?ecn, len = %(end - start));
+
+            Segment { start, end }
+        })
+    }
+}
+
+impl Index<Segment> for DatagramIn {
+    type Output = [u8];
+
+    fn index(&self, segment: Segment) -> &[u8] {
+        &self.buffer[..self.len][segment.start..segment.end]
+    }
+}
+
+fn ecn_codepoint(ecn: Ecn) -> Option<EcnCodepoint> {
+    match ecn {
+        Ecn::NonEct => None,
+        Ecn::Ect1 => Some(EcnCodepoint::Ect1),
+        Ecn::Ect0 => Some(EcnCodepoint::Ect0),
+        Ecn::Ce => Some(EcnCodepoint::Ce),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quinn_udp::RecvMeta;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn datagram_out_max_len_is_whole_segments_of_one_gso_send() {
+        let v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+
+        // Full-size segments are byte-bound: (65535 - 68) / 1316 = 49 whole segments over IPv4.
+        assert_eq!(DatagramOut::max_len(v4, 1316), 49 * 1316);
+
+        // The IPv4 budget assumes maximal headers (60 bytes incl. options), leaving
+        // room for one segment less than IPv6's fixed 40-byte header here.
+        assert_eq!(DatagramOut::max_len(v4, 1023), 63 * 1023);
+        assert_eq!(DatagramOut::max_len(v6, 1023), 64 * 1023);
+
+        // Small segments are count-bound at the kernel's segment limit.
+        assert_eq!(DatagramOut::max_len(v4, 100), 64 * 100);
+    }
+
+    use super::*;
+
+    /// The batch is the item of the channel to the main thread; keeping it small is
+    /// the whole point of storing its buffers in heap-allocated `Vec`s rather than inline.
+    /// tokio allocates channel slots in blocks, so a large item would cross musl's mmap
+    /// threshold and thrash the allocator.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn batch_is_a_small_channel_item() {
+        assert_eq!(size_of::<DatagramBatch>(), 64);
+    }
+
+    #[test]
+    fn drain_segments_buffers_correctly() {
+        let buffers = vec![
+            Bytes::copied_from(b"foobar1foobar2foobar3foobar4foobar5foo                 "),
+            Bytes::copied_from(b"baz1baz2baz3baz4baz5foo       "),
+            Bytes::copied_from(b""),
+        ];
+
+        let metas = vec![
+            recv_meta(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                38,
+                7,
+            ),
+            recv_meta(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                23,
+                4,
+            ),
+            quinn_udp::RecvMeta::default(),
+        ];
+
+        let mut batch = DatagramBatch::new(buffers, metas, 0, 3);
+
+        assert_eq!(
+            packets(&mut batch),
+            [
+                &b"foobar1"[..],
+                b"foobar2",
+                b"foobar3",
+                b"foobar4",
+                b"foobar5",
+                b"foo",
+                b"baz1",
+                b"baz2",
+                b"baz3",
+                b"baz4",
+                b"baz5",
+                b"foo",
+            ]
+        );
+    }
+
+    #[test]
+    fn drained_batch_yields_nothing() {
+        let buffers = vec![Bytes::copied_from(b"foo")];
+
+        let metas = vec![recv_meta(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            3,
+            3,
+        )];
+
+        let mut batch = DatagramBatch::new(buffers, metas, 0, 1);
+
+        assert_eq!(packets(&mut batch).len(), 1);
+
+        assert_eq!(packets(&mut batch).len(), 0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn drain_yields_each_buffer_with_its_sender_and_datagram_ranges() {
+        let remote_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1000);
+        let remote_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2000);
+        let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let buffers = vec![
+            Bytes::copied_from(b"foo1foo2"),
+            Bytes::copied_from(b"foo3"),
+            Bytes::copied_from(b"bar1"),
+            Bytes::copied_from(b"foo4"),
+        ];
+
+        let metas = vec![
+            recv_meta(remote_a, local, 8, 4),
+            recv_meta(remote_a, local, 4, 4),
+            recv_meta(remote_b, local, 4, 4),
+            recv_meta(remote_a, local, 4, 4),
+        ];
+
+        let mut batch = DatagramBatch::new(buffers, metas, 0, 4);
+        let buffers = batch
+            .drain()
+            .map(|buffer| {
+                let ranges = buffer
+                    .segments()
+                    .map(|segment| (segment.start, segment.end))
+                    .collect::<Vec<_>>();
+
+                (buffer.from(), buffer.num_segments(), ranges)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            buffers,
+            vec![
+                (remote_a, 2, vec![(0, 4), (4, 8)]),
+                (remote_a, 1, vec![(0, 4)]),
+                (remote_b, 1, vec![(0, 4)]),
+                (remote_a, 1, vec![(0, 4)]),
+            ]
+        );
+    }
+
+    /// A zero stride on a non-empty buffer must not stall the iterator: the receive
+    /// is dropped and iteration moves on to the next buffer.
+    #[test]
+    fn zero_stride_buffer_is_skipped() {
+        let buffers = vec![
+            Bytes::copied_from(b"garbage    "),
+            Bytes::copied_from(b"foo        "),
+        ];
+
+        let metas = vec![
+            recv_meta(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                7,
+                0,
+            ),
+            recv_meta(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                3,
+                3,
+            ),
+        ];
+
+        let mut batch = DatagramBatch::new(buffers, metas, 0, 2);
+
+        assert_eq!(packets(&mut batch), [b"foo"]);
+    }
+
+    /// Both buffers end in a segment shorter than their stride, so counting whole strides
+    /// would miss one datagram each.
+    #[test]
+    fn len_counts_segments_across_buffers() {
+        let localhost = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+        let metas = [
+            recv_meta(localhost, IpAddr::V4(Ipv4Addr::LOCALHOST), 38, 7),
+            recv_meta(localhost, IpAddr::V4(Ipv4Addr::LOCALHOST), 23, 4),
+            quinn_udp::RecvMeta::default(),
+        ];
+
+        assert_eq!(metas.iter().map(num_segments).sum::<usize>(), 12);
+    }
+
+    #[test]
+    fn drain_drops_segments_larger_than_max_fz_payload() {
+        let oversized = 2 * ip_packet::MAX_FZ_PAYLOAD;
+
+        let buffers = vec![
+            Bytes::copied_from(&vec![0; oversized]),
+            Bytes::copied_from(b"foobar1"),
+        ];
+
+        let metas = vec![
+            recv_meta(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                oversized,
+                oversized,
+            ),
+            recv_meta(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                7,
+                7,
+            ),
+        ];
+
+        let mut batch = DatagramBatch::new(buffers, metas, 0, 2);
+
+        assert_eq!(packets(&mut batch), [b"foobar1"]);
+    }
+
+    #[test]
+    fn scopes_are_ignored_for_link_local_addresses() {
+        let left = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+            1000,
+            0,
+            0,
+        ));
+        let right = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+            1000,
+            0,
+            42,
+        ));
+
+        assert!(is_equal_modulo_scope_for_ipv6_link_local(left, right))
+    }
+
+    #[test]
+    fn apply_buffer_size_halves_until_accepted() {
+        let mut attempts = Vec::new();
+
+        let result = apply_buffer_size(1024 * 1024, |size| {
+            attempts.push(size);
+
+            if size > 256 * 1024 {
+                return Err(io::Error::other("too big"));
+            }
+
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, vec![1024 * 1024, 512 * 1024, 256 * 1024]);
+    }
+
+    #[test]
+    fn apply_buffer_size_gives_up_at_floor() {
+        let result = apply_buffer_size(256 * 1024, |_| Err(io::Error::other("nope")));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn does_not_retry_non_os_errors() {
+        let err = io::Error::other("not an os error");
+
+        assert!(!should_retry(&err, 0));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn retries_gso_errors_once() {
+        for raw in [libc::EIO, libc::EINVAL] {
+            let err = io::Error::from_raw_os_error(raw);
+
+            assert!(should_retry(&err, 0));
+            assert!(!should_retry(&err, 1));
+        }
+    }
+
+    #[test]
+    #[cfg(apple)]
+    fn retries_enobufs_at_most_24_times() {
+        let err = io::Error::from_raw_os_error(libc::ENOBUFS);
+
+        assert!(should_retry(&err, 23));
+        assert!(!should_retry(&err, 24));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_10055_error() {
+        let err = io::Error::from_raw_os_error(WINDOWS_ENOBUFS);
+
+        assert_eq!(
+            err.to_string(),
+            "An operation on a socket could not be performed because the system lacked sufficient buffer space or because a queue was full. (os error 10055)"
+        );
+    }
+
+    fn packets(batch: &mut DatagramBatch) -> Vec<Vec<u8>> {
+        batch
+            .drain()
+            .flat_map(|datagram| {
+                datagram
+                    .segments()
+                    .map(|segment| datagram[segment].to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn recv_meta(addr: SocketAddr, dst_ip: IpAddr, len: usize, stride: usize) -> RecvMeta {
+        let mut meta = RecvMeta::default();
+        meta.addr = addr;
+        meta.dst_ip = Some(dst_ip);
+        meta.len = len;
+        meta.stride = stride;
+
+        meta
+    }
+}

@@ -1,0 +1,38 @@
+---
+name: "Create Sentry release"
+description: "Creates a Sentry release for a project from a particular Git tag"
+inputs:
+  project:
+    description: "The Sentry project, which is also the release name prefix"
+    required: true
+    # e.g. "gateway", "gui-client", "apple-client", ...
+  component:
+    description: "The component to create a release for. Defaults to `project`."
+    required: false
+    # Set it when one project ships several components, e.g. `apple-client`
+    # ships `macos-client` and `ios-client`.
+  sentry_token:
+    description: "The authentication token to use with sentry."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract semantic version from release name
+      id: version
+      env:
+        release_name: ${{ github.event.release.name }}
+        project: ${{ inputs.project }}
+      run: |
+        version=${release_name#"$project-"}
+        echo "version=$version" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - uses: getsentry/action-release@e6703d0b00208e0b3687ba660d18ab5af7892821 # v3.7.2
+      env:
+        SENTRY_AUTH_TOKEN: ${{ inputs.sentry_token }}
+        SENTRY_ORG: firezone-inc
+      with:
+        version: ${{ inputs.component || inputs.project }}@${{ steps.version.outputs.version }}
+        projects: ${{ inputs.project }}
+        set_commits: auto

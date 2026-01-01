@@ -1,0 +1,381 @@
+//
+//  Configuration.swift
+//  (c) 2024 Firezone, Inc.
+//  LICENSE: Apache-2.0
+//
+//  App configuration facade.
+//
+//  All user-editable settings live in the VPN provider configuration so only the
+//  host app and provider can write to them. UserDefaults is used only for MDM:
+//  read-only managed values (hideResourceList, supportURL, …) and forced
+//  overrides of tunnel keys, both deployed via .mobileconfig profiles. Forced
+//  overrides are also cached in providerConfiguration under a "forced." prefix
+//  so the network extension can apply them after restart without the GUI.
+
+import Combine
+import Foundation
+
+public enum ConfigurationDefaults {
+  #if DEBUG
+    public static let authURL = "https://app.firez.one"
+    public static let apiURL = "wss://api.firez.one"
+    public static let logFilter = "debug"
+  #else
+    public static let authURL = "https://app.firezone.dev"
+    public static let apiURL = "wss://api.firezone.dev"
+    public static let logFilter = "info"
+  #endif
+
+  public static let accountSlug = ""
+  public static let supportURL = "https://www.firezone.dev/support"
+  public static let connectOnStart = false
+  public static let startOnLogin = false
+  public static let disableUpdateCheck = false
+  public static let internetResourceEnabled = false
+  public static let additionalHostCandidates = ""
+}
+
+@MainActor
+public class Configuration: ObservableObject {
+  static let shared = Configuration()
+
+  // Forced overrides are cached in providerConfiguration as "forced.<key>".
+  nonisolated public static let forcedPrefix = "forced."
+  nonisolated public static func forcedKey(for key: String) -> String {
+    "\(forcedPrefix)\(key)"
+  }
+
+  public enum Keys {
+    public static let authURL = "authURL"
+    public static let apiURL = "apiURL"
+    public static let logFilter = "logFilter"
+    public static let accountSlug = "accountSlug"
+    public static let internetResourceEnabled = "internetResourceEnabled"
+    public static let additionalHostCandidates = "additionalHostCandidates"
+    public static let hideAdminPortalMenuItem = "hideAdminPortalMenuItem"
+    public static let hideResourceList = "hideResourceList"
+    public static let connectOnStart = "connectOnStart"
+    public static let startOnLogin = "startOnLogin"
+    public static let disableUpdateCheck = "disableUpdateCheck"
+    public static let supportURL = "supportURL"
+    public static let userDefaultsMigrated = "userDefaultsMigrated"
+    static let lastCustomAuthURL = "lastCustomAuthURL"
+    static let lastCustomApiURL = "lastCustomApiURL"
+    static let signedInAccountSlug = "signedInAccountSlug"
+    static let signedInAuthURL = "signedInAuthURL"
+    static let signedInApiURL = "signedInApiURL"
+  }
+
+  // Each entry describes a key persisted to providerConfiguration. The getters
+  // additionally honor an MDM forced value (UserDefaults.objectIsForced) for the
+  // is*Forced properties below, regardless of whether the key is forwarded to
+  // the network extension.
+  enum ProviderEntry: Sendable {
+    case string(key: String, default: String)
+    case bool(key: String, default: Bool)
+
+    var key: String {
+      switch self {
+      case .string(let key, _), .bool(let key, _): return key
+      }
+    }
+
+    var defaultString: String {
+      switch self {
+      case .string(_, let value): return value
+      case .bool(_, let value): return Configuration.string(value)
+      }
+    }
+  }
+
+  nonisolated static let providerEntries: [ProviderEntry] = [
+    .string(key: Keys.authURL, default: ConfigurationDefaults.authURL),
+    .string(key: Keys.apiURL, default: ConfigurationDefaults.apiURL),
+    .string(key: Keys.logFilter, default: ConfigurationDefaults.logFilter),
+    .string(key: Keys.accountSlug, default: ConfigurationDefaults.accountSlug),
+    .bool(key: Keys.connectOnStart, default: ConfigurationDefaults.connectOnStart),
+    .bool(key: Keys.startOnLogin, default: ConfigurationDefaults.startOnLogin),
+    .bool(
+      key: Keys.internetResourceEnabled, default: ConfigurationDefaults.internetResourceEnabled),
+    .string(
+      key: Keys.additionalHostCandidates, default: ConfigurationDefaults.additionalHostCandidates),
+  ]
+
+  // Subset of provider entries whose MDM forced values are cached in
+  // providerConfiguration as "forced.<key>" so the network extension can apply
+  // them at tunnel start without having to contact the GUI.
+  nonisolated static let forwardedForcedKeys: Set<String> = [
+    Keys.apiURL, Keys.logFilter, Keys.accountSlug,
+  ]
+
+  private var cancellables = Set<AnyCancellable>()
+  private let internetResourceEnabledSubject = PassthroughSubject<Bool, Never>()
+
+  private(set) var publishedInternetResourceEnabled = false
+  private(set) var publishedHideAdminPortalMenuItem = false
+  private(set) var publishedHideResourceList = false
+
+  var internetResourceEnabledPublisher: AnyPublisher<Bool, Never> {
+    internetResourceEnabledSubject.eraseToAnyPublisher()
+  }
+
+  /// Whether the settings come from a VPN configuration profile rather than from the GUI.
+  ///
+  /// A profile is the administrator's to edit, so every setting it carries is read-only
+  /// here, exactly as an individually forced key would be.
+  @Published private(set) var isVPNConfigurationManaged = false
+
+  var isAuthURLForced: Bool {
+    isVPNConfigurationManaged || defaults.objectIsForced(forKey: Keys.authURL)
+  }
+  var isApiURLForced: Bool {
+    isVPNConfigurationManaged || defaults.objectIsForced(forKey: Keys.apiURL)
+  }
+  var isLogFilterForced: Bool {
+    isVPNConfigurationManaged || defaults.objectIsForced(forKey: Keys.logFilter)
+  }
+  var isAccountSlugForced: Bool {
+    isVPNConfigurationManaged || defaults.objectIsForced(forKey: Keys.accountSlug)
+  }
+  var isConnectOnStartForced: Bool {
+    isVPNConfigurationManaged || defaults.objectIsForced(forKey: Keys.connectOnStart)
+  }
+  var isStartOnLoginForced: Bool {
+    isVPNConfigurationManaged || defaults.objectIsForced(forKey: Keys.startOnLogin)
+  }
+
+  func setVPNConfigurationManaged(_ isManaged: Bool) {
+    isVPNConfigurationManaged = isManaged
+  }
+
+  var authURL: String {
+    get { effectiveString(Keys.authURL, default: ConfigurationDefaults.authURL) }
+    set { setProviderValue(newValue, forKey: Keys.authURL) }
+  }
+  var apiURL: String {
+    get { effectiveString(Keys.apiURL, default: ConfigurationDefaults.apiURL) }
+    set { setProviderValue(newValue, forKey: Keys.apiURL) }
+  }
+  var logFilter: String {
+    get { effectiveString(Keys.logFilter, default: ConfigurationDefaults.logFilter) }
+    set { setProviderValue(newValue, forKey: Keys.logFilter) }
+  }
+  var accountSlug: String {
+    get { effectiveString(Keys.accountSlug, default: ConfigurationDefaults.accountSlug) }
+    set { setProviderValue(newValue, forKey: Keys.accountSlug) }
+  }
+  var connectOnStart: Bool {
+    get { effectiveBool(Keys.connectOnStart, default: ConfigurationDefaults.connectOnStart) }
+    set { setProviderValue(newValue, forKey: Keys.connectOnStart) }
+  }
+  var startOnLogin: Bool {
+    get { effectiveBool(Keys.startOnLogin, default: ConfigurationDefaults.startOnLogin) }
+    set { setProviderValue(newValue, forKey: Keys.startOnLogin) }
+  }
+  var internetResourceEnabled: Bool {
+    get {
+      providerBool(
+        Keys.internetResourceEnabled, default: ConfigurationDefaults.internetResourceEnabled)
+    }
+    set { setProviderValue(newValue, forKey: Keys.internetResourceEnabled) }
+  }
+  var additionalHostCandidates: [String] {
+    get {
+      providerString(
+        Keys.additionalHostCandidates, default: ConfigurationDefaults.additionalHostCandidates
+      )
+      .split(separator: ",")
+      .map(String.init)
+    }
+    set {
+      setProviderValue(newValue.joined(separator: ","), forKey: Keys.additionalHostCandidates)
+    }
+  }
+
+  /// The URLs last saved with the Custom control plane picked, so that picking Custom again brings them
+  /// back. Only this app reads them: they are not a managed setting and never reach the tunnel.
+  var lastCustomURLs: (authURL: String, apiURL: String)? {
+    get {
+      guard let authURL = defaults.string(forKey: Keys.lastCustomAuthURL),
+        let apiURL = defaults.string(forKey: Keys.lastCustomApiURL)
+      else { return nil }
+
+      return (authURL, apiURL)
+    }
+    set {
+      defaults.set(newValue?.authURL, forKey: Keys.lastCustomAuthURL)
+      defaults.set(newValue?.apiURL, forKey: Keys.lastCustomApiURL)
+    }
+  }
+
+  var signInSettings: SignInSettings {
+    SignInSettings(accountSlug: accountSlug, authURL: authURL, apiURL: apiURL)
+  }
+
+  /// What the last sign-in from this app used, until signing out. Only this app reads it.
+  var signedInWith: SignInSettings? {
+    get {
+      guard let accountSlug = defaults.string(forKey: Keys.signedInAccountSlug),
+        let authURL = defaults.string(forKey: Keys.signedInAuthURL),
+        let apiURL = defaults.string(forKey: Keys.signedInApiURL)
+      else { return nil }
+
+      return SignInSettings(accountSlug: accountSlug, authURL: authURL, apiURL: apiURL)
+    }
+    set {
+      defaults.set(newValue?.accountSlug, forKey: Keys.signedInAccountSlug)
+      defaults.set(newValue?.authURL, forKey: Keys.signedInAuthURL)
+      defaults.set(newValue?.apiURL, forKey: Keys.signedInApiURL)
+    }
+  }
+
+  var hideAdminPortalMenuItem: Bool { managedBool(Keys.hideAdminPortalMenuItem) }
+  var hideResourceList: Bool { managedBool(Keys.hideResourceList) }
+  var disableUpdateCheck: Bool { managedBool(Keys.disableUpdateCheck) }
+  var supportURL: String {
+    defaults.string(forKey: Keys.supportURL) ?? ConfigurationDefaults.supportURL
+  }
+
+  private var defaults: UserDefaults
+  private var providerConfiguration: [String: String]
+
+  // swiftlint:disable:next no_userdefaults_standard - DI entry point
+  init(userDefaults: UserDefaults = UserDefaults.standard) {
+    defaults = userDefaults
+    providerConfiguration = [:]
+
+    self.publishedInternetResourceEnabled = internetResourceEnabled
+    self.publishedHideAdminPortalMenuItem = hideAdminPortalMenuItem
+    self.publishedHideResourceList = hideResourceList
+
+    NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification, object: defaults)
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in self?.handleConfigurationChanged() }
+      .store(in: &cancellables)
+  }
+
+  func loadProviderConfiguration(_ providerConfiguration: [String: String]) {
+    guard self.providerConfiguration != providerConfiguration else { return }
+    self.providerConfiguration = providerConfiguration
+    handleConfigurationChanged()
+  }
+
+  func toProviderConfiguration(markUserDefaultsMigrated: Bool = true) -> [String: String] {
+    var result: [String: String] = [:]
+
+    for entry in Self.providerEntries {
+      result[entry.key] = providerConfiguration[entry.key] ?? entry.defaultString
+    }
+
+    // Cache MDM forced overrides so the network extension can apply them without the GUI.
+    for (key, value) in forcedConfiguration() {
+      result[Self.forcedKey(for: key)] = value
+    }
+
+    if markUserDefaultsMigrated {
+      result[Keys.userDefaultsMigrated] = "true"
+    }
+
+    return result
+  }
+
+  func forcedConfiguration() -> [String: String] {
+    var result: [String: String] = [:]
+    for entry in Self.providerEntries where Self.forwardedForcedKeys.contains(entry.key) {
+      guard defaults.objectIsForced(forKey: entry.key) else { continue }
+      switch entry {
+      case .bool(let key, _):
+        result[key] = Self.string(defaults.bool(forKey: key))
+      case .string(let key, _):
+        if let value = defaults.string(forKey: key) {
+          result[key] = value
+        }
+      }
+    }
+    return result
+  }
+
+  private func effectiveString(_ key: String, default defaultValue: String) -> String {
+    if defaults.objectIsForced(forKey: key), let value = defaults.string(forKey: key) {
+      return value
+    }
+    return providerString(key, default: defaultValue)
+  }
+
+  private func providerString(_ key: String, default defaultValue: String) -> String {
+    providerConfiguration[key] ?? defaultValue
+  }
+
+  private func effectiveBool(_ key: String, default defaultValue: Bool) -> Bool {
+    if defaults.objectIsForced(forKey: key) { return defaults.bool(forKey: key) }
+    return providerBool(key, default: defaultValue)
+  }
+
+  private func providerBool(_ key: String, default defaultValue: Bool) -> Bool {
+    Self.parseBool(providerConfiguration[key], default: defaultValue)
+  }
+
+  private func managedBool(_ key: String) -> Bool {
+    guard defaults.object(forKey: key) != nil else { return false }
+    return defaults.bool(forKey: key)
+  }
+
+  func setProviderValue(_ value: String, forKey key: String) {
+    guard providerConfiguration[key] != value else { return }
+    providerConfiguration[key] = value
+    handleConfigurationChanged()
+  }
+
+  func setProviderValue(_ value: Bool, forKey key: String) {
+    setProviderValue(Self.string(value), forKey: key)
+  }
+
+  private func handleConfigurationChanged() {
+    let previousInternetResourceEnabled = publishedInternetResourceEnabled
+
+    publishedInternetResourceEnabled = internetResourceEnabled
+    publishedHideAdminPortalMenuItem = hideAdminPortalMenuItem
+    publishedHideResourceList = hideResourceList
+
+    objectWillChange.send()
+
+    if previousInternetResourceEnabled != publishedInternetResourceEnabled {
+      internetResourceEnabledSubject.send(publishedInternetResourceEnabled)
+    }
+  }
+
+  nonisolated public static func parseBool(_ value: String?, default defaultValue: Bool) -> Bool {
+    switch value {
+    case "true": return true
+    case "false": return false
+    default: return defaultValue
+    }
+  }
+
+  nonisolated static func string(_ value: Bool) -> String { value ? "true" : "false" }
+}
+
+/// The account slug and endpoints selected for a sign-in.
+public struct SignInSettings: Codable, Equatable, Sendable {
+  public let accountSlug: String
+  public let authURL: String
+  public let apiURL: String
+
+  public init(accountSlug: String, authURL: String, apiURL: String) {
+    self.accountSlug = accountSlug
+    self.authURL = authURL
+    self.apiURL = apiURL
+  }
+}
+
+extension Dictionary where Key == String, Value == String {
+  /// Returns the MDM-forced override for `key` if cached, else the plain value.
+  ///
+  /// Only keys in `Configuration.forwardedForcedKeys` ever have a cached
+  /// override — user-controlled values like `internetResourceEnabled` must be
+  /// read directly via `self[key]`, since calling this would silently fall
+  /// through to the same lookup and obscure intent at the call site.
+  public func withMDMOverride(forKey key: String) -> String? {
+    self[Configuration.forcedKey(for: key)] ?? self[key]
+  }
+}

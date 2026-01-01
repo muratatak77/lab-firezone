@@ -1,0 +1,38 @@
+[package]
+name = "ip-packet"
+version = "0.1.0"
+edition = { workspace = true }
+authors = ["Firezone, Inc."]
+publish = false
+license = { workspace = true }
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+proptest = ["dep:proptest"]
+arbitrary = ["dep:arbitrary"]
+
+[dependencies]
+anyhow = { workspace = true }
+arbitrary = { workspace = true, optional = true, features = ["derive"] }
+bufferpool = { workspace = true }
+incremental-inet-checksum = { workspace = true }
+ingot = { workspace = true }
+prefetch = { workspace = true }
+proptest = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+test-case = { workspace = true }
+test-strategy = { workspace = true }
+
+[[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
+name = "checksum"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,3498 @@
+defmodule Portal.Entra.SyncTest do
+  use Portal.DataCase, async: true
+  use Oban.Testing, repo: Portal.Repo
+
+  import Ecto.Query
+  import Portal.AccountFixtures
+  import Portal.ObanFixtures
+  import Portal.RepoQueryHelpers
+  import Portal.EntraDirectoryFixtures
+
+  alias Portal.Microsoft.Graph.APIClient
+  alias Portal.Entra.Sync
+  alias Portal.Entra.Sync.Database
+  alias Portal.ExternalIdentity
+  alias Portal.Group
+  alias Portal.Membership
+  alias Portal.Actor
+
+  @test_service_principal_id "sp_12345"
+
+  describe "perform/1" do
+    setup do
+      Req.Test.stub(APIClient, fn conn ->
+        Req.Test.json(conn, %{"error" => "not mocked"})
+      end)
+
+      :ok
+    end
+
+    test "snoozes while a webhook job for the directory is executing" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      args = %{account_id: directory.account_id, directory_id: directory.id}
+
+      executing_job(
+        Portal.Entra.WebhookSync.new(%{
+            account_id: directory.account_id,
+            directory_id: directory.id,
+            resource: "user",
+            resource_id: "user-1",
+            change_type: "updated"
+        })
+      )
+
+      assert {:snooze, seconds} = perform_job(Sync, args)
+      assert seconds in 16..45
+      assert Repo.all(ExternalIdentity) == []
+    end
+
+    test "performs successful sync with assigned groups mode (sync_all_groups: false)" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{
+              "access_token" => "test_token",
+              "token_type" => "Bearer",
+              "expires_in" => 3600
+            })
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => @test_service_principal_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                # Auth provider not found (deprecated)
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "id" => "assignment1",
+                  "principalId" => "user_direct_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Direct User"
+                },
+                %{
+                  "id" => "assignment2",
+                  "principalId" => "group_eng_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Engineering"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_direct_123",
+                    "displayName" => "Direct User",
+                    "mail" => "direct@example.com",
+                    "userPrincipalName" => "direct@example.com",
+                    "givenName" => "Direct",
+                    "surname" => "User",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          String.contains?(path, "/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_alice_123",
+                  "displayName" => "Alice Smith",
+                  "mail" => "alice@example.com",
+                  "userPrincipalName" => "alice@example.com",
+                  "givenName" => "Alice",
+                  "surname" => "Smith"
+                }),
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_bob_123",
+                  "displayName" => "Bob Jones",
+                  "mail" => "bob@example.com",
+                  "userPrincipalName" => "bob@example.com"
+                })
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Verify identities created (3 total: 1 direct user + 2 group members)
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 3
+
+      assert_enqueued(
+        worker: Portal.Entra.Subscriptions,
+        args: %{account_id: directory.account_id, directory_id: directory.id, action: "ensure"}
+      )
+
+      identity_emails = Enum.map(identities, & &1.email) |> Enum.sort()
+
+      assert identity_emails == [
+               "alice@example.com",
+               "bob@example.com",
+               "direct@example.com"
+             ]
+
+      # Verify group created
+      groups = Repo.all(Group)
+      assert length(groups) == 1
+      group = hd(groups)
+      assert group.name == "Engineering"
+      assert group.idp_id == "group_eng_123"
+
+      # Verify memberships created (2 memberships for the 2 group members)
+      memberships = Repo.all(Membership)
+      assert length(memberships) == 2
+
+      # Verify directory updated with sync timestamp
+      updated_directory = Repo.get(Portal.Entra.Directory, directory.id)
+      refute is_nil(updated_directory.synced_at)
+      assert updated_directory.error_message == nil
+      assert updated_directory.error_email_count == 0
+    end
+
+    test "performs successful sync with all groups mode (sync_all_groups: true)" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      # Mock all requests with unlimited calls
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{
+              "access_token" => "test_token",
+              "token_type" => "Bearer",
+              "expires_in" => 3600
+            })
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{"id" => "group_sales_123", "displayName" => "Sales Team"},
+                %{"id" => "group_eng_123", "displayName" => "Engineering"}
+              ]
+            })
+
+          String.contains?(path, "group_sales_123/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_carol_123",
+                  "displayName" => "Carol Davis",
+                  "mail" => "carol@example.com",
+                  "userPrincipalName" => "carol@example.com"
+                })
+              ]
+            })
+
+          String.contains?(path, "group_eng_123/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_dave_123",
+                  "displayName" => "Dave Wilson",
+                  "mail" => "dave@example.com",
+                  "userPrincipalName" => "dave@example.com"
+                })
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Verify identities created (2 users)
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 2
+
+      identity_emails = Enum.map(identities, & &1.email) |> Enum.sort()
+      assert identity_emails == ["carol@example.com", "dave@example.com"]
+
+      # Verify groups created (2 groups)
+      groups = Repo.all(Group)
+      assert length(groups) == 2
+      group_names = Enum.map(groups, & &1.name) |> Enum.sort()
+      assert group_names == ["Engineering", "Sales Team"]
+
+      # Verify memberships created (2 memberships)
+      memberships = Repo.all(Membership)
+      assert length(memberships) == 2
+    end
+
+    test "reads each group once per sync however many groups nest it" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+      test_pid = self()
+
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{"id" => "group_all", "displayName" => "All"},
+                %{"id" => "group_eng", "displayName" => "Engineering"},
+                %{"id" => "group_team", "displayName" => "Team"}
+              ]
+            })
+
+          String.contains?(path, "group_all/members") ->
+            Req.Test.json(conn, %{
+              "value" => [%{"@odata.type" => "#microsoft.graph.group", "id" => "group_eng"}]
+            })
+
+          String.contains?(path, "group_eng/members") ->
+            Req.Test.json(conn, %{
+              "value" => [%{"@odata.type" => "#microsoft.graph.group", "id" => "group_team"}]
+            })
+
+          String.contains?(path, "group_team/members") ->
+            send(test_pid, :team_read)
+
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_alice",
+                  "displayName" => "Alice",
+                  "mail" => "alice@example.com",
+                  "userPrincipalName" => "alice@example.com"
+                })
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      assert_received :team_read
+      refute_received :team_read
+
+      identity = Repo.get_by!(ExternalIdentity, idp_id: "user_alice")
+      assert length(Repo.all_by(Membership, actor_id: identity.actor_id)) == 3
+
+      assert Repo.get_by!(Group, idp_id: "group_all").nested_group_idp_ids == [
+               "group_eng",
+               "group_team"
+             ]
+
+      assert Repo.get_by!(Group, idp_id: "group_eng").nested_group_idp_ids == ["group_team"]
+      assert Repo.get_by!(Group, idp_id: "group_team").nested_group_idp_ids == []
+    end
+
+    test "keeps syncing when a nested group vanishes before its members are read" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{"value" => [%{"id" => "group_all", "displayName" => "All"}]})
+
+          String.contains?(path, "group_all/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{"@odata.type" => "#microsoft.graph.group", "id" => "group_gone"},
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_alice",
+                  "displayName" => "Alice",
+                  "mail" => "alice@example.com",
+                  "userPrincipalName" => "alice@example.com"
+                })
+              ]
+            })
+
+          String.contains?(path, "group_gone/members") ->
+            conn
+            |> Plug.Conn.put_status(404)
+            |> Req.Test.json(%{"error" => %{"code" => "Request_ResourceNotFound"}})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      assert Repo.get_by!(Group, idp_id: "group_all").nested_group_idp_ids == ["group_gone"]
+      identity = Repo.get_by!(ExternalIdentity, idp_id: "user_alice")
+      assert [_] = Repo.all_by(Membership, actor_id: identity.actor_id)
+    end
+
+    test "prunes the members of a group deleted between the listing and its walk" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+
+      group =
+        Portal.GroupFixtures.group_fixture(
+          account: account,
+          directory: base_directory,
+          idp_id: "group_gone"
+        )
+
+      actor = Portal.ActorFixtures.actor_fixture(account: account)
+
+      Portal.IdentityFixtures.identity_fixture(
+        account: account,
+        actor: actor,
+        directory: base_directory,
+        issuer: Sync.issuer(directory),
+        idp_id: "user_carol"
+      )
+
+      membership =
+        Portal.MembershipFixtures.membership_fixture(account: account, actor: actor, group: group)
+
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{"value" => [%{"id" => "group_gone", "displayName" => "Gone"}]})
+
+          String.contains?(path, "group_gone/members") ->
+            conn
+            |> Plug.Conn.put_status(404)
+            |> Req.Test.json(%{"error" => %{"code" => "Request_ResourceNotFound"}})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      assert Repo.get_by(Group, id: group.id)
+      refute Repo.get_by(Membership, id: membership.id)
+    end
+
+    test "grants nothing from a walk that fails partway" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [%{"id" => "group_parent", "displayName" => "Parent"}]
+            })
+
+          String.contains?(path, "group_parent/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{"@odata.type" => "#microsoft.graph.group", "id" => "group_child"},
+                %{"@odata.type" => "#microsoft.graph.group", "id" => "group_broken"}
+              ]
+            })
+
+          String.contains?(path, "group_child/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_alice",
+                  "displayName" => "Alice",
+                  "mail" => "alice@example.com",
+                  "userPrincipalName" => "alice@example.com"
+                })
+              ]
+            })
+
+          String.contains?(path, "group_broken/members") ->
+            conn
+            |> Plug.Conn.put_status(500)
+            |> Req.Test.json(%{"error" => "server_error"})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert_raise Portal.Entra.SyncError, fn ->
+        perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+      end
+
+      parent = Repo.get_by!(Group, idp_id: "group_parent")
+      assert Repo.all_by(Membership, group_id: parent.id) == []
+    end
+
+    test "grants nothing from a group that vanishes between its member pages" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      Req.Test.expect(APIClient, 100, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{"id" => "group_parent", "displayName" => "Parent"},
+                %{"id" => "group_second", "displayName" => "Second"}
+              ]
+            })
+
+          String.contains?(path, "group_parent/members") or
+              String.contains?(path, "group_second/members") ->
+            Req.Test.json(conn, %{
+              "value" => [%{"@odata.type" => "#microsoft.graph.group", "id" => "group_child"}]
+            })
+
+          String.contains?(path, "group_child/members") and query == "page=2" ->
+            conn
+            |> Plug.Conn.put_status(404)
+            |> Req.Test.json(%{"error" => %{"code" => "Request_ResourceNotFound"}})
+
+          String.contains?(path, "group_child/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_ghost",
+                  "displayName" => "Ghost",
+                  "mail" => "ghost@example.com",
+                  "userPrincipalName" => "ghost@example.com"
+                })
+              ],
+              "@odata.nextLink" => "https://graph.microsoft.com/v1.0/groups/group_child/members?page=2"
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      refute Repo.get_by(ExternalIdentity, idp_id: "user_ghost")
+      assert Repo.all(Membership) == []
+    end
+
+    test "updates the name and email of an actor it created when the user changes" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      actor =
+        Portal.ActorFixtures.actor_fixture(account: account, name: "Old Name", email: "old@example.com")
+        |> Ecto.Changeset.change(created_by_directory_id: directory.id)
+        |> Repo.update!()
+
+      Portal.IdentityFixtures.identity_fixture(
+        account: account,
+        actor: actor,
+        directory: base_directory,
+        issuer: Sync.issuer(directory),
+        idp_id: "user_123",
+        email: "old@example.com",
+        synced_at: DateTime.add(DateTime.utc_now(), -3600, :second)
+      )
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "New Name"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_123",
+                    "displayName" => "New Name",
+                    "mail" => "new@example.com",
+                    "userPrincipalName" => "new@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      actor = Repo.get_by!(Actor, id: actor.id)
+      assert actor.name == "New Name"
+      assert actor.email == "new@example.com"
+    end
+
+    test "skips disabled users from direct assignments and group memberships" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{
+              "access_token" => "test_token",
+              "token_type" => "Bearer",
+              "expires_in" => 3600
+            })
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => @test_service_principal_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "id" => "assignment1",
+                  "principalId" => "user_direct_active",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Direct Active"
+                },
+                %{
+                  "id" => "assignment2",
+                  "principalId" => "user_direct_disabled",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Direct Disabled"
+                },
+                %{
+                  "id" => "assignment3",
+                  "principalId" => "group_eng_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Engineering"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_direct_active",
+                    "displayName" => "Direct Active",
+                    "mail" => "active-direct@example.com",
+                    "userPrincipalName" => "active-direct@example.com",
+                    "givenName" => "Direct",
+                    "surname" => "Active",
+                    "accountEnabled" => true
+                  }
+                },
+                %{
+                  "id" => "2",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_direct_disabled",
+                    "displayName" => "Direct Disabled",
+                    "mail" => "disabled-direct@example.com",
+                    "userPrincipalName" => "disabled-direct@example.com",
+                    "givenName" => "Direct",
+                    "surname" => "Disabled",
+                    "accountEnabled" => false
+                  }
+                }
+              ]
+            })
+
+          String.contains?(path, "/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_group_active",
+                  "displayName" => "Group Active",
+                  "mail" => "group-active@example.com",
+                  "userPrincipalName" => "group-active@example.com",
+                  "givenName" => "Group",
+                  "surname" => "Active",
+                  "accountEnabled" => true
+                },
+                %{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_group_disabled",
+                  "displayName" => "Group Disabled",
+                  "mail" => "group-disabled@example.com",
+                  "userPrincipalName" => "group-disabled@example.com",
+                  "givenName" => "Group",
+                  "surname" => "Disabled",
+                  "accountEnabled" => false
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      identities = Repo.all(ExternalIdentity)
+      identity_emails = Enum.map(identities, & &1.email) |> Enum.sort()
+      assert identity_emails == ["active-direct@example.com", "group-active@example.com"]
+
+      memberships = Repo.all(Membership)
+      assert length(memberships) == 1
+    end
+
+    test "disables, then re-enables, the actor of a previously synced user" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      args = %{account_id: directory.account_id, directory_id: directory.id}
+
+      expect_entra_direct_assignment_sync([direct_user("user_active_123"), direct_user("user_disable_123")])
+      assert :ok = perform_job(Sync, args)
+      identity = Repo.get_by!(ExternalIdentity, directory_id: directory.id, idp_id: "user_disable_123")
+
+      expect_entra_direct_assignment_sync([
+        direct_user("user_active_123"),
+        direct_user("user_disable_123", false)
+      ])
+
+      assert :ok = perform_job(Sync, args)
+
+      assert Repo.get_by!(ExternalIdentity, id: identity.id)
+      actor = Repo.get_by!(Actor, id: identity.actor_id)
+      assert actor.is_disabled
+      assert actor.disabled_by_directory_id == directory.id
+
+      expect_entra_direct_assignment_sync([direct_user("user_active_123"), direct_user("user_disable_123")])
+      assert :ok = perform_job(Sync, args)
+
+      actor = Repo.get_by!(Actor, id: identity.actor_id)
+      refute actor.is_disabled
+      assert actor.disabled_by_directory_id == nil
+    end
+
+    test "removes a disabled user whose actor the directory did not create" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      args = %{account_id: directory.account_id, directory_id: directory.id}
+
+      actor =
+        Portal.ActorFixtures.actor_fixture(account: account, email: "user_disable_123@example.com")
+
+      expect_entra_direct_assignment_sync([direct_user("user_active_123"), direct_user("user_disable_123")])
+      assert :ok = perform_job(Sync, args)
+      assert Repo.get_by!(ExternalIdentity, idp_id: "user_disable_123").actor_id == actor.id
+
+      expect_entra_direct_assignment_sync([
+        direct_user("user_active_123"),
+        direct_user("user_disable_123", false)
+      ])
+
+      assert :ok = perform_job(Sync, args)
+
+      refute Repo.get_by(ExternalIdentity, idp_id: "user_disable_123")
+      refute Repo.get_by!(Actor, id: actor.id).is_disabled
+    end
+
+    test "keeps the group memberships of a disabled user whose actor the directory created" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      args = %{account_id: directory.account_id, directory_id: directory.id}
+
+      stub_entra_group_sync([group_member("user_1"), group_member("user_2")])
+      assert :ok = perform_job(Sync, args)
+      identity = Repo.get_by!(ExternalIdentity, idp_id: "user_2")
+      assert Repo.get_by(Membership, actor_id: identity.actor_id)
+
+      stub_entra_group_sync([group_member("user_1"), group_member("user_2", false)])
+      assert :ok = perform_job(Sync, args)
+
+      assert Repo.get_by!(Actor, id: identity.actor_id).is_disabled
+      assert Repo.get_by(Membership, actor_id: identity.actor_id)
+    end
+
+    test "handles missing directory gracefully" do
+      non_existent_id = Ecto.UUID.generate()
+
+      # Should not raise an error
+      assert :ok = perform_job(Sync, %{account_id: Ecto.UUID.generate(), directory_id: non_existent_id})
+
+      # No data should be created
+      assert Repo.all(ExternalIdentity) == []
+      assert Repo.all(Group) == []
+    end
+
+    test "skips directory belonging to another account" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      other_account = account_fixture(features: %{idp_sync: true})
+
+      assert :ok = perform_job(Sync, %{account_id: other_account.id, directory_id: directory.id})
+
+      assert Repo.all(ExternalIdentity) == []
+      assert Repo.all(Group) == []
+    end
+
+    test "handles disabled directory" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, is_disabled: true)
+
+      # Should not perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # No data should be created
+      assert Repo.all(ExternalIdentity) == []
+      assert Repo.all(Group) == []
+    end
+
+    test "handles disabled account" do
+      account = account_fixture(features: %{idp_sync: true})
+
+      account =
+        account
+        |> Ecto.Changeset.change(is_disabled: true)
+        |> Repo.update!()
+
+      directory = entra_directory_fixture(account: account)
+
+      # Should not perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # No data should be created
+      assert Repo.all(ExternalIdentity) == []
+      assert Repo.all(Group) == []
+    end
+
+    test "deletes unsynced identities on subsequent sync" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      # Create an old identity that won't be in the new sync
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+
+      actor =
+        Repo.insert!(%Actor{
+          id: Ecto.UUID.generate(),
+          account_id: account.id,
+          type: :account_user,
+          name: "Old User",
+          email: "old@example.com",
+          created_by_directory_id: directory.id
+        })
+
+      old_identity =
+        Repo.insert!(%ExternalIdentity{
+          id: Ecto.UUID.generate(),
+          account_id: account.id,
+          actor_id: actor.id,
+          issuer: issuer,
+          idp_id: "old_user_123",
+          directory_id: directory.id,
+          email: "old@example.com",
+          name: "Old User",
+        })
+
+      # Mock successful sync with a different user
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "new_user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "New User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "new_user_123",
+                    "displayName" => "New User",
+                    "mail" => "new@example.com",
+                    "userPrincipalName" => "new@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Old identity should be deleted
+      refute Repo.get_by(ExternalIdentity, id: old_identity.id)
+
+      # Old actor should be deleted (no other identities)
+      refute Repo.get_by(Actor, id: actor.id)
+
+      # New identity should exist
+      new_identities = Repo.all(ExternalIdentity)
+      assert length(new_identities) == 1
+      assert hd(new_identities).email == "new@example.com"
+    end
+
+    test "deletes unsynced groups on subsequent sync" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      # Create an old group that won't be in the new sync
+      old_group =
+        Repo.insert!(%Group{
+          id: Ecto.UUID.generate(),
+          account_id: account.id,
+          directory_id: directory.id,
+          idp_id: "old_group_123",
+          name: "Old Group",
+          type: :static,
+        })
+
+      # Mock successful sync with a different group
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{"id" => "new_group_123", "displayName" => "New Group"}
+              ]
+            })
+
+          String.contains?(path, "/members") ->
+            Req.Test.json(conn, %{"value" => []})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Old group should be deleted
+      refute Repo.get_by(Group, id: old_group.id)
+
+      # New group should exist
+      new_groups = Repo.all(Group)
+      assert length(new_groups) == 1
+      assert hd(new_groups).name == "New Group"
+    end
+
+    test "filters out non-user members from group members" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      # Mock all requests with unlimited calls
+      Req.Test.expect(APIClient, 100, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [%{"id" => "group_123", "displayName" => "Test Group"}]
+            })
+
+          String.contains?(path, "/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                # This user should be included
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_123",
+                  "displayName" => "Test User",
+                  "mail" => "user@example.com",
+                  "userPrincipalName" => "user@example.com"
+                }),
+                # This group should be filtered out
+                %{
+                  "@odata.type" => "#microsoft.graph.group",
+                  "id" => "nested_group_123",
+                  "displayName" => "Nested Group"
+                },
+                # This service principal should be filtered out
+                %{
+                  "@odata.type" => "#microsoft.graph.servicePrincipal",
+                  "id" => "sp_123",
+                  "displayName" => "Service Principal"
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Only the user identity should be created
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 1
+      assert hd(identities).email == "user@example.com"
+    end
+
+    test "uses userPrincipalName as fallback when mail is null" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Test User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_123",
+                    "displayName" => "Test User",
+                    "mail" => nil,
+                    "userPrincipalName" => "testuser@example.onmicrosoft.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Identity should use userPrincipalName as email
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 1
+      assert hd(identities).email == "testuser@example.onmicrosoft.com"
+    end
+
+    test "handles batch user fetch with partial failures gracefully" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user1_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "User One"
+                },
+                %{
+                  "principalId" => "user2_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "User Two"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user1_123",
+                    "displayName" => "User One",
+                    "mail" => "user1@example.com",
+                    "userPrincipalName" => "user1@example.com",
+                    "accountEnabled" => true
+                  }
+                },
+                %{
+                  "id" => "2",
+                  "status" => 404,
+                  "body" => %{"error" => "User not found"}
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Only the successful user should be synced
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 1
+      assert hd(identities).email == "user1@example.com"
+    end
+
+    test "clears error state on successful sync" do
+      account = account_fixture(features: %{idp_sync: true})
+
+      directory =
+        entra_directory_fixture(
+          account: account,
+          sync_all_groups: true,
+          error_message: "Previous error",
+          error_email_count: 3,
+          errored_at: DateTime.utc_now() |> DateTime.add(-3600, :second)
+        )
+
+      # Mock successful sync
+      Req.Test.expect(APIClient, 10, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{"value" => []})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Error state should be cleared
+      updated_directory = Repo.get(Portal.Entra.Directory, directory.id)
+      assert updated_directory.error_message == nil
+      assert updated_directory.error_email_count == 0
+      assert updated_directory.errored_at == nil
+      assert updated_directory.is_disabled == false
+      assert updated_directory.disabled_reason == nil
+      refute is_nil(updated_directory.synced_at)
+    end
+
+    test "validates app role assignments have required fields" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      # Mock access token
+      Req.Test.expect(APIClient, fn %{request_path: path} = conn ->
+        if String.ends_with?(path, "/oauth2/v2.0/token") do
+          Req.Test.json(conn, %{"access_token" => "test_token"})
+        else
+          Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      # Mock service principal
+      Req.Test.expect(APIClient, fn %{request_path: "/v1.0/servicePrincipals"} = conn ->
+        Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+      end)
+
+      # Mock app role assignments with missing principalId
+      Req.Test.expect(APIClient, fn %{request_path: path} = conn ->
+        if String.contains?(path, "appRoleAssignedTo") do
+          Req.Test.json(conn, %{
+            "value" => [
+              %{
+                "principalType" => "User",
+                "principalDisplayName" => "User Without ID"
+              }
+            ]
+          })
+        else
+          Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      # Should raise SyncError
+      assert_raise Portal.Entra.SyncError, fn ->
+        perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+      end
+    end
+
+    test "validates users have required id field" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      # Mock access token
+      Req.Test.expect(APIClient, fn %{request_path: path} = conn ->
+        if String.ends_with?(path, "/oauth2/v2.0/token") do
+          Req.Test.json(conn, %{"access_token" => "test_token"})
+        else
+          Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      # Mock groups
+      Req.Test.expect(APIClient, fn %{request_path: "/v1.0/groups"} = conn ->
+        Req.Test.json(conn, %{
+          "value" => [%{"id" => "group_123", "displayName" => "Test Group"}]
+        })
+      end)
+
+      # Mock transitive members with user missing id
+      Req.Test.expect(APIClient, fn %{request_path: path} = conn ->
+        if String.contains?(path, "/members") do
+          Req.Test.json(conn, %{
+            "value" => [
+              entra_api_user_fixture(%{
+                "@odata.type" => "#microsoft.graph.user",
+                "displayName" => "User Without ID",
+                "mail" => "user@example.com"
+              })
+            ]
+          })
+        else
+          Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      # Should raise SyncError
+      assert_raise Portal.Entra.SyncError, fn ->
+        perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+      end
+    end
+
+    test "validates groups have required fields" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      # Mock access token
+      Req.Test.expect(APIClient, fn %{request_path: path} = conn ->
+        if String.ends_with?(path, "/oauth2/v2.0/token") do
+          Req.Test.json(conn, %{"access_token" => "test_token"})
+        else
+          Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      # Mock groups with missing displayName
+      Req.Test.expect(APIClient, fn %{request_path: "/v1.0/groups"} = conn ->
+        Req.Test.json(conn, %{
+          "value" => [%{"id" => "group_123"}]
+        })
+      end)
+
+      # Should raise SyncError
+      assert_raise Portal.Entra.SyncError, fn ->
+        perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+      end
+    end
+
+    test "reads a group assigned to both apps once" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+      test_pid = self()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => "sp_directory_sync"}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => "sp_auth_provider"}]})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "group_shared",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Shared"
+                }
+              ]
+            })
+
+          String.contains?(path, "group_shared/members") ->
+            send(test_pid, :members_read)
+
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_alice",
+                  "displayName" => "Alice",
+                  "mail" => "alice@example.com",
+                  "userPrincipalName" => "alice@example.com"
+                })
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      assert_received :members_read
+      refute_received :members_read
+      identity = Repo.get_by!(ExternalIdentity, idp_id: "user_alice")
+      assert [_] = Repo.all_by(Membership, actor_id: identity.actor_id)
+    end
+
+    test "syncs assignments from both directory sync and auth provider apps" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      # Get the expected client_ids from config
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      # Track which client_ids were used in service principal lookups
+      test_pid = self()
+
+      directory_sync_sp_id = "sp_directory_sync"
+      auth_provider_sp_id = "sp_auth_provider"
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            # Capture the filter to verify which client_id was looked up
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+            send(test_pid, {:service_principal_lookup, filter})
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => directory_sync_sp_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [%{"id" => auth_provider_sp_id, "appId" => auth_provider_client_id}]
+                })
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "#{directory_sync_sp_id}/appRoleAssignedTo") ->
+            # Directory sync app has a user assignment
+            send(test_pid, {:app_role_query, :directory_sync})
+
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_dir_sync_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Directory Sync User"
+                }
+              ]
+            })
+
+          String.contains?(path, "#{auth_provider_sp_id}/appRoleAssignedTo") ->
+            # Auth provider app also has a user assignment (deprecated, for backwards compat)
+            send(test_pid, {:app_role_query, :auth_provider})
+
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_auth_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Auth Provider User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            # Return user details based on which user IDs are requested
+            {:ok, body, conn} = Plug.Conn.read_body(conn)
+            request_body = Jason.decode!(body)
+
+            responses =
+              Enum.map(request_body["requests"], fn req ->
+                cond do
+                  String.contains?(req["url"], "user_dir_sync_123") ->
+                    %{
+                      "id" => req["id"],
+                      "status" => 200,
+                      "body" => %{
+                        "id" => "user_dir_sync_123",
+                        "displayName" => "Directory Sync User",
+                        "mail" => "dirsync@example.com",
+                        "userPrincipalName" => "dirsync@example.com",
+                        "accountEnabled" => true
+                      }
+                    }
+
+                  String.contains?(req["url"], "user_auth_123") ->
+                    %{
+                      "id" => req["id"],
+                      "status" => 200,
+                      "body" => %{
+                        "id" => "user_auth_123",
+                        "displayName" => "Auth Provider User",
+                        "mail" => "authprovider@example.com",
+                        "userPrincipalName" => "authprovider@example.com",
+                        "accountEnabled" => true
+                      }
+                    }
+
+                  true ->
+                    %{"id" => req["id"], "status" => 404, "body" => %{"error" => "not found"}}
+                end
+              end)
+
+            Req.Test.json(conn, %{"responses" => responses})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Verify both service principals were looked up
+      lookups = receive_all_messages(:service_principal_lookup)
+      assert length(lookups) == 2
+      assert Enum.any?(lookups, &String.contains?(&1, directory_sync_client_id))
+      assert Enum.any?(lookups, &String.contains?(&1, auth_provider_client_id))
+
+      # Verify both apps were queried for assignments
+      app_role_queries = receive_all_messages(:app_role_query)
+      assert :directory_sync in app_role_queries
+      assert :auth_provider in app_role_queries
+
+      # Verify users from BOTH apps were synced
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 2
+      identity_emails = Enum.map(identities, & &1.email) |> Enum.sort()
+      assert identity_emails == ["authprovider@example.com", "dirsync@example.com"]
+    end
+
+    test "syncs groups and their members from both directory sync and auth provider apps" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      # Get the expected client_ids from config
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      directory_sync_sp_id = "sp_directory_sync"
+      auth_provider_sp_id = "sp_auth_provider"
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 30, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => directory_sync_sp_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [%{"id" => auth_provider_sp_id, "appId" => auth_provider_client_id}]
+                })
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "#{directory_sync_sp_id}/appRoleAssignedTo") ->
+            # Directory sync app has a GROUP assignment
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "group_engineering_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Engineering Team"
+                }
+              ]
+            })
+
+          String.contains?(path, "#{auth_provider_sp_id}/appRoleAssignedTo") ->
+            # Auth provider app also has a GROUP assignment (deprecated, for backwards compat)
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "group_sales_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Sales Team"
+                }
+              ]
+            })
+
+          # Transitive members for Engineering Team (from directory sync app)
+          String.contains?(path, "group_engineering_123/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_alice_123",
+                  "displayName" => "Alice Engineer",
+                  "mail" => "alice@example.com",
+                  "userPrincipalName" => "alice@example.com",
+                  "givenName" => "Alice",
+                  "surname" => "Engineer"
+                }),
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_bob_123",
+                  "displayName" => "Bob Engineer",
+                  "mail" => "bob@example.com",
+                  "userPrincipalName" => "bob@example.com",
+                  "givenName" => "Bob",
+                  "surname" => "Engineer"
+                })
+              ]
+            })
+
+          # Transitive members for Sales Team (from auth provider app)
+          String.contains?(path, "group_sales_123/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "id" => "user_carol_123",
+                  "displayName" => "Carol Sales",
+                  "mail" => "carol@example.com",
+                  "userPrincipalName" => "carol@example.com",
+                  "givenName" => "Carol",
+                  "surname" => "Sales"
+                })
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Verify BOTH groups were created
+      groups = Repo.all(Group)
+      assert length(groups) == 2
+      group_names = Enum.map(groups, & &1.name) |> Enum.sort()
+      assert group_names == ["Engineering Team", "Sales Team"]
+
+      # Verify members from BOTH groups were synced as identities
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 3
+      identity_emails = Enum.map(identities, & &1.email) |> Enum.sort()
+      assert identity_emails == ["alice@example.com", "bob@example.com", "carol@example.com"]
+
+      # Verify memberships were created
+      memberships = Repo.all(Membership)
+      assert length(memberships) == 3
+
+      # Verify Engineering Team has 2 members (Alice and Bob)
+      engineering_group = Enum.find(groups, &(&1.name == "Engineering Team"))
+      engineering_memberships = Enum.filter(memberships, &(&1.group_id == engineering_group.id))
+      assert length(engineering_memberships) == 2
+
+      # Verify Sales Team has 1 member (Carol)
+      sales_group = Enum.find(groups, &(&1.name == "Sales Team"))
+      sales_memberships = Enum.filter(memberships, &(&1.group_id == sales_group.id))
+      assert length(sales_memberships) == 1
+    end
+
+    test "syncs users from auth provider app when directory sync app has no assignments (deprecated)" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      # Get the expected client_ids from config
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      directory_sync_sp_id = "sp_directory_sync"
+      auth_provider_sp_id = "sp_auth_provider"
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => directory_sync_sp_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [%{"id" => auth_provider_sp_id, "appId" => auth_provider_client_id}]
+                })
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "#{directory_sync_sp_id}/appRoleAssignedTo") ->
+            # Directory sync app has NO assignments
+            Req.Test.json(conn, %{"value" => []})
+
+          String.contains?(path, "#{auth_provider_sp_id}/appRoleAssignedTo") ->
+            # Auth provider app HAS assignments
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_legacy_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Legacy User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_legacy_123",
+                    "displayName" => "Legacy User",
+                    "mail" => "legacy@example.com",
+                    "userPrincipalName" => "legacy@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # Verify user from auth provider was synced
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 1
+      assert hd(identities).email == "legacy@example.com"
+    end
+
+    test "handles case when neither directory sync nor auth provider apps have assignments" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      directory_sync_sp_id = "sp_directory_sync"
+      auth_provider_sp_id = "sp_auth_provider"
+
+      # Mock all requests
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => directory_sync_sp_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{
+                  "value" => [%{"id" => auth_provider_sp_id, "appId" => auth_provider_client_id}]
+                })
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            # Neither app has assignments
+            Req.Test.json(conn, %{"value" => []})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Perform sync - should complete successfully with no data
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # No identities should be created
+      assert Repo.all(ExternalIdentity) == []
+      assert Repo.all(Group) == []
+    end
+
+    test "fails sync when Directory Sync service principal not found (consent revoked)" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      # Mock access token and service principal lookup returning empty for directory sync
+      Req.Test.expect(APIClient, 10, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            if String.contains?(filter, directory_sync_client_id) do
+              # Directory Sync app NOT found - consent was revoked
+              Req.Test.json(conn, %{"value" => []})
+            else
+              Req.Test.json(conn, %{"value" => []})
+            end
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Should raise SyncError with appropriate step
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :fetch_directory_sync_service_principal
+      assert {:consent_revoked, msg} = error.error
+      assert msg =~ "Directory Sync app service principal not found"
+    end
+
+    test "continues sync when Auth Provider service principal not found (deprecated app)" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+
+      directory_sync_client_id = APIClient.client_id(:entra)
+
+      auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+      auth_provider_client_id = auth_provider_config[:client_id]
+
+      directory_sync_sp_id = "sp_directory_sync"
+
+      # Mock requests - directory sync found, auth provider NOT found
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            params = URI.decode_query(query)
+            filter = params["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                # Directory Sync app IS found
+                Req.Test.json(conn, %{
+                  "value" => [
+                    %{"id" => directory_sync_sp_id, "appId" => directory_sync_client_id}
+                  ]
+                })
+
+              String.contains?(filter, auth_provider_client_id) ->
+                # Auth Provider app NOT found (deprecated, should be ok)
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "#{directory_sync_sp_id}/appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Test User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_123",
+                    "displayName" => "Test User",
+                    "mail" => "test@example.com",
+                    "userPrincipalName" => "test@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+        end
+      end)
+
+      # Should complete successfully even though auth provider app is not found
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      # User should be synced from directory sync app
+      identities = Repo.all(ExternalIdentity)
+      assert length(identities) == 1
+      assert hd(identities).email == "test@example.com"
+    end
+
+    test "raises SyncError when access token response is missing access_token" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+
+      Req.Test.expect(APIClient, fn %{request_path: path} = conn ->
+        if String.ends_with?(path, "/oauth2/v2.0/token") do
+          Req.Test.json(conn, %{"token_type" => "Bearer"})
+        else
+          Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :get_access_token
+    end
+
+    test "raises SyncError when access token request fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+
+      Req.Test.expect(APIClient, fn conn ->
+        Req.Test.transport_error(conn, :econnrefused)
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :get_access_token
+    end
+
+    test "raises SyncError when directory sync service principal lookup fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, _auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            if String.contains?(filter, directory_sync_client_id) do
+              Req.Test.transport_error(conn, :econnrefused)
+            else
+              Req.Test.json(conn, %{"value" => []})
+            end
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :fetch_directory_sync_service_principal
+    end
+
+    test "continues sync when auth provider service principal lookup request fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+      Logger.put_process_level(self(), :debug)
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.transport_error(conn, :econnrefused)
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "#{@test_service_principal_id}/appRoleAssignedTo") ->
+            Req.Test.json(conn, %{"value" => []})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+      assert Repo.all(ExternalIdentity) == []
+    end
+
+    test "raises SyncError when streaming app role assignments fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "#{@test_service_principal_id}/appRoleAssignedTo") ->
+            conn
+            |> Plug.Conn.put_status(500)
+            |> Req.Test.json(%{"error" => "server_error"})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :stream_app_role_assignments
+    end
+
+    test "validates app role assignments have principalType" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, _auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            if String.contains?(filter, directory_sync_client_id) do
+              Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+            else
+              Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalDisplayName" => "Test User"
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_assignment
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "validates app role assignments have principalDisplayName" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, _auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            if String.contains?(filter, directory_sync_client_id) do
+              Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+            else
+              Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User"
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_assignment
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "validates app role assignments have principalId" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, _auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            if String.contains?(filter, directory_sync_client_id) do
+              Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+            else
+              Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalType" => "User",
+                  "principalDisplayName" => "User Without ID"
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_assignment
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "raises SyncError when batch user fetch fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Test User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            conn
+            |> Plug.Conn.put_status(500)
+            |> Req.Test.json(%{"error" => "server_error"})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :batch_get_users
+    end
+
+    test "raises SyncError when assigned group member streaming fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "group_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Engineering"
+                }
+              ]
+            })
+
+          String.contains?(path, "group_123/members") ->
+            conn
+            |> Plug.Conn.put_status(500)
+            |> Req.Test.json(%{"error" => "server_error"})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :stream_group_members
+    end
+
+    test "raises SyncError when streaming all groups fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            conn
+            |> Plug.Conn.put_status(500)
+            |> Req.Test.json(%{"error" => "server_error"})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :stream_groups
+    end
+
+    test "raises SyncError when all-group member streaming fails" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [%{"id" => "group_123", "displayName" => "Engineering"}]
+            })
+
+          String.contains?(path, "group_123/members") ->
+            conn
+            |> Plug.Conn.put_status(500)
+            |> Req.Test.json(%{"error" => "server_error"})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :stream_group_members
+    end
+
+    test "validates groups have required id field" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{"value" => [%{"displayName" => "Engineering"}]})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_group
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "validates assigned group members have required id field" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "group_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Engineering"
+                }
+              ]
+            })
+
+          String.contains?(path, "group_123/members") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                entra_api_user_fixture(%{
+                  "@odata.type" => "#microsoft.graph.user",
+                  "displayName" => "User Without ID",
+                  "mail" => "user@example.com",
+                  "userPrincipalName" => "user@example.com"
+                })
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_group_member
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "validates batch fetched users have required id field" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Test User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "displayName" => "Test User",
+                    "mail" => "test@example.com",
+                    "userPrincipalName" => "test@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_user
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "raises SyncError when configured mail field is invalid" do
+      account = account_fixture(features: %{idp_sync: true})
+
+      directory =
+        entra_directory_fixture(account: account, sync_all_groups: false, email_field: "mail")
+
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Test User"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_123",
+                    "displayName" => "Test User",
+                    "mail" => "not-an-email",
+                    "userPrincipalName" => "test@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :process_user
+      assert match?({:validation, _}, error.error)
+    end
+
+    test "reconnects orphaned policies after sync" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: true)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+
+      group =
+        Portal.GroupFixtures.group_fixture(
+          account: account,
+          directory: base_directory,
+          idp_id: "group_123",
+          name: "Engineering"
+        )
+
+      resource = Portal.ResourceFixtures.resource_fixture(account: account)
+
+      policy =
+        Portal.PolicyFixtures.policy_fixture(account: account, group: group, resource: resource)
+
+      {1, _} =
+        Repo.update_all(
+          from(p in Portal.Policy, where: p.id == ^policy.id),
+          set: [group_id: nil, group_idp_id: group.idp_id]
+        )
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/groups" ->
+            Req.Test.json(conn, %{
+              "value" => [%{"id" => "group_123", "displayName" => "Engineering"}]
+            })
+
+          String.contains?(path, "group_123/members") ->
+            Req.Test.json(conn, %{"value" => []})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      assert Repo.get_by!(Portal.Policy, account_id: account.id, id: policy.id).group_id ==
+               group.id
+    end
+
+    test "grants a member listed twice on one page once" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 30, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "Direct User"
+                },
+                %{
+                  "principalId" => "group_123",
+                  "principalType" => "Group",
+                  "principalDisplayName" => "Engineering"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_123",
+                    "displayName" => "Direct User",
+                    "mail" => "direct@example.com",
+                    "userPrincipalName" => "direct@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          String.contains?(path, "group_123/members") ->
+            duplicate_member =
+              entra_api_user_fixture(%{
+                "@odata.type" => "#microsoft.graph.user",
+                "id" => "user_123",
+                "displayName" => "Direct User",
+                "mail" => "direct@example.com",
+                "userPrincipalName" => "direct@example.com"
+              })
+
+            Req.Test.json(conn, %{"value" => [duplicate_member, duplicate_member]})
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      assert :ok = perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+
+      identity = Repo.get_by!(ExternalIdentity, idp_id: "user_123")
+      assert [_] = Repo.all_by(Membership, actor_id: identity.actor_id)
+    end
+
+    test "raises SyncError when direct user upserts fail because emails collide" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account, sync_all_groups: false)
+      {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+      Req.Test.expect(APIClient, 20, fn %{request_path: path, query_string: query} = conn ->
+        cond do
+          String.ends_with?(path, "/oauth2/v2.0/token") ->
+            Req.Test.json(conn, %{"access_token" => "test_token"})
+
+          path == "/v1.0/servicePrincipals" ->
+            filter = URI.decode_query(query)["$filter"]
+
+            cond do
+              String.contains?(filter, directory_sync_client_id) ->
+                Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+
+              String.contains?(filter, auth_provider_client_id) ->
+                Req.Test.json(conn, %{"value" => []})
+
+              true ->
+                Req.Test.json(conn, %{"value" => []})
+            end
+
+          String.contains?(path, "appRoleAssignedTo") ->
+            Req.Test.json(conn, %{
+              "value" => [
+                %{
+                  "principalId" => "user_123",
+                  "principalType" => "User",
+                  "principalDisplayName" => "User One"
+                },
+                %{
+                  "principalId" => "user_456",
+                  "principalType" => "User",
+                  "principalDisplayName" => "User Two"
+                }
+              ]
+            })
+
+          String.ends_with?(path, "/$batch") ->
+            Req.Test.json(conn, %{
+              "responses" => [
+                %{
+                  "id" => "1",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_123",
+                    "displayName" => "User One",
+                    "mail" => "shared@example.com",
+                    "userPrincipalName" => "shared@example.com",
+                    "accountEnabled" => true
+                  }
+                },
+                %{
+                  "id" => "2",
+                  "status" => 200,
+                  "body" => %{
+                    "id" => "user_456",
+                    "displayName" => "User Two",
+                    "mail" => "shared@example.com",
+                    "userPrincipalName" => "shared@example.com",
+                    "accountEnabled" => true
+                  }
+                }
+              ]
+            })
+
+          true ->
+            Req.Test.json(conn, %{"error" => "unexpected"})
+        end
+      end)
+
+      error =
+        assert_raise Portal.Entra.SyncError, fn ->
+          perform_job(Sync, %{account_id: directory.account_id, directory_id: directory.id})
+        end
+
+      assert error.step == :batch_upsert_identities
+    end
+  end
+
+  describe "parents_of/2" do
+    test "finds parents through the nesting index in a large directory" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      Portal.GroupFixtures.bulk_groups_fixture(base_directory, 2000)
+
+      parent =
+        Portal.GroupFixtures.group_fixture(
+          account: account,
+          directory: base_directory,
+          idp_id: "parent",
+          nested_group_idp_ids: ["child"]
+        )
+
+      Repo.query!("ANALYZE groups")
+
+      [{sql, params}] =
+        capture_statements(fn ->
+          assert [%Group{id: id}] = Sync.parents_of(directory, "child")
+          assert id == parent.id
+        end)
+
+      assert indexed_plan(sql, params) =~ "groups_nested_group_idp_ids_index"
+    end
+  end
+
+  describe "new_recovery/1" do
+    test "queues behind an executing sync where a plain sync collapses into it" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      args = %{account_id: directory.account_id, directory_id: directory.id}
+
+      running = executing_job(Sync.new(args))
+
+      assert {:ok, %Oban.Job{conflict?: true, id: id}} = Oban.insert(Sync.new(args))
+      assert id == running.id
+
+      assert {:ok, %Oban.Job{conflict?: false, state: "available"}} =
+               Oban.insert(Sync.new_recovery(args))
+    end
+  end
+
+  describe "database helpers" do
+    test "cover empty and error branches" do
+      now = DateTime.utc_now()
+      account_id = Ecto.UUID.generate()
+      directory_id = Ecto.UUID.generate()
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      actor = Portal.ActorFixtures.actor_fixture(account: account)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+
+      Portal.GroupFixtures.group_fixture(
+        account: account,
+        directory: base_directory,
+        idp_id: "group1"
+      )
+
+      Portal.IdentityFixtures.identity_fixture(
+        account: account,
+        actor: actor,
+        directory: base_directory,
+        issuer: issuer,
+        idp_id: "user1",
+        email: "user1@example.com"
+      )
+
+      assert {:ok, %{upserted_identities: 0}} =
+               Database.batch_upsert_identities(account_id, issuer, directory_id, now, [])
+
+      assert {:ok, %{upserted_groups: 0}} =
+               Database.batch_upsert_groups(account_id, directory_id, now, [])
+
+      assert {:ok, %{upserted_memberships: 0}} =
+               Database.batch_upsert_memberships(account_id, issuer, directory_id, now, [])
+
+      assert {:error, _reason} =
+               Database.batch_upsert_identities(
+                 account_id,
+                 issuer,
+                 directory_id,
+                 now,
+                 [
+                   %{
+                     idp_id: "user1",
+                     email: "u1@example.com",
+                     name: "User 1",
+                     given_name: "User",
+                     family_name: "One",
+                     preferred_username: "u1@example.com",
+                     profile: nil
+                   }
+                 ]
+               )
+
+      assert {:error, _reason} =
+               Database.batch_upsert_groups(
+                 account_id,
+                 directory_id,
+                 now,
+                 [%{idp_id: "group1", name: "Group 1"}]
+               )
+
+      assert {:error, _reason} =
+               Database.batch_upsert_memberships(
+                 account.id,
+                 issuer,
+                 directory.id,
+                 now,
+                 [{"group1", "user1"}, {"group1", "user1"}]
+               )
+    end
+
+    test "identity upsert rejects stale synced_at and accepts fresh" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      actor = Portal.ActorFixtures.actor_fixture(account: account)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+
+      now = DateTime.utc_now()
+      stale = DateTime.add(now, -3600, :second)
+      future = DateTime.add(now, 3600, :second)
+
+      identity =
+        Portal.IdentityFixtures.identity_fixture(
+          account: account,
+          actor: actor,
+          directory: base_directory,
+          issuer: issuer,
+          idp_id: "monotonic_user",
+          email: "old@example.com",
+          synced_at: now
+        )
+
+      stale_attrs = [
+        %{
+          idp_id: "monotonic_user",
+          email: "stale@example.com",
+          name: nil,
+          given_name: nil,
+          family_name: nil,
+          preferred_username: nil,
+          profile: nil
+        }
+      ]
+
+      assert {:ok, _} =
+               Database.batch_upsert_identities(
+                 account.id,
+                 issuer,
+                 directory.id,
+                 stale,
+                 stale_attrs
+               )
+
+      identity_after_stale = Repo.get_by!(ExternalIdentity, id: identity.id, account_id: account.id)
+      assert identity_after_stale.email == "old@example.com"
+
+      sync_state_after_stale =
+        Repo.get_by!(Portal.ExternalIdentitySyncState, external_identity_id: identity.id)
+
+      assert DateTime.compare(sync_state_after_stale.synced_at, now) == :eq
+
+      fresh_attrs = [Map.put(hd(stale_attrs), :email, "fresh@example.com")]
+
+      assert {:ok, _} =
+               Database.batch_upsert_identities(
+                 account.id,
+                 issuer,
+                 directory.id,
+                 future,
+                 fresh_attrs
+               )
+
+      identity_after_fresh = Repo.get_by!(ExternalIdentity, id: identity.id, account_id: account.id)
+      assert identity_after_fresh.email == "fresh@example.com"
+
+      sync_state_after_fresh =
+        Repo.get_by!(Portal.ExternalIdentitySyncState, external_identity_id: identity.id)
+
+      assert DateTime.compare(sync_state_after_fresh.synced_at, future) == :eq
+    end
+
+    test "identity upsert recycles stale identity when user is recreated with a new idp_id" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+
+      actor =
+        Portal.ActorFixtures.actor_fixture(account: account, email: "recreated@example.com")
+
+      # Identity left behind by the user's previous (now deleted) Entra object.
+      stale_identity =
+        Portal.IdentityFixtures.identity_fixture(
+          account: account,
+          actor: actor,
+          directory: base_directory,
+          issuer: issuer,
+          idp_id: "old-object-id",
+          email: "recreated@example.com",
+          synced_at: DateTime.add(DateTime.utc_now(), -86_400, :second)
+        )
+
+      # The user is recreated in Entra: same UPN/email, brand new object id.
+      assert {:ok, %{upserted_identities: 1}} =
+               Database.batch_upsert_identities(
+                 account.id,
+                 issuer,
+                 directory.id,
+                 DateTime.utc_now(),
+                 [
+                   %{
+                     idp_id: "new-object-id",
+                     email: "recreated@example.com",
+                     name: "Recreated User",
+                     given_name: "Recreated",
+                     family_name: "User",
+                     preferred_username: "recreated@example.com",
+                     profile: nil
+                   }
+                 ]
+               )
+
+      identities =
+        from(ei in ExternalIdentity,
+          where: ei.account_id == ^account.id and ei.actor_id == ^actor.id
+        )
+        |> Repo.all()
+
+      # The stale row is recycled in place rather than duplicated.
+      assert [identity] = identities
+      assert identity.id == stale_identity.id
+      assert identity.idp_id == "new-object-id"
+      assert identity.directory_id == directory.id
+    end
+
+    test "recycled identity keeps a fresh sync state when seen twice in one run" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+
+      actor =
+        Portal.ActorFixtures.actor_fixture(account: account, email: "recreated@example.com")
+
+      stale_identity =
+        Portal.IdentityFixtures.identity_fixture(
+          account: account,
+          actor: actor,
+          directory: base_directory,
+          issuer: issuer,
+          idp_id: "old-object-id",
+          email: "recreated@example.com",
+          synced_at: DateTime.add(DateTime.utc_now(), -86_400, :second)
+        )
+
+      synced_at = DateTime.utc_now()
+
+      attrs = [
+        %{
+          idp_id: "new-object-id",
+          email: "recreated@example.com",
+          name: "Recreated User",
+          given_name: "Recreated",
+          family_name: "User",
+          preferred_username: "recreated@example.com",
+          profile: nil
+        }
+      ]
+
+      # The same recreated user can appear in two batches of one sync run
+      # (e.g. direct assignment and group membership). The first call recycles
+      # the row; the second must still advance its sync state to the run's
+      # watermark so the later cleanup pass does not delete it.
+      assert {:ok, _} =
+               Database.batch_upsert_identities(account.id, issuer, directory.id, synced_at, attrs)
+
+      assert {:ok, _} =
+               Database.batch_upsert_identities(account.id, issuer, directory.id, synced_at, attrs)
+
+      sync_state =
+        Repo.get_by!(Portal.ExternalIdentitySyncState, external_identity_id: stale_identity.id)
+
+      assert DateTime.compare(sync_state.synced_at, synced_at) == :eq
+    end
+
+    test "identity upsert attaches the directory to an actor's pre-existing OIDC identity" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+      actor = Portal.ActorFixtures.actor_fixture(account: account, email: "oidc@example.com")
+
+      # Identity created by an OIDC sign-in: same issuer, no directory yet.
+      auth_identity =
+        Portal.IdentityFixtures.identity_fixture(
+          account: account,
+          actor: actor,
+          issuer: issuer,
+          idp_id: "subject-1",
+          email: "oidc@example.com"
+        )
+
+      assert auth_identity.directory_id == nil
+
+      assert {:ok, %{upserted_identities: 1}} =
+               Database.batch_upsert_identities(account.id, issuer, directory.id, DateTime.utc_now(), [
+                 %{
+                   idp_id: "subject-1",
+                   email: "oidc@example.com",
+                   name: "OIDC User",
+                   given_name: "OIDC",
+                   family_name: "User",
+                   preferred_username: "oidc@example.com",
+                   profile: nil
+                 }
+               ])
+
+      identities =
+        from(ei in ExternalIdentity,
+          where: ei.account_id == ^account.id and ei.actor_id == ^actor.id
+        )
+        |> Repo.all()
+
+      # The pre-existing identity is reused and gains the directory, not duplicated.
+      assert [identity] = identities
+      assert identity.id == auth_identity.id
+      assert identity.directory_id == directory.id
+    end
+
+    test "identity upsert errors when one batch maps two idp_ids to the same actor" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+      actor = Portal.ActorFixtures.actor_fixture(account: account, email: "swap@example.com")
+
+      Portal.IdentityFixtures.identity_fixture(
+        account: account,
+        actor: actor,
+        directory: base_directory,
+        issuer: issuer,
+        idp_id: "old-object-id",
+        email: "swap@example.com",
+        synced_at: DateTime.add(DateTime.utc_now(), -86_400, :second)
+      )
+
+      # The IdP reports two distinct objects sharing one email in a single batch:
+      # the old object (email changed) and a new object that took the old email.
+      # Both resolve to the same actor and directory slot, which cannot be
+      # represented, so we let it surface as an error rather than corrupt state.
+      assert {:error, %Postgrex.Error{postgres: %{code: :cardinality_violation}}} =
+               Database.batch_upsert_identities(account.id, issuer, directory.id, DateTime.utc_now(), [
+                 %{
+                   idp_id: "old-object-id",
+                   email: "renamed@example.com",
+                   name: "Old",
+                   given_name: "Old",
+                   family_name: "User",
+                   preferred_username: "renamed@example.com",
+                   profile: nil
+                 },
+                 %{
+                   idp_id: "new-object-id",
+                   email: "swap@example.com",
+                   name: "New",
+                   given_name: "New",
+                   family_name: "User",
+                   preferred_username: "swap@example.com",
+                   profile: nil
+                 }
+               ])
+    end
+
+    test "identity upsert updates issuer when a directory is reverified against a new tenant" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      actor = Portal.ActorFixtures.actor_fixture(account: account, email: "moved@example.com")
+
+      # Identity recorded under the directory's previous Entra tenant/issuer.
+      stale_identity =
+        Portal.IdentityFixtures.identity_fixture(
+          account: account,
+          actor: actor,
+          directory: base_directory,
+          issuer: "https://login.microsoftonline.com/old-tenant/v2.0",
+          idp_id: "entra-user",
+          email: "moved@example.com",
+          synced_at: DateTime.add(DateTime.utc_now(), -86_400, :second)
+        )
+
+      # The directory is reverified onto a new tenant, so the sync runs with a
+      # new issuer for the same Entra object id.
+      assert {:ok, %{upserted_identities: 1}} =
+               Database.batch_upsert_identities(
+                 account.id,
+                 "https://login.microsoftonline.com/new-tenant/v2.0",
+                 directory.id,
+                 DateTime.utc_now(),
+                 [
+                   %{
+                     idp_id: "entra-user",
+                     email: "moved@example.com",
+                     name: "Moved User",
+                     given_name: "Moved",
+                     family_name: "User",
+                     preferred_username: "moved@example.com",
+                     profile: nil
+                   }
+                 ]
+               )
+
+      identities =
+        from(ei in ExternalIdentity,
+          where: ei.account_id == ^account.id and ei.actor_id == ^actor.id
+        )
+        |> Repo.all()
+
+      assert [identity] = identities
+      assert identity.id == stale_identity.id
+      assert identity.issuer == "https://login.microsoftonline.com/new-tenant/v2.0"
+    end
+
+    test "group upsert rejects stale synced_at and accepts fresh" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+
+      now = DateTime.utc_now()
+      stale = DateTime.add(now, -3600, :second)
+      future = DateTime.add(now, 3600, :second)
+
+      group =
+        Portal.GroupFixtures.group_fixture(
+          account: account,
+          directory: base_directory,
+          idp_id: "monotonic_group",
+          name: "Original Name",
+          synced_at: now
+        )
+
+      assert {:ok, _} =
+               Database.batch_upsert_groups(account.id, directory.id, stale, [
+                 %{idp_id: "monotonic_group", name: "Stale Name"}
+               ])
+
+      group_after_stale = Repo.get_by!(Group, id: group.id, account_id: account.id)
+      assert group_after_stale.name == "Original Name"
+
+      sync_state_after_stale = Repo.get_by!(Portal.GroupSyncState, group_id: group.id)
+      assert DateTime.compare(sync_state_after_stale.synced_at, now) == :eq
+
+      assert {:ok, _} =
+               Database.batch_upsert_groups(account.id, directory.id, future, [
+                 %{idp_id: "monotonic_group", name: "Fresh Name"}
+               ])
+
+      group_after_fresh = Repo.get_by!(Group, id: group.id, account_id: account.id)
+      assert group_after_fresh.name == "Fresh Name"
+
+      sync_state_after_fresh = Repo.get_by!(Portal.GroupSyncState, group_id: group.id)
+      assert DateTime.compare(sync_state_after_fresh.synced_at, future) == :eq
+    end
+
+    test "membership upsert rejects stale synced_at and accepts fresh" do
+      account = account_fixture(features: %{idp_sync: true})
+      directory = entra_directory_fixture(account: account)
+      base_directory = Repo.get_by!(Portal.Directory, id: directory.id, account_id: account.id)
+      actor = Portal.ActorFixtures.actor_fixture(account: account)
+      issuer = "https://login.microsoftonline.com/#{directory.tenant_id}/v2.0"
+
+      now = DateTime.utc_now()
+      stale = DateTime.add(now, -3600, :second)
+      future = DateTime.add(now, 3600, :second)
+
+      group =
+        Portal.GroupFixtures.group_fixture(
+          account: account,
+          directory: base_directory,
+          idp_id: "monotonic_mem_group"
+        )
+
+      Portal.IdentityFixtures.identity_fixture(
+        account: account,
+        actor: actor,
+        directory: base_directory,
+        issuer: issuer,
+        idp_id: "monotonic_mem_user"
+      )
+
+      membership =
+        Portal.MembershipFixtures.membership_fixture(
+          account: account,
+          actor: actor,
+          group: group,
+          synced_at: now
+        )
+
+      assert {:ok, _} =
+               Database.batch_upsert_memberships(
+                 account.id,
+                 issuer,
+                 directory.id,
+                 stale,
+                 [{"monotonic_mem_group", "monotonic_mem_user"}]
+               )
+
+      sync_state_after_stale =
+        Repo.get_by!(Portal.MembershipSyncState, membership_id: membership.id)
+
+      assert DateTime.compare(sync_state_after_stale.synced_at, now) == :eq
+
+      assert {:ok, _} =
+               Database.batch_upsert_memberships(
+                 account.id,
+                 issuer,
+                 directory.id,
+                 future,
+                 [{"monotonic_mem_group", "monotonic_mem_user"}]
+               )
+
+      sync_state_after_fresh =
+        Repo.get_by!(Portal.MembershipSyncState, membership_id: membership.id)
+
+      assert DateTime.compare(sync_state_after_fresh.synced_at, future) == :eq
+    end
+  end
+
+  defp entra_client_ids do
+    auth_provider_config = Portal.Config.get_env(:portal, Portal.Entra.AuthProvider)
+
+    {APIClient.client_id(:entra), auth_provider_config[:client_id]}
+  end
+
+  defp expect_entra_direct_assignment_sync(batch_users) do
+    {directory_sync_client_id, auth_provider_client_id} = entra_client_ids()
+
+    Req.Test.expect(APIClient, 5, fn %{request_path: path, query_string: query} = conn ->
+      cond do
+        String.ends_with?(path, "/oauth2/v2.0/token") ->
+          Req.Test.json(conn, %{
+            "access_token" => "test_token",
+            "token_type" => "Bearer",
+            "expires_in" => 3600
+          })
+
+        path == "/v1.0/servicePrincipals" ->
+          params = URI.decode_query(query)
+          filter = params["$filter"]
+
+          cond do
+            String.contains?(filter, directory_sync_client_id) ->
+              Req.Test.json(conn, %{
+                "value" => [
+                  %{"id" => @test_service_principal_id, "appId" => directory_sync_client_id}
+                ]
+              })
+
+            String.contains?(filter, auth_provider_client_id) ->
+              Req.Test.json(conn, %{"value" => []})
+
+            true ->
+              Req.Test.json(conn, %{"value" => []})
+          end
+
+        String.contains?(path, "appRoleAssignedTo") ->
+          Req.Test.json(conn, %{
+            "value" => [
+              %{
+                "id" => "assignment1",
+                "principalId" => "user_active_123",
+                "principalType" => "User",
+                "principalDisplayName" => "Active User"
+              },
+              %{
+                "id" => "assignment2",
+                "principalId" => "user_disable_123",
+                "principalType" => "User",
+                "principalDisplayName" => "Disable Me"
+              }
+            ]
+          })
+
+        String.ends_with?(path, "/$batch") ->
+          responses =
+            batch_users
+            |> Enum.with_index(1)
+            |> Enum.map(fn {user, index} ->
+              %{
+                "id" => Integer.to_string(index),
+                "status" => 200,
+                "body" => entra_api_user_fixture(user)
+              }
+            end)
+
+          Req.Test.json(conn, %{"responses" => responses})
+
+        true ->
+          Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+      end
+    end)
+  end
+
+  defp direct_user(id, enabled \\ true) do
+    %{
+      "id" => id,
+      "displayName" => id,
+      "mail" => "#{id}@example.com",
+      "userPrincipalName" => "#{id}@example.com",
+      "accountEnabled" => enabled
+    }
+  end
+
+  defp group_member(id, enabled \\ true) do
+    Map.put(direct_user(id, enabled), "@odata.type", "#microsoft.graph.user")
+  end
+
+  # One assigned group, "group_eng_123", with `members` and no direct users.
+  defp stub_entra_group_sync(members) do
+    {directory_sync_client_id, _auth_provider_client_id} = entra_client_ids()
+
+    Req.Test.stub(APIClient, fn %{request_path: path, query_string: query} = conn ->
+      cond do
+        String.ends_with?(path, "/oauth2/v2.0/token") ->
+          Req.Test.json(conn, %{"access_token" => "test_token", "expires_in" => 3600})
+
+        path == "/v1.0/servicePrincipals" ->
+          if String.contains?(URI.decode_query(query)["$filter"], directory_sync_client_id) do
+            Req.Test.json(conn, %{"value" => [%{"id" => @test_service_principal_id}]})
+          else
+            Req.Test.json(conn, %{"value" => []})
+          end
+
+        String.contains?(path, "appRoleAssignedTo") ->
+          Req.Test.json(conn, %{
+            "value" => [
+              %{
+                "principalId" => "group_eng_123",
+                "principalType" => "Group",
+                "principalDisplayName" => "Engineering"
+              }
+            ]
+          })
+
+        String.contains?(path, "/members") ->
+          Req.Test.json(conn, %{"value" => members})
+
+        true ->
+          Req.Test.json(conn, %{"error" => "unexpected: #{path}"})
+      end
+    end)
+  end
+
+  # Helper to receive all messages of a given type
+  defp receive_all_messages(tag, acc \\ []) do
+    receive do
+      {^tag, value} -> receive_all_messages(tag, acc ++ [value])
+    after
+      0 -> acc
+    end
+  end
+end

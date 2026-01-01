@@ -1,0 +1,153 @@
+# Install canary for the Windows MSI. Verifies that the sparse
+# MSIX registers, the package is queryable by the runner's user,
+# and that a freshly-launched `Firezone.exe` and the `firezone`
+# CLI both carry the package identity the pipe DACLs pin access
+# to.
+#
+# PowerShell rather than bash because MSYS2's process spawn drops
+# the kernel's SXS-manifest -> registered-package identity
+# binding: `Firezone.exe` launched via bash backgrounding has no
+# package identity, while the same binary launched via
+# `Start-Process` does.
+
+$ErrorActionPreference = "Stop"
+
+function Assert-ValidSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Error "Expected signed file not found: $Path"
+        exit 1
+    }
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    Write-Output ("    {0}: {1}" -f (Split-Path -Leaf $Path), $sig.Status)
+    if ($sig.Status -ne "Valid") {
+        Write-Error "Authenticode verification failed for ${Path}: $($sig.Status) - $($sig.StatusMessage)"
+        exit 1
+    }
+}
+
+if (-not $env:BINARY_DEST_PATH) {
+    Write-Error "BINARY_DEST_PATH not set"
+    exit 1
+}
+
+$msi = "$($env:BINARY_DEST_PATH).msi"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+Write-Output "==> Verifying the MSI's Authenticode signature..."
+Assert-ValidSignature $msi
+
+Write-Output "==> Installing $msi..."
+$msiproc = Start-Process -FilePath "msiexec.exe" `
+    -ArgumentList "/i", $msi, "/l*v!", "install.log", "/qn" `
+    -Wait -PassThru -NoNewWindow
+if ($msiproc.ExitCode -ne 0) {
+    Write-Error "msiexec exited with $($msiproc.ExitCode)"
+    exit 1
+}
+
+Write-Output "==> Verifying Authenticode signatures on the installed binaries..."
+$installDir = "C:\Program Files\Firezone"
+Assert-ValidSignature "$installDir\Firezone.exe"
+Assert-ValidSignature "$installDir\firezone-client-tunnel.exe"
+Assert-ValidSignature "$installDir\register-sparse.exe"
+Assert-ValidSignature "$installDir\cli\firezone.exe"
+
+Write-Output "==> Checking the CLI directory is on the machine PATH..."
+$machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+if (($machinePath -split ";") -notcontains "$installDir\cli") {
+    Write-Error "Machine PATH does not contain $installDir\cli: $machinePath"
+    exit 1
+}
+
+Write-Output "==> Checking the CLI is not a copy of the GUI..."
+$cliHash = (Get-FileHash -LiteralPath "$installDir\cli\firezone.exe").Hash
+$guiHash = (Get-FileHash -LiteralPath "$installDir\Firezone.exe").Hash
+if ($cliHash -eq $guiHash) {
+    Write-Error "firezone.exe and Firezone.exe are the same binary ($cliHash)"
+    exit 1
+}
+
+Write-Output "==> Checking the tunnel service is running..."
+$null = sc.exe query FirezoneClientTunnelService | Select-String "RUNNING"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "FirezoneClientTunnelService is not running"
+    exit 1
+}
+
+# `register-sparse.exe` (MSI deferred CA, runs as LocalSystem)
+# calls `ProvisionPackageForAllUsersAsync`, which returns success
+# before the AppX deployment service has finished syncing the
+# per-user registration. Poll `Get-AppxPackage` until the runner's
+# session sees the package before launching the GUI.
+Write-Output "==> Waiting for AppX deployment service to register the package..."
+$pfn = $null
+for ($i = 1; $i -le 15; $i++) {
+    $pfn = (Get-AppxPackage Firezone.Client.GUI | Select-Object -First 1).PackageFullName
+    if ($pfn) {
+        Write-Output "==> Get-AppxPackage settled after $i probe(s) (~$($i * 2)s): $pfn"
+        break
+    }
+    Start-Sleep -Seconds 2
+}
+if (-not $pfn) {
+    Write-Error "Get-AppxPackage Firezone.Client.GUI returned nothing after 30s"
+    exit 1
+}
+
+# `firezone.exe` embeds an MSIX identity claim, so the kernel refuses to
+# start it at all (`APPMODEL_ERROR_NO_PACKAGE`) unless the sparse package
+# lists it as an `<Application>` at exactly this path. Starting it is
+# therefore the check that it carries the package identity the GUI's pipe
+# DACL grants access to.
+Write-Output '==> Checking `firezone --help` runs...'
+# The MSI edited the machine PATH after this process started, so pick it up.
+$env:Path = "$machinePath;" + [Environment]::GetEnvironmentVariable("Path", "User")
+$cliHelp = firezone --help | Out-String
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "``firezone --help`` exited with ${LASTEXITCODE}: $cliHelp"
+    exit 1
+}
+if ($cliHelp -notmatch "Usage: firezone \[") {
+    Write-Error "``firezone --help`` printed no usage line: $cliHelp"
+    exit 1
+}
+
+$gui = "C:\Program Files\Firezone\Firezone.exe"
+$logDir = "$env:LOCALAPPDATA\dev.firezone.client\data\logs"
+
+# Raise our crates to debug so the startup breadcrumbs (launch lock,
+# IPC connect) land in the log; if the GUI bails before binding its
+# pipe, the tail shows how far it got. Inherited by Start-Process.
+$env:RUST_LOG = "info,firezone_gui_client=debug"
+Write-Output "==> Launching Firezone.exe..."
+$proc = Start-Process -FilePath $gui `
+    -ArgumentList "--no-deep-links", "--no-elevation-check", "--no-error-dialog" -PassThru
+try {
+    Write-Output "==> Verifying Firezone.exe has package identity attached..."
+    & "$scriptDir\gui-package-identity-windows.ps1" -ProcessId $proc.Id
+    Write-Output "==> Package identity attached to Firezone.exe"
+
+    Write-Output "==> Verifying tunnel pipe denies non-Firezone-signed callers..."
+    & "$scriptDir\expect-pipe-denied-lua-windows.ps1" -PipePath '\\.\pipe\dev.firezone.client_tunnel.ipc'
+    Write-Output "==> Tunnel pipe DACL pinned to package SID"
+
+    Write-Output "==> Verifying GUI pipe denies non-Firezone-signed callers..."
+    & "$scriptDir\expect-pipe-denied-lua-windows.ps1" -PipePath '\\.\pipe\dev.firezone.client_gui.ipc'
+    Write-Output "==> GUI pipe DACL pinned to package SID"
+
+    # The GUI must still be running. If it had failed to connect to the
+    # tunnel it would have bailed out (non-zero, dialog suppressed)
+    # before now.
+    if ($proc.HasExited) {
+        Write-Error "Firezone.exe exited prematurely with code $($proc.ExitCode)"
+        exit 1
+    }
+    Write-Output "==> Firezone.exe still running after all checks"
+}
+finally {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Write-Output "==> GUI log tail:"
+    Get-ChildItem $logDir -Filter *.log -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content -Tail 60
+}

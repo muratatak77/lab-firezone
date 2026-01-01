@@ -1,0 +1,501 @@
+defmodule PortalAPI.ActorController do
+  use PortalAPI, :controller
+  use OpenApiSpex.ControllerSpecs
+  alias PortalAPI.Pagination
+  alias PortalAPI.JSON
+  alias PortalAPI.Error
+  alias PortalAPI.Filters
+  alias PortalAPI.Schemas.ProblemDetails
+  alias Portal.Billing
+  alias __MODULE__.Database
+  import Ecto.Changeset
+
+  tags ["Actors"]
+
+  # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
+  operation :index,
+    summary: "List Actors",
+    parameters: [
+      limit: [in: :query, description: "Limit Users returned", schema: PortalAPI.Pagination.limit_schema(), example: 10],
+      page_cursor: [in: :query, description: "Next/Prev page cursor", type: :string],
+      name: [in: :query, description: "Filter to Actors with this exact name", type: :string],
+      email: [in: :query, description: "Filter to Actors with this exact email", type: :string],
+      type: [
+        in: :query,
+        description:
+          "Filter to Actors of this type: account_user, account_admin_user, " <>
+            "service_account, or api_client.",
+        type: :string,
+        example: "service_account"
+      ]
+    ],
+    responses:
+      [ok: {"ActorsResponse", "application/json", PortalAPI.Schemas.Actor.ListResponse}] ++
+        ProblemDetails.responses([:bad_request, :unauthorized, :too_many_requests])
+
+  # coveralls-ignore-stop
+
+  @spec index(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def index(conn, params) do
+    with {:ok, list_opts} <- Pagination.params_to_list_opts(params),
+         list_opts = Keyword.put(list_opts, :filter, coerce_filters(params)),
+         {:ok, actors, metadata} <- Database.list_actors(conn.assigns.subject, list_opts) do
+      json(conn, JSON.encode(actors, metadata))
+    else
+      error -> Error.handle(conn, error)
+    end
+  end
+
+  defp coerce_filters(params) do
+    []
+    |> Filters.maybe_append(:name, params["name"])
+    |> Filters.maybe_append(:email, params["email"])
+    |> Filters.maybe_append(:type, params["type"])
+  end
+
+  # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
+  operation :show,
+    summary: "Show Actor",
+    parameters: [
+      id: [
+        in: :path,
+        description: "Actor ID",
+        type: :string,
+        example: "00000000-0000-0000-0000-000000000000"
+      ]
+    ],
+    responses:
+      [ok: {"ActorResponse", "application/json", PortalAPI.Schemas.Actor.Response}] ++
+        ProblemDetails.responses([:bad_request, :unauthorized, :too_many_requests, :not_found])
+
+  # coveralls-ignore-stop
+
+  @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def show(conn, %{"id" => id}) do
+    with {:ok, actor} <- Database.fetch_actor(id, conn.assigns.subject) do
+      json(conn, JSON.encode(actor))
+    else
+      error -> Error.handle(conn, error)
+    end
+  end
+
+  # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
+  operation :create,
+    summary: "Create an Actor",
+    description: "Creates an Actor. Admins can only be created in the portal.",
+    request_body:
+      {"Actor attributes", "application/json", PortalAPI.Schemas.Actor.CreateRequest,
+       required: true},
+    responses:
+      [created: {"ActorResponse", "application/json", PortalAPI.Schemas.Actor.Response}] ++
+        ProblemDetails.responses([
+          :bad_request,
+          :unauthorized,
+          :forbidden,
+          :unprocessable_entity,
+          :too_many_requests
+        ])
+
+  # coveralls-ignore-stop
+
+  @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def create(conn, %{"actor" => params}) do
+    subject = conn.assigns.subject
+    account = subject.account
+    actor_type = normalize_actor_type(params["type"])
+
+    with :ok <- check_billing_limits(account, actor_type),
+         changeset <- create_actor_changeset(account, params),
+         {:ok, actor} <- Database.insert_actor(changeset, subject) do
+      conn
+      |> put_status(:created)
+      |> put_resp_header("location", ~p"/actors/#{actor}")
+      |> json(JSON.encode(actor))
+    else
+      error -> Error.handle(conn, error)
+    end
+  end
+
+  def create(conn, _params) do
+    Error.handle(conn, {:error, :bad_request})
+  end
+
+  defp normalize_actor_type("service_account"), do: :service_account
+  defp normalize_actor_type("account_admin_user"), do: :account_admin_user
+  defp normalize_actor_type("account_user"), do: :account_user
+  defp normalize_actor_type(_), do: nil
+
+  defp check_billing_limits(account, :service_account) do
+    if Billing.can_create_service_accounts?(account) do
+      :ok
+    else
+      {:error, :forbidden, reason: "Service accounts limit reached"}
+    end
+  end
+
+  defp check_billing_limits(account, :account_user) do
+    if Billing.can_create_users?(account) do
+      :ok
+    else
+      {:error, :forbidden, reason: "Users limit reached"}
+    end
+  end
+
+  defp check_billing_limits(_account, _type), do: :ok
+
+  # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
+  operation :update,
+    summary: "Update an Actor",
+    description: """
+    Updates an Actor.
+
+    **Warning: changing an Actor's email signs them out and unlinks their identity providers.**
+
+    If the `email` field is changed to a different address, Firezone will:
+
+    - Unlink every identity provider (Google, Okta, Entra, etc.) connected to this Actor.
+    - End all active sessions for this Actor, both in the admin portal and on
+      connected Client devices, no matter how the Actor signed in (identity
+      provider, email OTP, or username and password). The user will be signed
+      out immediately.
+
+    The Actor will need to sign in again through their identity provider, which
+    re-links it under the new email.
+
+    Email comparison ignores case and surrounding whitespace, so changes like
+    `User@Example.com` → `user@example.com` are not treated as a real change
+    and will not unlink identities.
+
+    **Setting `is_disabled` to `true` immediately revokes all of the Actor's
+    active Client tokens and portal sessions.** An Actor cannot disable itself.
+
+    Admins and API clients can only be changed in the portal, and users can only
+    be promoted to admin there.
+    """,
+    parameters: [
+      id: [
+        in: :path,
+        description: "Actor ID",
+        type: :string,
+        example: "00000000-0000-0000-0000-000000000000"
+      ]
+    ],
+    request_body:
+      {"Actor attributes", "application/json", PortalAPI.Schemas.Actor.UpdateRequest,
+       required: true},
+    responses:
+      [ok: {"ActorResponse", "application/json", PortalAPI.Schemas.Actor.Response}] ++
+        ProblemDetails.responses([
+          :bad_request,
+          :unauthorized,
+          :forbidden,
+          :not_found,
+          :unprocessable_entity,
+          :too_many_requests
+        ])
+
+  # coveralls-ignore-stop
+
+  @spec update(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def update(conn, %{"id" => id, "actor" => params}) do
+    subject = conn.assigns.subject
+
+    with {:ok, actor} <- Database.fetch_actor(id, subject),
+         :ok <- ensure_manageable(actor),
+         changeset <- actor_changeset(actor, params),
+         :ok <- ensure_not_self_disable(actor, changeset, subject),
+         {:ok, actor} <- Database.update_actor(changeset, subject) do
+      json(conn, JSON.encode(actor))
+    else
+      error -> Error.handle(conn, error)
+    end
+  end
+
+  def update(conn, _params) do
+    Error.handle(conn, {:error, :bad_request})
+  end
+
+  # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
+  operation :delete,
+    summary: "Delete an Actor",
+    description: "Deletes an Actor. Admins and API clients can only be deleted in the portal.",
+    parameters: [
+      id: [
+        in: :path,
+        description: "Actor ID",
+        type: :string,
+        example: "00000000-0000-0000-0000-000000000000"
+      ]
+    ],
+    responses:
+      [ok: {"ActorResponse", "application/json", PortalAPI.Schemas.Actor.Response}] ++
+        ProblemDetails.responses([:bad_request, :unauthorized, :forbidden, :too_many_requests, :not_found])
+
+  # coveralls-ignore-stop
+
+  @spec delete(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def delete(conn, %{"id" => id}) do
+    subject = conn.assigns.subject
+
+    with {:ok, actor} <- Database.fetch_actor(id, subject),
+         :ok <- ensure_manageable(actor),
+         {:ok, actor} <- Database.delete_actor_by_id(actor.id, subject) do
+      json(conn, JSON.encode(actor))
+    else
+      error -> Error.handle(conn, error)
+    end
+  end
+
+  # A token's scopes must not reach past the actors it is allowed to manage.
+  # Admins can only be created or changed in the portal, otherwise a token with
+  # actors:write could mint a portal admin for itself and bypass every scope.
+  # API clients are portal-managed too, otherwise a narrow token could revoke
+  # the tokens of an API client that has more scopes than itself.
+  defp ensure_manageable(%Portal.Actor{type: :account_admin_user}) do
+    {:error, :forbidden, reason: "Admins can only be managed in the portal"}
+  end
+
+  defp ensure_manageable(%Portal.Actor{type: :api_client}) do
+    {:error, :forbidden, reason: "API clients can only be managed in the portal"}
+  end
+
+  defp ensure_manageable(_actor), do: :ok
+
+  # Disabling an Actor revokes its own credentials, so letting a caller disable
+  # the Actor behind the current request would lock it out mid-request.
+  defp ensure_not_self_disable(actor, changeset, subject) do
+    if get_change(changeset, :is_disabled) == true and actor.id == subject.actor.id do
+      {:error, :forbidden, reason: "You cannot disable the Actor used to make this request"}
+    else
+      :ok
+    end
+  end
+
+  defp create_actor_changeset(account, attrs) do
+    %Portal.Actor{account_id: account.id}
+    |> cast(attrs, [:name, :email, :type, :allow_email_otp_sign_in])
+    |> validate_required([:name, :type])
+    |> validate_exclusion(:type, [:api_client],
+      message: "API clients cannot be created via the API"
+    )
+    |> validate_exclusion(:type, [:account_admin_user],
+      message: "admins can only be created in the portal"
+    )
+  end
+
+  defp actor_changeset(actor, attrs) do
+    actor
+    |> cast(attrs, [:name, :email, :type, :allow_email_otp_sign_in, :is_disabled])
+    |> validate_required([:name, :type])
+    |> validate_exclusion(:type, [:account_admin_user],
+      message: "users can only be promoted to admin in the portal"
+    )
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    alias Portal.Actor
+    alias Portal.APIToken
+    alias Portal.ClientToken
+    alias Portal.Device
+    alias Portal.ExternalIdentity
+    alias Portal.OAuthToken
+    alias Portal.PortalSession
+    alias Portal.Safe
+
+    def list_actors(subject, opts \\ []) do
+      from(a in Portal.Actor, as: :actors)
+      |> select_last_seen_at()
+      |> Safe.scoped(subject)
+      |> Safe.list(__MODULE__, opts)
+    end
+
+    def filters do
+      [
+        %Portal.Repo.Filter{
+          name: :name,
+          title: "Name",
+          type: :string,
+          fun: &filter_by_name/2
+        },
+        %Portal.Repo.Filter{
+          name: :email,
+          title: "Email",
+          type: :string,
+          fun: &filter_by_email/2
+        },
+        %Portal.Repo.Filter{
+          name: :type,
+          title: "Type",
+          type: {:string, :select},
+          values: [
+            {"Account User", "account_user"},
+            {"Account Admin User", "account_admin_user"},
+            {"Service Account", "service_account"},
+            {"API Client", "api_client"}
+          ],
+          fun: &filter_by_type/2
+        }
+      ]
+    end
+
+    defp filter_by_name(queryable, name) do
+      dynamic = dynamic([actors: a], a.name == ^name)
+      {queryable, dynamic}
+    end
+
+    defp filter_by_email(queryable, email) do
+      dynamic = dynamic([actors: a], a.email == ^email)
+      {queryable, dynamic}
+    end
+
+    defp filter_by_type(queryable, "account_user") do
+      dynamic = dynamic([actors: a], a.type == :account_user)
+      {queryable, dynamic}
+    end
+
+    defp filter_by_type(queryable, "account_admin_user") do
+      dynamic = dynamic([actors: a], a.type == :account_admin_user)
+      {queryable, dynamic}
+    end
+
+    defp filter_by_type(queryable, "service_account") do
+      dynamic = dynamic([actors: a], a.type == :service_account)
+      {queryable, dynamic}
+    end
+
+    defp filter_by_type(queryable, "api_client") do
+      dynamic = dynamic([actors: a], a.type == :api_client)
+      {queryable, dynamic}
+    end
+
+    def cursor_fields do
+      [
+        {:actors, :asc, :inserted_at},
+        {:actors, :asc, :id}
+      ]
+    end
+
+    def fetch_actor(id, subject) do
+      from(a in Portal.Actor, as: :actors, where: a.id == ^id)
+      |> select_last_seen_at()
+      |> Safe.scoped(subject)
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        {:error, :unauthorized} -> {:error, :unauthorized}
+        actor -> {:ok, actor}
+      end
+    end
+
+    def insert_actor(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    def update_actor(changeset, subject) do
+      if Actor.email_meaningfully_changed?(changeset) do
+        Safe.transact(fn -> update_actor_and_clear_identities(changeset, subject) end)
+      else
+        update_actor_changeset(changeset, subject)
+      end
+    end
+
+    # Single-query delete: Safe.delete_all/2 already applies the account filter
+    # automatically, and a plain delete has no changeset to run, so there's no
+    # fetch to save by skipping.
+    def delete_actor_by_id(id, subject) do
+      result =
+        from(a in Actor, where: a.id == ^id, select: a)
+        |> Safe.scoped(subject)
+        |> Safe.delete_all()
+
+      case result do
+        {:error, reason} -> {:error, reason}
+        {0, _} -> {:error, :not_found}
+        {1, [actor]} -> {:ok, actor}
+      end
+    end
+
+    defp update_actor_changeset(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.update()
+    end
+
+    defp update_actor_and_clear_identities(changeset, subject) do
+      actor_id = changeset.data.id
+
+      with {:ok, actor} <- update_actor_changeset(changeset, subject),
+           {count, _} when is_integer(count) <- clear_identities_for_actor(actor_id, subject),
+           {count, _} when is_integer(count) <- clear_portal_sessions_for_actor(actor_id, subject),
+           {count, _} when is_integer(count) <- clear_client_tokens_for_actor(actor_id, subject) do
+        {:ok, actor}
+      end
+    end
+
+    defp select_last_seen_at(queryable) do
+      client_seen_at =
+        from(d in Device,
+          where: d.account_id == parent_as(:actors).account_id,
+          where: d.actor_id == parent_as(:actors).id,
+          where: d.type == :client,
+          select: max(d.last_seen_at)
+        )
+
+      portal_signed_in_at =
+        from(s in PortalSession,
+          where: s.account_id == parent_as(:actors).account_id,
+          where: s.actor_id == parent_as(:actors).id,
+          select: max(s.inserted_at)
+        )
+
+      api_token_seen_at =
+        from(t in APIToken,
+          where: t.account_id == parent_as(:actors).account_id,
+          where: t.actor_id == parent_as(:actors).id,
+          select: max(t.last_seen_at)
+        )
+
+      oauth_token_seen_at =
+        from(t in OAuthToken,
+          where: t.account_id == parent_as(:actors).account_id,
+          where: t.actor_id == parent_as(:actors).id,
+          select: max(t.last_seen_at)
+        )
+
+      select_merge(queryable, [actors: a], %{
+        last_seen_at:
+          type(
+            fragment(
+              "GREATEST(?, ?, ?, ?)",
+              subquery(client_seen_at),
+              subquery(portal_signed_in_at),
+              subquery(api_token_seen_at),
+              subquery(oauth_token_seen_at)
+            ),
+            :utc_datetime_usec
+          )
+      })
+    end
+
+    defp clear_identities_for_actor(actor_id, subject) do
+      from(i in ExternalIdentity, where: i.actor_id == ^actor_id)
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+    end
+
+    defp clear_portal_sessions_for_actor(actor_id, subject) do
+      from(s in PortalSession, where: s.actor_id == ^actor_id)
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+    end
+
+    defp clear_client_tokens_for_actor(actor_id, subject) do
+      from(c in ClientToken, where: c.actor_id == ^actor_id)
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+    end
+  end
+end

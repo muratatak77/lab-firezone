@@ -1,0 +1,200 @@
+defmodule Portal.AccountFixtures do
+  @moduledoc """
+  Test helpers for creating accounts and related data.
+  """
+
+  import Ecto.Changeset
+  alias Portal.Repo
+
+  @doc """
+  Generate valid account attributes with sensible defaults.
+  """
+  def valid_account_attrs(attrs \\ %{}) do
+    unique_num = System.unique_integer([:positive, :monotonic])
+
+    Enum.into(attrs, %{
+      name: "Account #{unique_num}",
+      legal_name: "Legal Account #{unique_num}",
+      slug: "account_#{unique_num}",
+      key: Portal.Account.new_key(),
+      config: %{
+        clients_upstream_dns: %{
+          type: :custom,
+          addresses: [
+            %{address: "1.1.1.1"},
+            %{address: "2606:4700:4700::1111"},
+            %{address: "9.9.9.9"}
+          ]
+        }
+      },
+      features: %{
+        policy_conditions: true,
+        idp_sync: true,
+        iceless: false
+      },
+      limits: %{
+        monthly_active_users_count: 100
+      },
+      metadata: %{
+        stripe: %{}
+      }
+    })
+  end
+
+  @doc """
+  Generate an account with valid default attributes.
+
+  ## Examples
+
+      account = account_fixture()
+      account = account_fixture(name: "Custom Account")
+
+  """
+  def account_fixture(attrs \\ %{}) do
+    attrs = valid_account_attrs(attrs)
+
+    %Portal.Account{}
+    |> cast(attrs, [:name, :legal_name, :slug, :key])
+    |> cast_embed(:config)
+    |> cast_embed(:features)
+    |> cast_embed(:limits)
+    |> cast_embed(:metadata)
+    |> Portal.Account.changeset()
+    |> Repo.insert!()
+    |> Repo.reload!()
+  end
+
+  @doc """
+  Generate an account with a Starter plan.
+  """
+  def starter_account_fixture(attrs \\ %{}) do
+    account = account_fixture(attrs)
+
+    account
+    |> cast(%{metadata: %{stripe: %{product_name: "Starter"}}}, [])
+    |> cast_embed(:metadata)
+    |> Repo.update!()
+  end
+
+  @doc """
+  Generate an account with a Team plan.
+  """
+  def team_account_fixture(attrs \\ %{}) do
+    account = account_fixture(attrs)
+
+    account
+    |> cast(%{metadata: %{stripe: %{product_name: "Team"}}}, [])
+    |> cast_embed(:metadata)
+    |> Repo.update!()
+  end
+
+  @doc """
+  Generate an account with a Business plan.
+  """
+  def business_account_fixture(attrs \\ %{}) do
+    account = account_fixture(attrs)
+
+    account
+    |> cast(%{metadata: %{stripe: %{product_name: "Business"}}}, [])
+    |> cast_embed(:metadata)
+    |> Repo.update!()
+  end
+
+  @doc """
+  Generate a disabled account.
+  """
+  def disabled_account_fixture(attrs \\ %{}) do
+    account = account_fixture(attrs)
+
+    account
+    |> cast(%{is_disabled: true, disabled_reason: "Testing"}, [
+      :is_disabled,
+      :disabled_reason
+    ])
+    |> Repo.update!()
+  end
+
+  @doc """
+  Update an account with the given attributes.
+  """
+  def update_account(account, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    account
+    |> cast(attrs, [
+      :name,
+      :legal_name,
+      :slug,
+      :key,
+      :is_disabled,
+      :scheduled_deletion_at,
+      :disabled_reason,
+      :users_limit_exceeded,
+      :seats_limit_exceeded,
+      :service_accounts_limit_exceeded,
+      :sites_limit_exceeded,
+      :admins_limit_exceeded,
+      :warning_last_sent_at,
+      :seats_warning_last_sent_at,
+      :seats_warning_level,
+      :outdated_gateway_last_sent_at
+    ])
+    |> cast_embed(:config)
+    |> cast_embed(:features)
+    |> cast_embed(:limits)
+    |> cast_embed(:metadata)
+    |> Portal.Account.changeset()
+    |> Repo.update!()
+  end
+
+  @doc """
+  Fetch an account by id.
+  """
+  def fetch_account!(account_id) do
+    Repo.get!(Portal.Account, account_id)
+  end
+
+  @doc """
+  Fetch an account by id or return nil.
+  """
+  def fetch_account(account_id) do
+    Repo.get(Portal.Account, account_id)
+  end
+
+  @doc "Generate an account with recent session activity."
+  def active_account_fixture(attrs \\ %{}) do
+    account = account_fixture(attrs)
+    Portal.SessionLogFixtures.session_log_fixture(account: account)
+
+    account
+  end
+
+  @doc "Generate a provisioned Starter account with recent session activity."
+  def provisioned_account_fixture(attrs \\ %{}) do
+    account = dormant_provisioned_account_fixture(attrs)
+    Portal.SessionLogFixtures.session_log_fixture(account: account)
+
+    account
+  end
+
+  @doc "Generate a provisioned Starter account without session activity."
+  def dormant_provisioned_account_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+    account = account_fixture(attrs)
+
+    stripe_attrs =
+      Map.merge(
+        %{
+          customer_id: "cus_#{System.unique_integer([:positive])}",
+          subscription_id: "sub_#{System.unique_integer([:positive])}",
+          product_name: "Starter"
+        },
+        get_in(attrs, [:metadata, :stripe]) || %{}
+      )
+
+    account
+    |> Ecto.Changeset.cast(%{metadata: %{stripe: stripe_attrs}}, [])
+    |> Ecto.Changeset.cast_embed(:metadata)
+    |> Repo.update!()
+  end
+end

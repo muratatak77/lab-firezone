@@ -1,0 +1,967 @@
+defmodule Portal.Authentication do
+  import Ecto.Changeset
+  import Ecto.Query
+  import Portal.Changeset
+  alias Portal.ClientToken
+  alias Portal.OneTimePasscode
+  alias Portal.PortalSession
+  alias Portal.SessionLog
+  alias Portal.Types.LogId
+  alias Portal.Authentication.Context
+  alias Portal.Authentication.Credential
+  alias Portal.Authentication.Subject
+  alias __MODULE__.Database
+  # Client Tokens
+
+  # Interactive client token - created during an interactive sign-in flow
+  # (OIDC, Email/OTP, userpass). Carries an auth_provider_id. Used by both GUI
+  # and headless client sign-ins.
+  def create_interactive_client_token(attrs) do
+    changeset =
+      %ClientToken{}
+      |> cast(attrs, ~w[secret_nonce account_id actor_id auth_provider_id expires_at]a)
+      |> validate_required([:account_id, :actor_id, :auth_provider_id, :expires_at])
+      |> validate_length(:secret_nonce, max: 128)
+      |> validate_format(:secret_nonce, ~r/^[^.]*$/, message: "cannot contain periods")
+
+    nonce = get_change(changeset, :secret_nonce) || ""
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets(nonce)
+
+    changeset
+    |> put_change(:secret_fragment, secret_fragment)
+    |> put_change(:secret_salt, secret_salt)
+    |> put_change(:secret_hash, secret_hash)
+    |> Database.insert_token()
+  end
+
+  # Non-interactive client token - issued directly by an admin (no sign-in flow,
+  # no auth_provider_id). Only for service accounts: minting one for a user would
+  # let an admin act as that user. api_client actors must use create_api_token/3.
+  def create_non_interactive_client_token(
+        %Portal.Actor{type: :service_account, account_id: account_id} = actor,
+        attrs,
+        %Subject{account: %{id: account_id}} = subject
+      ) do
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets()
+
+    %ClientToken{
+      account_id: actor.account_id,
+      actor_id: actor.id,
+      secret_nonce: "",
+      secret_fragment: secret_fragment,
+      secret_salt: secret_salt,
+      secret_hash: secret_hash
+    }
+    |> cast(attrs, [:expires_at])
+    |> validate_required([:expires_at])
+    |> validate_datetime(:expires_at, greater_than: DateTime.utc_now())
+    |> Database.insert_token(subject)
+  end
+
+  # API Tokens
+
+  def create_api_token(
+        %Portal.Actor{type: :api_client, account_id: account_id} = actor,
+        attrs,
+        %Subject{account: %{id: account_id}} = subject
+      ) do
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets()
+
+    %Portal.APIToken{
+      account_id: actor.account_id,
+      actor_id: actor.id,
+      secret_fragment: secret_fragment,
+      secret_salt: secret_salt,
+      secret_hash: secret_hash
+    }
+    |> cast(attrs, [:name, :expires_at, :scopes])
+    |> validate_required([:expires_at])
+    |> validate_datetime(:expires_at, greater_than: DateTime.utc_now())
+    |> Database.insert_api_token(subject)
+    |> case do
+      {:ok, token} -> {:ok, encode_fragment!(token)}
+      {:error, changeset} -> {:error, changeset}
+    end
+  end
+
+  # Relay Tokens
+
+  def create_relay_token do
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets()
+
+    %Portal.RelayToken{
+      secret_fragment: secret_fragment,
+      secret_salt: secret_salt,
+      secret_hash: secret_hash
+    }
+    |> Database.insert_relay_token()
+  end
+
+  # Gateway Tokens
+
+  def build_gateway_token(%Portal.Site{} = site) do
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets()
+    %Portal.GatewayToken{
+      account_id: site.account_id,
+      site_id: site.id,
+      secret_fragment: secret_fragment,
+      secret_salt: secret_salt,
+      secret_hash: secret_hash
+    }
+  end
+
+  def create_gateway_token(%Portal.Site{} = site, %Subject{} = subject) do
+    build_gateway_token(site)
+    |> Database.insert_gateway_token(subject)
+  end
+
+  # Single-owner token: bound to one gateway. At most one active token can
+  # exist per gateway; callers should map the unique constraint error on
+  # :device_id to a conflict response and point users at rotation instead.
+  def create_gateway_token(%Portal.Device{type: :gateway} = gateway, %Subject{} = subject) do
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets()
+
+    %Portal.GatewayToken{
+      account_id: gateway.account_id,
+      device_id: gateway.id,
+      secret_fragment: secret_fragment,
+      secret_salt: secret_salt,
+      secret_hash: secret_hash
+    }
+    # Safe.insert applies GatewayToken.changeset/1 to changesets (not bare
+    # structs), which maps the unique violation to a changeset error
+    |> Ecto.Changeset.change()
+    |> Database.insert_gateway_token(subject)
+  end
+
+  @doc """
+  Rotates a gateway's single-owner token.
+
+  The current active token is stamped with `rotated_at` and remains valid until
+  the gateway first connects with the new token or the rotation grace period
+  elapses, whichever comes first. Rotating again while a rotation is still
+  unconfirmed replaces the pending token and leaves the in-use rotated token
+  and its original deadline untouched.
+  """
+  @spec rotate_gateway_token(Portal.Device.t(), Subject.t()) ::
+          {:ok, Portal.GatewayToken.t()} | {:error, Ecto.Changeset.t()} | {:error, :unauthorized}
+  def rotate_gateway_token(%Portal.Device{type: :gateway} = gateway, %Subject{} = subject) do
+    {secret_fragment, secret_salt, secret_hash} = generate_token_secrets()
+
+    new_token = %Portal.GatewayToken{
+      account_id: gateway.account_id,
+      device_id: gateway.id,
+      secret_fragment: secret_fragment,
+      secret_salt: secret_salt,
+      secret_hash: secret_hash
+    }
+
+    Database.rotate_gateway_token(gateway, new_token, subject)
+  end
+
+  @doc """
+  Mints a fresh secret triple. Public because `Portal.OAuth` issues its own
+  tokens and must derive them exactly the same way.
+  """
+  def generate_token_secrets(nonce \\ "") do
+    secret_fragment = Portal.Crypto.random_token(32, encoder: :hex32)
+    secret_salt = Portal.Crypto.random_token(16)
+    secret_hash = Portal.Crypto.hash(:sha3_256, nonce <> secret_fragment <> secret_salt)
+    {secret_fragment, secret_salt, secret_hash}
+  end
+
+  # One-Time Passcodes
+
+  @otp_expiration_seconds 15 * 60
+
+  def create_one_time_passcode(%Portal.Account{} = account, %Portal.Actor{} = actor) do
+    code = Portal.Crypto.random_token(6, encoder: :user_friendly)
+    code_hash = Portal.Crypto.hash(:argon2, code)
+    expires_at = DateTime.utc_now() |> DateTime.add(@otp_expiration_seconds, :second)
+
+    # Delete existing passcodes for this actor first
+    :ok = Database.delete_one_time_passcodes_for_actor(account, actor)
+
+    %OneTimePasscode{
+      account_id: account.id,
+      actor_id: actor.id,
+      code_hash: code_hash,
+      code: code,
+      expires_at: expires_at
+    }
+    |> Database.insert_one_time_passcode()
+  end
+
+  def verify_one_time_passcode(account_id, actor_id, passcode_id, entered_code) do
+    case Database.consume_one_time_passcode_attempt(account_id, actor_id, passcode_id) do
+      {:ok, passcode} ->
+        if Portal.Crypto.equal?(:argon2, entered_code, passcode.code_hash) do
+          :ok = Database.delete_one_time_passcode(passcode)
+          {:ok, passcode}
+        else
+          :ok = Database.delete_exhausted_one_time_passcode(passcode)
+          {:error, :invalid_code}
+        end
+
+      {:error, :not_found} ->
+        # Perform dummy verification to prevent timing attacks
+        Portal.Crypto.equal?(:argon2, nil, nil)
+        {:error, :invalid_code}
+    end
+  end
+
+  # Portal Sessions
+
+  def create_portal_session(
+        %Portal.Actor{type: :account_admin_user, account_id: account_id, id: actor_id} = actor,
+        auth_provider_id,
+        %Context{} = context,
+        expires_at
+      ) do
+    now = DateTime.utc_now()
+
+    session = %PortalSession{
+      account_id: account_id,
+      actor_id: actor_id,
+      auth_provider_id: auth_provider_id,
+      user_agent: context.user_agent,
+      remote_ip: %Postgrex.INET{address: context.remote_ip},
+      remote_ip_location_region: context.remote_ip_location_region,
+      remote_ip_location_city: context.remote_ip_location_city,
+      remote_ip_location_lat: context.remote_ip_location_lat,
+      remote_ip_location_lon: context.remote_ip_location_lon,
+      expires_at: expires_at
+    }
+
+    # Portal sessions are inserted synchronously at human-login rate (no
+    # reconnect storm), so the session log is written inline rather than
+    # through the batching queue. Both writes share one transaction so a login
+    # cannot succeed without its audit record.
+    Database.insert_portal_session_with_log(
+      session,
+      portal_session_log_attrs(session, actor, auth_provider_id, now)
+    )
+  end
+
+  defp portal_session_log_attrs(session, actor, auth_provider_id, timestamp) do
+    %{
+      account_id: session.account_id,
+      log_id: LogId.build_session_log(),
+      timestamp: timestamp,
+      context: :portal,
+      subject: %{
+        actor_id: actor.id,
+        actor_name: actor.name,
+        actor_email: actor.email,
+        actor_type: to_string(actor.type),
+        auth_provider_id: auth_provider_id,
+        ip: format_ip(session.remote_ip),
+        ip_region: session.remote_ip_location_region,
+        ip_city: session.remote_ip_location_city,
+        ip_lat: session.remote_ip_location_lat,
+        ip_lon: session.remote_ip_location_lon,
+        user_agent: session.user_agent
+      }
+    }
+  end
+
+  defp format_ip(%Postgrex.INET{address: address}), do: to_string(:inet.ntoa(address))
+
+  def fetch_portal_session(account_id, session_id) do
+    Database.fetch_portal_session(account_id, session_id)
+  end
+
+  def delete_portal_session(%PortalSession{} = session) do
+    Database.delete_portal_session(session)
+  end
+
+  @doc """
+  Atomically consumes a portal session as a one-shot authentication proof.
+
+  The actor binding matters for step-up flows: a session may only authorize an
+  action for the same actor it authenticated, and concurrent attempts may not
+  both spend the same proof.
+  """
+  def consume_portal_session(account_id, actor_id, session_id) do
+    Database.consume_portal_session(account_id, actor_id, session_id)
+  end
+
+  # Token encoding/decoding
+
+  @doc """
+  Encodes a token fragment for transmission.
+
+  The token is encoded as a tuple of {account_id, token_id, secret_fragment}
+  which is then signed using Plug.Crypto to ensure it can't be tampered with.
+  """
+  def encode_fragment!(%ClientToken{} = token),
+    do: encode_token(token.account_id, token.id, token.secret_fragment, "client")
+
+  def encode_fragment!(%Portal.RelayToken{} = token),
+    do: encode_token(nil, token.id, token.secret_fragment, "relay")
+
+  def encode_fragment!(%Portal.GatewayToken{} = token),
+    do: encode_token(token.account_id, token.id, token.secret_fragment, "gateway")
+
+  def encode_fragment!(%Portal.APIToken{} = token),
+    do: encode_token(token.account_id, token.id, token.secret_fragment, "api_client")
+
+  def encode_fragment!(%Portal.OAuthToken{} = token),
+    do: encode_token(token.account_id, token.id, token.secret_fragment, "mcp")
+
+  def encode_fragment!(%Portal.OAuthAuthorizationCode{} = code),
+    do: encode_token(code.account_id, code.id, code.secret_fragment, "mcp_code")
+
+  @doc """
+  Encodes the refresh half of an OAuth token.
+
+  Refresh secrets are signed under their own type, so a refresh token presented
+  as an access token fails to decode rather than being looked up and rejected
+  later.
+  """
+  def encode_refresh_fragment!(%Portal.OAuthToken{} = token),
+    do: encode_token(token.account_id, token.id, token.refresh_secret_fragment, "mcp_refresh")
+
+  @doc """
+  Decodes a signed fragment of the given type.
+
+  Used for credentials that are not presented as an authentication context of
+  their own, such as authorization codes and refresh tokens.
+  """
+  def decode_fragment(encoded_token, type) when is_binary(encoded_token) and is_binary(type) do
+    config = fetch_config!()
+    key_base = Keyword.fetch!(config, :key_base)
+    salt = Keyword.fetch!(config, :salt)
+
+    # try_decode/3 returns whatever its `with` fell through on, which for a
+    # string with no "." separator is a plain list rather than an error tuple.
+    case try_decode(encoded_token, key_base, salt <> type) do
+      {:ok, decoded} -> {:ok, decoded}
+      _other -> {:error, :invalid_token}
+    end
+  end
+
+  @doc "Constant time check of a presented fragment against a stored hash."
+  def verify_fragment(secret_hash, secret_salt, nonce, fragment) do
+    expected_hash = Portal.Crypto.hash(:sha3_256, nonce <> fragment <> secret_salt)
+
+    if Plug.Crypto.secure_compare(expected_hash, secret_hash) do
+      :ok
+    else
+      :error
+    end
+  end
+
+  defp encode_token(account_id, id, fragment, type) do
+    body = {account_id, id, fragment}
+    config = fetch_config!()
+    key_base = Keyword.fetch!(config, :key_base)
+    salt = Keyword.fetch!(config, :salt)
+    "." <> Plug.Crypto.sign(key_base, salt <> type, body)
+  end
+
+  def verify_relay_token(encoded_token) when is_binary(encoded_token) do
+    verify_infrastructure_token(
+      encoded_token,
+      "relay",
+      "relay_group",
+      &Database.fetch_relay_token/1
+    )
+  end
+
+  def verify_gateway_token(encoded_token) when is_binary(encoded_token) do
+    with {:ok, token} <-
+           verify_infrastructure_token(
+             encoded_token,
+             "gateway",
+             "gateway_group",
+             &Database.fetch_gateway_token/2
+           ) do
+      :ok = confirm_gateway_token_rotation(token)
+      {:ok, token}
+    end
+  end
+
+  # The gateway presenting the active token proves it received the rotation
+  # replacement, which completes the rotation: the rotated sibling is deleted,
+  # disconnecting any straggler still using it via the delete hook.
+  defp confirm_gateway_token_rotation(%Portal.GatewayToken{
+         rotated_at: nil,
+         rotated_sibling_id: sibling_id,
+         account_id: account_id
+       })
+       when not is_nil(sibling_id) do
+    Database.delete_rotated_gateway_token(account_id, sibling_id)
+    :ok
+  end
+
+  defp confirm_gateway_token_rotation(_token), do: :ok
+
+  defp verify_infrastructure_token(encoded_token, current_salt, legacy_salt, fetch_fn) do
+    config = fetch_config!()
+    key_base = Keyword.fetch!(config, :key_base)
+    base_salt = Keyword.fetch!(config, :salt)
+
+    with [nonce, signed] <- String.split(encoded_token, ".", parts: 2),
+         {:ok, {account_id, id, fragment}} <-
+           decode_infrastructure_token(signed, key_base, base_salt, current_salt, legacy_salt),
+         {:ok, token} <- apply_fetch(fetch_fn, account_id, id),
+         :ok <- verify_secret_hash(token, nonce, fragment) do
+      {:ok, token}
+    else
+      _ -> {:error, :invalid_token}
+    end
+  end
+
+  defp apply_fetch(fetch_fn, _account_id, id) when is_function(fetch_fn, 1), do: fetch_fn.(id)
+
+  defp apply_fetch(fetch_fn, account_id, id) when is_function(fetch_fn, 2),
+    do: fetch_fn.(account_id, id)
+
+  defp decode_infrastructure_token(signed, key_base, base_salt, current_salt, legacy_salt) do
+    case Plug.Crypto.verify(key_base, base_salt <> current_salt, signed, max_age: :infinity) do
+      {:ok, _} = result ->
+        result
+
+      {:error, _} ->
+        Plug.Crypto.verify(key_base, base_salt <> legacy_salt, signed, max_age: :infinity)
+    end
+  end
+
+  def fetch_token(account_id, token_id, %Context{} = context) do
+    Database.fetch_token_for_use(account_id, token_id, context)
+  end
+
+  def use_token(encoded_token, %Context{} = context)
+      when is_binary(encoded_token) do
+    with {:ok, {nonce, account_id, id, fragment}} <-
+           decode_token_with_context(encoded_token, context),
+         {:ok, token} <- Database.fetch_token_for_use(account_id, id, context),
+         :ok <- verify_secret_hash(token, nonce, fragment) do
+      {:ok, token}
+    else
+      _ -> {:error, :invalid_token}
+    end
+  end
+
+  defp decode_token_with_context(encoded_token, %Context{} = context) do
+    config = fetch_config!()
+    key_base = Keyword.fetch!(config, :key_base)
+    base_salt = Keyword.fetch!(config, :salt)
+    salt = base_salt <> to_string(context.type)
+
+    with {:error, _} <- try_decode(encoded_token, key_base, salt) do
+      {:error, :invalid_token}
+    end
+  end
+
+  defp try_decode(encoded_token, key_base, salt) do
+    with [nonce, encoded_fragment] <- String.split(encoded_token, ".", parts: 2),
+         {:ok, {account_id, id, fragment}} <-
+           Plug.Crypto.verify(key_base, salt, encoded_fragment, max_age: :infinity) do
+      {:ok, {nonce, account_id, id, fragment}}
+    end
+  end
+
+  defp verify_secret_hash(
+         %{secret_salt: secret_salt, secret_hash: secret_hash},
+         nonce,
+         fragment
+       )
+       when is_binary(secret_salt) and is_binary(secret_hash) and is_binary(nonce) and
+              is_binary(fragment) do
+    expected_hash = Portal.Crypto.hash(:sha3_256, nonce <> fragment <> secret_salt)
+
+    if Plug.Crypto.secure_compare(expected_hash, secret_hash) do
+      :ok
+    else
+      :error
+    end
+  end
+
+  defp verify_secret_hash(_token, _nonce, _fragment), do: :error
+
+  # Authentication
+
+  def authenticate(encoded_token, %Context{} = context)
+      when is_binary(encoded_token) do
+    with {:ok, token} <- use_token(encoded_token, context),
+         {:ok, subject} <- build_subject(token, context) do
+      {:ok, subject}
+    else
+      _ -> {:error, :invalid_token}
+    end
+  end
+
+  def build_subject(%ClientToken{} = token, %Context{} = context) do
+    credential = %Credential.ClientToken{
+      id: token.id,
+      auth_provider_id: token.auth_provider_id
+    }
+
+    do_build_subject(token, context, credential)
+  end
+
+  def build_subject(%Portal.APIToken{} = token, %Context{} = context) do
+    credential = %Credential.APIToken{id: token.id, scopes: token.scopes}
+    do_build_subject(token, context, credential)
+  end
+
+  def build_subject(%Portal.OAuthToken{} = token, %Context{} = context) do
+    credential = %Credential.OAuthToken{
+      id: token.id,
+      scopes: token.scopes,
+      resource: token.resource
+    }
+
+    do_build_subject(token, context, credential)
+  end
+
+  def build_subject(%PortalSession{} = session, %Context{} = context) do
+    credential = %Credential.PortalSession{
+      id: session.id,
+      auth_provider_id: session.auth_provider_id
+    }
+
+    do_build_subject(session, context, credential)
+  end
+
+  defp do_build_subject(token_or_session, context, credential) do
+    account = Database.get_account_by_id!(token_or_session.account_id)
+
+    with {:ok, actor} <- Database.fetch_active_actor_by_id(token_or_session.actor_id) do
+      {:ok,
+       %Subject{
+         actor: actor,
+         account: account,
+         expires_at: token_or_session.expires_at,
+         context: context,
+         credential: credential
+       }}
+    end
+  end
+
+  defp fetch_config! do
+    Portal.Config.fetch_env!(:portal, Portal.Tokens)
+  end
+
+  defmodule Database do
+    import Ecto.Query
+    alias Portal.Safe
+    alias Portal.Account
+    alias Portal.Actor
+
+    alias Portal.ClientToken
+    alias Portal.OneTimePasscode
+    alias Portal.SessionLog
+
+    def get_account_by_id!(id) do
+      from(a in Account, where: a.id == ^id)
+      |> Safe.unscoped()
+      |> Safe.one!()
+    end
+
+    def fetch_active_actor_by_id(id) do
+      from(a in Actor, where: a.id == ^id, where: a.is_disabled == false)
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        actor -> {:ok, actor}
+      end
+    end
+
+    # Client
+    def insert_token(changeset) do
+      changeset
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    # Service Account
+    def insert_token(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    def insert_relay_token(relay_token) do
+      relay_token
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def fetch_relay_token(id) do
+      from(rt in Portal.RelayToken, where: rt.id == ^id)
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        relay_token -> {:ok, relay_token}
+      end
+    end
+
+    def insert_gateway_token(gateway_token, subject) do
+      gateway_token
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    # The unique index on (account_id, device_id, rotated_at IS NULL) permits
+    # at most one active token per gateway, so rotation is three set-based
+    # writes with no row lock: concurrent rotations race on the final insert
+    # and the loser surfaces the unique violation as a changeset error.
+    def rotate_gateway_token(gateway, new_token, subject) do
+      Safe.transact(fn ->
+        with {:ok, _} <- delete_replaceable_active_token(gateway, subject),
+             {:ok, _} <- stamp_active_token(gateway, subject) do
+          new_token
+          |> Ecto.Changeset.change()
+          |> insert_gateway_token(subject)
+        end
+      end)
+    end
+
+    # An active token is replaced outright rather than stamped when nothing
+    # relies on it: either a rotation is already pending (the active token is
+    # the unconfirmed replacement, and the in-use rotated sibling keeps its
+    # original deadline) or no device's latest session references it. Latest
+    # is as good as "ever used": a single-owner token can only be superseded
+    # on its own device by a rotated sibling, which the pending-rotation
+    # branch already covers.
+    defp delete_replaceable_active_token(gateway, subject) do
+      rotated_sibling =
+        from(s in Portal.GatewayToken,
+          where: s.account_id == parent_as(:gateway_tokens).account_id,
+          where: s.device_id == parent_as(:gateway_tokens).device_id,
+          where: not is_nil(s.rotated_at)
+        )
+
+      used_by_device =
+        from(d in Portal.Device,
+          where: d.account_id == parent_as(:gateway_tokens).account_id,
+          where: d.gateway_token_id == parent_as(:gateway_tokens).id
+        )
+
+      from(t in Portal.GatewayToken, as: :gateway_tokens)
+      |> where([gateway_tokens: t], t.account_id == ^gateway.account_id)
+      |> where([gateway_tokens: t], t.device_id == ^gateway.id)
+      |> where([gateway_tokens: t], is_nil(t.rotated_at))
+      |> where(
+        [gateway_tokens: t],
+        exists(subquery(rotated_sibling)) or not exists(subquery(used_by_device))
+      )
+      |> Safe.scoped(subject)
+      |> Safe.delete_all()
+      |> bulk_result()
+    end
+
+    # Whatever active token survives the delete is in use with no pending
+    # rotation: stamp it to start the grace period
+    defp stamp_active_token(gateway, subject) do
+      from(t in Portal.GatewayToken)
+      |> where([t], t.account_id == ^gateway.account_id)
+      |> where([t], t.device_id == ^gateway.id)
+      |> where([t], is_nil(t.rotated_at))
+      |> Safe.scoped(subject)
+      |> Safe.update_all(set: [rotated_at: DateTime.utc_now()])
+      |> bulk_result()
+    end
+
+    defp bulk_result({:error, :unauthorized}), do: {:error, :unauthorized}
+    defp bulk_result({count, _}) when is_integer(count), do: {:ok, count}
+
+    def insert_api_token(changeset, subject) do
+      changeset
+      |> Safe.scoped(subject)
+      |> Safe.insert()
+    end
+
+    def fetch_gateway_token(account_id, id) do
+      grace_hours = Portal.GatewayToken.rotation_grace_hours()
+
+      from(gt in Portal.GatewayToken,
+        where: gt.account_id == ^account_id,
+        where: gt.id == ^id,
+        where: is_nil(gt.rotated_at) or gt.rotated_at > ago(^grace_hours, "hour"),
+        join: account in Account,
+        on: account.id == gt.account_id and account.is_disabled == false,
+        left_join: sibling in Portal.GatewayToken,
+        on:
+          sibling.account_id == gt.account_id and sibling.device_id == gt.device_id and
+            sibling.id != gt.id,
+        select_merge: %{rotated_sibling_id: sibling.id}
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        gateway_token -> {:ok, gateway_token}
+      end
+    end
+
+    def delete_rotated_gateway_token(account_id, id) do
+      from(gt in Portal.GatewayToken,
+        where: gt.account_id == ^account_id,
+        where: gt.id == ^id,
+        where: not is_nil(gt.rotated_at)
+      )
+      |> Safe.unscoped()
+      |> Safe.delete_all()
+    end
+
+    def fetch_token_for_use(account_id, token_id, %Portal.Authentication.Context{type: :client}) do
+      now = DateTime.utc_now()
+
+      from(tokens in ClientToken, as: :tokens)
+      |> join(:inner, [tokens: tokens], account in assoc(tokens, :account), as: :account)
+      |> join(:inner, [tokens: tokens], actor in assoc(tokens, :actor),
+        on: actor.account_id == tokens.account_id,
+        as: :actor
+      )
+      |> where([tokens: tokens], tokens.expires_at > ^now or is_nil(tokens.expires_at))
+      |> where([tokens: tokens], tokens.id == ^token_id)
+      |> where([tokens: tokens], tokens.account_id == ^account_id)
+      |> where([account: account], account.is_disabled == false)
+      |> where([actor: actor], actor.is_disabled == false)
+      |> select([tokens: tokens], tokens)
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        token -> {:ok, token}
+      end
+    end
+
+    def fetch_token_for_use(
+          account_id,
+          token_id,
+          %Portal.Authentication.Context{type: :mcp} = context
+        ) do
+      now = DateTime.utc_now()
+      remote_ip = %Postgrex.INET{address: context.remote_ip}
+
+      from(tokens in Portal.OAuthToken, as: :tokens)
+      |> join(:inner, [tokens: tokens], account in assoc(tokens, :account), as: :account)
+      |> join(:inner, [tokens: tokens], actor in assoc(tokens, :actor),
+        on: actor.account_id == tokens.account_id,
+        as: :actor
+      )
+      |> where([tokens: tokens], tokens.expires_at > ^now)
+      |> where([tokens: tokens], tokens.id == ^token_id)
+      |> where([tokens: tokens], tokens.account_id == ^account_id)
+      # The audience the token was minted for, checked on every use rather than
+      # only when it is renewed, so a token issued for anything else is refused
+      # here instead of being handed to whoever asked.
+      |> where([tokens: tokens], tokens.resource == ^Portal.OAuth.resource_uri())
+      |> where([account: account], account.is_disabled == false)
+      |> where([actor: actor], actor.is_disabled == false)
+      # Only an admin can grant an MCP client access. The grant is deleted when
+      # the admin is demoted, but that happens asynchronously, so a token is
+      # also refused here as soon as its actor is no longer an admin.
+      |> where([actor: actor], actor.type == :account_admin_user)
+      |> update([tokens: tokens],
+        set: [
+          last_seen_at: ^now,
+          last_seen_user_agent: ^context.user_agent,
+          last_seen_remote_ip: ^remote_ip,
+          last_seen_remote_ip_location_region: ^context.remote_ip_location_region,
+          last_seen_remote_ip_location_city: ^context.remote_ip_location_city,
+          last_seen_remote_ip_location_lat: ^context.remote_ip_location_lat,
+          last_seen_remote_ip_location_lon: ^context.remote_ip_location_lon
+        ]
+      )
+      |> select([tokens: tokens], tokens)
+      |> Safe.unscoped()
+      |> Safe.update_all([])
+      |> case do
+        {1, [token]} -> {:ok, token}
+        {0, []} -> {:error, :not_found}
+      end
+    end
+
+    def fetch_token_for_use(account_id, token_id, %Portal.Authentication.Context{} = context) do
+      now = DateTime.utc_now()
+      remote_ip = %Postgrex.INET{address: context.remote_ip}
+
+      from(tokens in Portal.APIToken, as: :tokens)
+      |> join(:inner, [tokens: tokens], account in assoc(tokens, :account), as: :account)
+      |> join(:inner, [tokens: tokens], actor in assoc(tokens, :actor),
+        on: actor.account_id == tokens.account_id,
+        as: :actor
+      )
+      |> where([tokens: tokens], tokens.expires_at > ^now or is_nil(tokens.expires_at))
+      |> where([tokens: tokens], tokens.id == ^token_id)
+      |> where([tokens: tokens], tokens.account_id == ^account_id)
+      |> where([account: account], account.is_disabled == false)
+      |> where([actor: actor], actor.is_disabled == false)
+      |> update([tokens: tokens],
+        set: [
+          last_seen_at: ^now,
+          last_seen_user_agent: ^context.user_agent,
+          last_seen_remote_ip: ^remote_ip,
+          last_seen_remote_ip_location_region: ^context.remote_ip_location_region,
+          last_seen_remote_ip_location_city: ^context.remote_ip_location_city,
+          last_seen_remote_ip_location_lat: ^context.remote_ip_location_lat,
+          last_seen_remote_ip_location_lon: ^context.remote_ip_location_lon
+        ]
+      )
+      |> select([tokens: tokens], tokens)
+      |> Safe.unscoped()
+      |> Safe.update_all([])
+      |> case do
+        {1, [token]} -> {:ok, token}
+        {0, []} -> {:error, :not_found}
+      end
+    end
+
+    # One-Time Passcode functions
+
+    def insert_one_time_passcode(passcode) do
+      passcode
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def consume_one_time_passcode_attempt(account_id, actor_id, id) do
+      from(otp in OneTimePasscode,
+        join: a in assoc(otp, :actor),
+        on: a.account_id == otp.account_id,
+        where: otp.account_id == ^account_id,
+        where: otp.actor_id == ^actor_id,
+        where: otp.id == ^id,
+        where: otp.expires_at > ^DateTime.utc_now(),
+        where: otp.attempts < ^OneTimePasscode.max_attempts(),
+        where: a.is_disabled == false,
+        where: a.allow_email_otp_sign_in == true,
+        update: [inc: [attempts: 1]],
+        select: otp
+      )
+      |> Safe.unscoped()
+      |> Safe.update_all([])
+      |> case do
+        {1, [passcode]} -> {:ok, Safe.preload(passcode, :actor)}
+        {0, _} -> {:error, :not_found}
+      end
+    end
+
+    def delete_one_time_passcodes_for_actor(account, actor) do
+      from(otp in OneTimePasscode,
+        where: otp.account_id == ^account.id,
+        where: otp.actor_id == ^actor.id
+      )
+      |> Safe.unscoped()
+      |> Safe.delete_all()
+
+      :ok
+    end
+
+    def delete_exhausted_one_time_passcode(%OneTimePasscode{} = passcode) do
+      if passcode.attempts >= OneTimePasscode.max_attempts() do
+        delete_one_time_passcode(passcode)
+      else
+        :ok
+      end
+    end
+
+    def delete_one_time_passcode(passcode) do
+      from(otp in OneTimePasscode,
+        where: otp.account_id == ^passcode.account_id,
+        where: otp.id == ^passcode.id
+      )
+      |> Safe.unscoped()
+      |> Safe.delete_all()
+
+      :ok
+    end
+
+    # Portal Session functions
+
+    def insert_portal_session_with_log(session, log_attrs) do
+      Safe.transact(fn ->
+        with {:ok, session} <- insert_portal_session(session) do
+          insert_session_log(log_attrs)
+          {:ok, session}
+        end
+      end)
+    end
+
+    def insert_portal_session(session) do
+      session
+      |> Safe.unscoped()
+      |> Safe.insert()
+    end
+
+    def insert_session_log(attrs) do
+      Safe.unscoped()
+      |> Safe.insert_all(SessionLog, [attrs])
+    end
+
+    def fetch_portal_session(account_id, id) do
+      enabled_provider_ids = enabled_auth_provider_ids_subquery()
+
+      from(ps in PortalSession,
+        join: a in assoc(ps, :actor),
+        on: a.account_id == ps.account_id,
+        where: ps.account_id == ^account_id,
+        where: ps.id == ^id,
+        where: ps.expires_at > ^DateTime.utc_now(),
+        where: a.is_disabled == false,
+        where: ps.auth_provider_id in subquery(enabled_provider_ids),
+        preload: [actor: a]
+      )
+      |> Safe.unscoped()
+      |> Safe.one()
+      |> case do
+        nil -> {:error, :not_found}
+        session -> {:ok, session}
+      end
+    end
+
+    defp enabled_auth_provider_ids_subquery do
+      provider_modules = [
+        Portal.EmailOTP.AuthProvider,
+        Portal.Userpass.AuthProvider,
+        Portal.Google.AuthProvider,
+        Portal.GitHub.AuthProvider,
+        Portal.Okta.AuthProvider,
+        Portal.Entra.AuthProvider,
+        Portal.OIDC.AuthProvider
+      ]
+
+      provider_modules
+      |> Enum.map(fn module ->
+        from(p in module, where: p.is_disabled == false, select: p.id)
+      end)
+      |> Enum.reduce(&union_all(&2, ^&1))
+    end
+
+    def delete_portal_session(session) do
+      from(ps in PortalSession,
+        where: ps.account_id == ^session.account_id,
+        where: ps.id == ^session.id
+      )
+      |> Safe.unscoped()
+      |> Safe.delete_all()
+
+      :ok
+    end
+
+    def consume_portal_session(account_id, actor_id, session_id) do
+      now = DateTime.utc_now()
+
+      from(ps in PortalSession,
+        where: ps.account_id == ^account_id,
+        where: ps.actor_id == ^actor_id,
+        where: ps.id == ^session_id,
+        where: ps.expires_at > ^now
+      )
+      |> Safe.unscoped()
+      |> Safe.delete_all()
+      |> case do
+        {1, _} -> :ok
+        {0, _} -> {:error, :not_found}
+      end
+    end
+  end
+end

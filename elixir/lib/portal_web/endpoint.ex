@@ -1,0 +1,97 @@
+defmodule PortalWeb.Endpoint do
+  use Phoenix.Endpoint, otp_app: :portal
+
+  # NOTE: This is only used for the LiveView session. We store per-account cookies to allow
+  # multiple accounts to be logged in simultaneously. See PortalWeb.Cookie.Session.
+  #
+  # `secure` must be a literal boolean here — Plug.Session passes it directly to
+  # put_resp_cookie/4 without resolving MFA tuples, so a tuple would always be
+  # truthy. PortalWeb is always served over HTTPS, so this is always true.
+  @session_cookie [
+    store: :cookie,
+    key: "_firezone_key",
+    same_site: "Lax",
+    max_age: 8 * 60 * 60,
+    sign: true,
+    secure: true,
+    signing_salt: {__MODULE__, :cookie_signing_salt, []}
+  ]
+
+  # Health checks - early in pipeline for fast responses
+  plug Portal.Health
+
+  if Application.compile_env(:portal, :sql_sandbox) do
+    plug Phoenix.Ecto.SQL.Sandbox
+    plug PortalWeb.Plugs.AllowEctoSandbox
+  end
+
+  plug Plug.MethodOverride
+
+  # Security Headers
+  plug PortalWeb.Plugs.PutSTSHeader
+  plug PortalWeb.Plugs.PutSecurityHeaders
+
+  plug Plug.RequestId
+  plug PortalWeb.Plugs.PutDynamicRepo
+  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
+
+  # Serve at "/" the static files from "priv/static" directory.
+  plug Plug.Static,
+    at: "/",
+    from: :portal,
+    gzip: true,
+    only: PortalWeb.static_paths(),
+    # allows serving digested files at the root
+    only_matching: ["site", "favicon"]
+
+  # Code reloading can be explicitly enabled under the
+  # :code_reloader configuration of your endpoint.
+  if code_reloading? do
+    socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
+
+    plug Phoenix.LiveReloader
+    plug Phoenix.CodeReloader
+    plug Phoenix.Ecto.CheckRepoStatus, otp_app: :portal
+  end
+
+  plug Plug.Parsers,
+    parsers: [Portal.Parsers.URLENCODED, Portal.Parsers.JSON],
+    pass: ["*/*"],
+    json_decoder: Phoenix.json_library()
+
+  plug PortalWeb.Plugs.RateLimit
+
+  plug Plug.Session, @session_cookie
+
+  plug PortalWeb.Plugs.FetchUserAgent
+  plug PortalWeb.Router
+  plug Sentry.PlugContext
+
+  socket "/live", Phoenix.LiveView.Socket,
+    websocket: [
+      connect_info: [
+        :trace_context_headers,
+        :user_agent,
+        :peer_data,
+        :x_headers,
+        :uri,
+        session: {__MODULE__, :live_view_session_options, []}
+      ]
+    ],
+    longpoll: false,
+    drainer: []
+
+  def cookie_signing_salt do
+    Portal.Config.fetch_env!(:portal, :cookie_signing_salt)
+  end
+
+  def cookie_encryption_salt do
+    Portal.Config.fetch_env!(:portal, :cookie_encryption_salt)
+  end
+
+  # Configures the LiveView session cookie options.
+  # IMPORTANT: Must use the same key as Plug.Session so they share session data
+  def live_view_session_options do
+    @session_cookie
+  end
+end

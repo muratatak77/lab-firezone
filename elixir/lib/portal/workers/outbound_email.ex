@@ -1,0 +1,124 @@
+defmodule Portal.Workers.OutboundEmail do
+  @moduledoc """
+  Oban worker that submits a queued email using the secondary outbound adapter.
+  """
+
+  use Oban.Worker, queue: :outbound_emails, max_attempts: 3
+
+  alias Portal.Mailer
+  require Logger
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{id: job_id, args: %{"account_id" => account_id, "request" => request}}) do
+    email =
+      request
+      |> deserialize()
+      |> put_operation_id(job_id)
+
+    {result, email} = Mailer.deliver_secondary_with_email(email)
+    persist_delivery_result(result, account_id, email)
+  end
+
+  # An empty response means the mailer skipped the send because every recipient
+  # was suppressed (or undeliverable) by the time the job ran; nothing to track.
+  defp persist_delivery_result({:ok, response}, _account_id, _email)
+       when map_size(response) == 0 do
+    :ok
+  end
+
+  defp persist_delivery_result({:ok, response}, account_id, email) do
+    with message_id when is_binary(message_id) <- response_message_id(response),
+         {:ok, _} <-
+           Mailer.insert_tracked_delivery(
+             account_id,
+             message_id,
+             email.subject,
+             email_addresses(email)
+           ) do
+      :ok
+    else
+      nil ->
+        Logger.error("ACS queued email response did not include a message id",
+          account_id: account_id,
+          response: inspect(response)
+        )
+
+        {:discard, :missing_message_id}
+
+      {:error, reason} ->
+        Logger.error("Failed to persist tracked outbound email; email was already sent",
+          account_id: account_id,
+          message_id: response_message_id(response),
+          reason: inspect(reason)
+        )
+
+        {:discard, {:track_delivery, reason}}
+    end
+  end
+
+  defp persist_delivery_result({:error, reason}, account_id, _email) do
+    Logger.error("Queued email delivery failed",
+      account_id: account_id,
+      reason: inspect(reason)
+    )
+
+    {:error, reason}
+  end
+
+  defp email_addresses(%Swoosh.Email{} = email) do
+    (List.wrap(email.to) ++ List.wrap(email.cc) ++ List.wrap(email.bcc))
+    |> Enum.map(fn
+      {_, addr} -> addr
+      addr -> addr
+    end)
+  end
+
+  defp deserialize(
+         %{
+           "from" => from,
+           "subject" => subject,
+           "html_body" => html_body,
+           "text_body" => text_body
+         } = request
+       ) do
+    Swoosh.Email.new()
+    |> maybe_put_recipients(:to, request["to"] || [])
+    |> maybe_put_recipients(:cc, request["cc"] || [])
+    |> maybe_put_recipients(:bcc, request["bcc"] || [])
+    |> maybe_put_reply_to(request["reply_to"] || [])
+    |> Swoosh.Email.from({from["name"], from["address"]})
+    |> Swoosh.Email.subject(subject)
+    |> Swoosh.Email.html_body(html_body)
+    |> Swoosh.Email.text_body(text_body)
+  end
+
+  defp maybe_put_reply_to(email, []), do: email
+
+  defp maybe_put_reply_to(email, [%{"name" => name, "address" => address} | _]),
+    do: Swoosh.Email.reply_to(email, {name, address})
+
+  defp maybe_put_recipients(email, _field, []), do: email
+
+  defp maybe_put_recipients(email, field, recipients) do
+    mapped =
+      Enum.map(recipients, fn %{"name" => name, "address" => address} -> {name, address} end)
+
+    case field do
+      :to -> Swoosh.Email.to(email, mapped)
+      :cc -> Swoosh.Email.cc(email, mapped)
+      :bcc -> Swoosh.Email.bcc(email, mapped)
+    end
+  end
+
+  defp response_message_id(response) when is_map(response), do: response[:id] || response["id"]
+  defp response_message_id(_response), do: nil
+
+  defp put_operation_id(%Swoosh.Email{} = email, job_id) do
+    Swoosh.Email.put_provider_option(email, :operation_id, job_operation_id(job_id))
+  end
+
+  defp job_operation_id(job_id) do
+    {:ok, uuid} = Ecto.UUID.load(<<0::64, job_id::64>>)
+    uuid
+  end
+end

@@ -1,0 +1,529 @@
+defmodule PortalWeb.OIDCTest do
+  use ExUnit.Case, async: true
+
+  alias Portal.Entra
+  alias PortalWeb.Mocks
+  alias PortalWeb.OIDC
+
+  @client_assertion_type "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+  setup do
+    Mocks.OIDC.stub_discovery_document()
+
+    config = [
+      client_id: "test-entra-client-id",
+      response_type: "code",
+      scope: "openid email profile",
+      discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+      req_opts: [retry: false, plug: {Req.Test, PortalWeb.OIDC}]
+    ]
+
+    provider = %Entra.AuthProvider{tenant_ids: ["12345678-1234-1234-1234-123456789012"]}
+
+    %{config: config, provider: provider}
+  end
+
+  describe "Google Workspace verification" do
+    setup %{config: config} do
+      config = config |> Keyword.put(:client_id, "test-client") |> Map.new()
+      Portal.Config.put_env_override(:portal, Portal.Google.AuthProvider, Map.to_list(config))
+      %{config: config}
+    end
+
+    test "setup and sign-up request the domains scope; sign-in keeps identity scopes" do
+      assert {:ok, %{config: config}} = OIDC.setup_verification("google", [])
+      assert config.scope == "openid email profile https://www.googleapis.com/auth/admin.directory.domain.readonly"
+      assert {:ok, %{config: signup}} = OIDC.setup_verification("google_sign_up", [])
+      assert signup.scope == config.scope
+      assert {:ok, signin} = OIDC.config_for_provider(%Portal.Google.AuthProvider{})
+      refute signin[:scope] =~ "admin.directory"
+    end
+
+    test "a Workspace account is verified through its domain list, never hd alone", %{config: config} do
+      google_setup_token(%{"hd" => "Primary.Example"})
+      Req.Test.expect(Portal.Google.APIClient, fn conn ->
+        Req.Test.json(conn, %{"domains" => [%{"domainName" => "primary.example", "verified" => true, "isPrimary" => true}]})
+      end)
+      assert {:ok, %{domains: ["primary.example"], name: "primary.example"}} =
+               OIDC.verify_google_callback(config, "code", "test-verifier")
+    end
+
+    test "rejects a callback issuer that differs from the token issuer", %{config: config} do
+      google_setup_token(%{})
+      token_issuer = Mocks.OIDC.default_claims()["iss"]
+
+      assert {:error, :google_issuer_mismatch} =
+               OIDC.verify_google_callback(config, "code", "test-verifier",
+                 iss: "https://evil.example"
+               )
+
+      google_setup_token(%{})
+
+      assert {:ok, %{domains: nil}} =
+               OIDC.verify_google_callback(config, "code", "test-verifier", iss: token_issuer)
+
+      google_setup_token(%{})
+
+      assert {:ok, %{domains: nil}} =
+               OIDC.verify_google_callback(config, "code", "test-verifier",
+                 iss: String.replace_prefix(token_issuer, "https://", "")
+               )
+    end
+
+    test "sign-up returns the claims, userinfo and the proven domains", %{config: config} do
+      google_setup_token(%{"hd" => "workspace.example"})
+      Req.Test.expect(Portal.Google.APIClient, fn conn ->
+        Req.Test.json(conn, %{"domains" => [
+          %{"domainName" => "workspace.example", "verified" => true, "isPrimary" => true},
+          %{"domainName" => "other.example", "verified" => true}]})
+      end)
+      assert {:ok, %{claims: %{"sub" => "353690423699814251281"}, userinfo: {:ok, _}, domains: domains}} =
+               OIDC.verify_google_sign_up_callback(config, "code", "test-verifier")
+      assert domains == ["workspace.example", "other.example"]
+
+      google_setup_token(%{})
+      Req.Test.stub(Portal.Google.APIClient, fn _conn -> flunk("personal accounts must not read Workspace domains") end)
+      assert {:ok, %{domains: nil}} = OIDC.verify_google_sign_up_callback(config, "code", "test-verifier")
+
+      google_setup_token(%{"hd" => "workspace.example"})
+      Req.Test.expect(Portal.Google.APIClient, fn conn -> Plug.Conn.send_resp(conn, 403, "forbidden") end)
+      assert {:error, :google_workspace_verification_failed} =
+               OIDC.verify_google_sign_up_callback(config, "code", "test-verifier")
+    end
+
+    test "reads verified primary, secondary, and alias domains", %{config: config} do
+      google_setup_token(%{"hd" => "secondary.example"})
+      Req.Test.expect(Portal.Google.APIClient, fn conn ->
+        assert conn.request_path == "/admin/directory/v1/customer/my_customer/domains"
+        assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer setup-access-token"]
+        Req.Test.json(conn, %{"domains" => [
+          %{"domainName" => "PRIMARY.EXAMPLE", "verified" => true, "isPrimary" => true,
+            "domainAliases" => [%{"domainAliasName" => "alias.example", "verified" => true}]},
+          %{"domainName" => "secondary.example", "verified" => true},
+          %{"domainName" => "unverified.example", "verified" => false}
+        ]})
+      end)
+      assert {:ok, %{name: "PRIMARY.EXAMPLE", domains: domains}} =
+               OIDC.verify_google_callback(config, "code", "test-verifier")
+      assert domains == ["secondary.example", "alias.example", "primary.example"]
+    end
+
+    for overrides <- [%{"hd" => nil}, %{"hd" => ""}, %{"email_verified" => false}, %{"hd" => "example.com", "email_verified" => false}] do
+      @google_claim_overrides overrides
+      test "rejects setup without verified Workspace identity #{inspect(overrides)}", %{config: config} do
+        google_setup_token(@google_claim_overrides)
+        Req.Test.stub(Portal.Google.APIClient, fn _conn -> flunk("must verify identity before reading domains") end)
+        assert {:error, _} = OIDC.verify_google_callback(config, "code", "test-verifier")
+      end
+    end
+
+    for email <- ["person@gmail.com", "person@googlemail.com", "person@company.example"] do
+      @personal_google_email email
+      test "verifies a personal account without domain restrictions: #{email}", %{config: config} do
+        google_setup_token(%{"email" => @personal_google_email})
+        Req.Test.stub(Portal.Google.APIClient, fn _conn -> flunk("personal accounts must not read Workspace domains") end)
+        assert {:ok, %{issuer: _, domains: nil, name: nil}} =
+                 OIDC.verify_google_callback(config, "code", "test-verifier")
+      end
+    end
+
+    test "fails setup if the administrator cannot list domains", %{config: config} do
+      google_setup_token(%{"hd" => "example.com"})
+      Req.Test.expect(Portal.Google.APIClient, fn conn -> Plug.Conn.send_resp(conn, 403, "forbidden") end)
+      assert {:error, _} = OIDC.verify_google_callback(config, "code", "test-verifier")
+    end
+
+    test "fails setup when the signed hd is not a verified customer domain", %{config: config} do
+      google_setup_token(%{"hd" => "other.example"})
+      Req.Test.expect(Portal.Google.APIClient, fn conn ->
+        Req.Test.json(conn, %{"domains" => [%{"domainName" => "example.com", "verified" => true}]})
+      end)
+      assert {:error, _} = OIDC.verify_google_callback(config, "code", "test-verifier")
+    end
+
+    for {hd, result} <- [{"example.com", :ok}, {"secondary.example", :ok},
+                         {"other.example", :error}, {"sub.example.com", :error}, {nil, :error}] do
+      @google_hd hd
+      @google_expected_result result
+      test "checks the signed hd at sign-in: #{inspect(hd)}" do
+        token = Mocks.OIDC.default_claims()
+          |> Map.put("hd", @google_hd)
+          |> Mocks.OIDC.sign_openid_connect_token()
+        provider = %Portal.Google.AuthProvider{workspace_domains: ["example.com", "secondary.example"]}
+        assert {@google_expected_result, _} = OIDC.verify_token(provider, token, "test-verifier")
+      end
+    end
+
+    for hd <- [nil, "work.example"] do
+      @legacy_hd hd
+      test "keeps existing unrestricted providers compatible with #{inspect(hd)}" do
+        claims = Mocks.OIDC.default_claims()
+        claims = if @legacy_hd, do: Map.put(claims, "hd", @legacy_hd), else: claims
+        token = Mocks.OIDC.sign_openid_connect_token(claims)
+        provider = %Portal.Google.AuthProvider{is_legacy_unrestricted: true}
+        assert {:ok, _} = OIDC.verify_token(provider, token, "test-verifier")
+      end
+    end
+
+    test "new personal-only providers reject Workspace tokens and accept personal tokens" do
+      claims = Mocks.OIDC.default_claims()
+      personal = Mocks.OIDC.sign_openid_connect_token(claims)
+      workspace = claims |> Map.put("hd", "example.com") |> Mocks.OIDC.sign_openid_connect_token()
+      assert {:ok, _} = OIDC.verify_token(%Portal.Google.AuthProvider{}, personal, "test-verifier")
+      assert {:error, _} = OIDC.verify_token(%Portal.Google.AuthProvider{}, workspace, "test-verifier")
+      assert {:error, _} = OIDC.verify_token(%Portal.Google.AuthProvider{workspace_domains: []}, personal, "test-verifier")
+    end
+
+  end
+
+  defp google_setup_token(overrides) do
+    token = Mocks.OIDC.default_claims()
+      |> Map.merge(overrides)
+      |> Mocks.OIDC.sign_openid_connect_token()
+    Mocks.OIDC.set_token_response(%{"id_token" => token, "access_token" => "setup-access-token"})
+  end
+
+  describe "verification process serialization" do
+    test "round trips the PID with its Erlang node identity" do
+      serialized_pid = OIDC.serialize_pid(self())
+
+      assert String.starts_with?(serialized_pid, "pid:")
+      assert OIDC.deserialize_pid(serialized_pid) == self()
+    end
+
+    test "accepts legacy local PID strings for callbacks already in flight" do
+      legacy_pid = self() |> :erlang.pid_to_list() |> to_string()
+
+      assert OIDC.deserialize_pid(legacy_pid) == self()
+    end
+
+    test "rejects malformed values" do
+      encrypted_term =
+        Phoenix.Token.encrypt(PortalWeb.Endpoint, "oidc-verification-pid", "not-a-pid")
+
+      assert OIDC.deserialize_pid("pid:" <> encrypted_term) == nil
+      assert OIDC.deserialize_pid("pid:not-base64!") == nil
+      assert OIDC.deserialize_pid("not-a-pid") == nil
+    end
+  end
+
+  describe "Entra admin-consent URI" do
+    test "starts auth-provider verification with organization-wide admin consent" do
+      verifier = "auth-provider-verifier"
+      state = "signed-state"
+
+      assert {:ok, %{config: config}} = OIDC.setup_verification("entra", [])
+      assert {:ok, url} = OIDC.build_verification_uri("entra", config, verifier, state)
+
+      uri = URI.parse(url)
+      params = URI.decode_query(uri.query)
+
+      assert uri.path == "/organizations/v2.0/adminconsent"
+      assert params["scope"] == "openid email profile"
+      assert params["state"] == state
+      refute Map.has_key?(params, "prompt")
+      refute Map.has_key?(params, "response_type")
+    end
+
+    test "requests the directory-sync application's static Graph permissions" do
+      verifier = "directory-sync-verifier"
+
+      assert {:ok, %{config: config}} = OIDC.setup_verification("entra_directory_sync", [])
+
+      assert {:ok, url} =
+               OIDC.build_verification_uri(
+                 "entra_directory_sync",
+                 config,
+                 verifier,
+                 "signed-state"
+               )
+
+      uri = URI.parse(url)
+      params = URI.decode_query(uri.query)
+
+      assert uri.path == "/organizations/v2.0/adminconsent"
+      assert params["client_id"] == "test_client_id"
+      assert params["scope"] == "https://graph.microsoft.com/.default"
+    end
+  end
+
+  describe "OIDC verification URI" do
+    test "binds Google, Okta, and generic OIDC verification requests to the PKCE verifier",
+         %{config: config} do
+      config = Map.new(config)
+
+      for type <- ["google", "okta", "oidc"] do
+        assert {:ok, url} =
+                 OIDC.build_verification_uri(type, config, "verification-verifier", "signed-state")
+
+        params = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+        assert params["nonce"] == OIDC.nonce("verification-verifier")
+        if type == "google", do: assert(params["prompt"] == "select_account consent")
+      end
+    end
+  end
+
+  describe "authorization URI" do
+    test "does not allow additional parameters to override state, nonce, or PKCE", %{
+      config: config,
+      provider: provider
+    } do
+      Portal.Config.put_env_override(:portal, Entra.AuthProvider, config)
+
+      additional_params = %{
+        "state" => "attacker-state",
+        "nonce" => "attacker-nonce",
+        "code_challenge_method" => "plain",
+        "code_challenge" => "attacker-challenge"
+      }
+
+      assert {:ok, url, "trusted-state", verifier} =
+               OIDC.authorization_uri(provider,
+                 state: "trusted-state",
+                 additional_params: additional_params
+               )
+
+      query_params = url |> URI.parse() |> Map.fetch!(:query) |> URI.query_decoder() |> Enum.to_list()
+
+      assert Enum.filter(query_params, &match?({"state", _value}, &1)) == [
+               {"state", "trusted-state"}
+             ]
+
+      assert Enum.filter(query_params, &match?({"nonce", _value}, &1)) == [
+               {"nonce", OIDC.nonce(verifier)}
+             ]
+
+      assert Enum.filter(query_params, &match?({"code_challenge_method", _value}, &1)) == [
+               {"code_challenge_method", "S256"}
+             ]
+
+      assert Enum.filter(query_params, &match?({"code_challenge", _value}, &1)) == [
+               {"code_challenge", pkce_challenge(verifier)}
+      ]
+    end
+  end
+
+  describe "Google directory verification URI" do
+    test "requests only basic identity access for Google directory verification" do
+      Portal.Config.put_env_override(:portal, Portal.Google.SyncAuthorization,
+        client_id: "google-sync-authz-client-id",
+        client_secret: "google-sync-authz-client-secret",
+        response_type: "code",
+        scope: "openid email profile",
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        req_opts: [retry: false, plug: {Req.Test, PortalWeb.OIDC}]
+      )
+
+      assert {:ok, %{config: config}} = OIDC.setup_verification("google_directory_sync", [])
+
+      assert {:ok, url} =
+               OIDC.build_verification_uri(
+                 "google_directory_sync",
+                 config,
+                 "verification-verifier",
+                 "signed-state"
+               )
+
+      params = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert params["client_id"] == "google-sync-authz-client-id"
+      assert params["scope"] == "openid email"
+
+      assert params["state"] == "signed-state"
+      assert params["response_type"] == "code"
+      assert params["prompt"] == "select_account"
+      assert params["code_challenge_method"] == "S256"
+      assert params["code_challenge"] == pkce_challenge("verification-verifier")
+      assert params["nonce"] == OIDC.nonce("verification-verifier")
+      refute params["scope"] =~ "admin.directory"
+    end
+  end
+
+  describe "Entra tenant-proof authorization URI" do
+    @tenant_id "12345678-1234-1234-1234-123456789012"
+
+    test "silently proves the auth-provider tenant with authorization code and PKCE" do
+      verifier = "auth-provider-verifier"
+
+      assert {:ok, %{config: config}} = OIDC.setup_verification("entra", [])
+
+      assert {:ok, url} =
+               OIDC.build_entra_tenant_authorization_uri(
+                 config,
+                 @tenant_id,
+                 verifier,
+                 "signed-state"
+               )
+
+      uri = URI.parse(url)
+      params = URI.decode_query(uri.query)
+
+      assert uri.path == "/#{@tenant_id}/oauth2/v2.0/authorize"
+      assert params["client_id"] == "test_auth_provider_client_id"
+      assert params["scope"] == "openid email profile"
+      assert params["state"] == "signed-state"
+      assert params["response_type"] == "code"
+      assert params["response_mode"] == "query"
+      assert params["prompt"] == "none"
+      assert params["nonce"] == entra_nonce(verifier)
+      assert params["code_challenge_method"] == "S256"
+      assert params["code_challenge"] == pkce_challenge(verifier)
+    end
+
+    test "proves the directory-sync user with only OIDC identity scopes" do
+      verifier = "directory-sync-verifier"
+
+      assert {:ok, %{config: config}} = OIDC.setup_verification("entra_directory_sync", [])
+
+      assert {:ok, url} =
+               OIDC.build_entra_tenant_authorization_uri(
+                 config,
+                 @tenant_id,
+                 verifier,
+                 "signed-state"
+               )
+
+      params = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert params["client_id"] == "test_client_id"
+      assert params["scope"] == "openid profile"
+      refute params["scope"] =~ ".default"
+      refute params["scope"] =~ "Directory.Read"
+    end
+
+    test "allows an interactive fallback without forcing another account choice" do
+      assert {:ok, %{config: config}} = OIDC.setup_verification("entra", [])
+
+      assert {:ok, url} =
+               OIDC.build_entra_tenant_authorization_uri(
+                 config,
+                 @tenant_id,
+                 "auth-provider-verifier",
+                 "signed-state",
+                 prompt: nil
+               )
+
+      params = url |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      refute Map.has_key?(params, "prompt")
+    end
+
+    test "rejects a tenant that was not a validated GUID" do
+      assert {:ok, %{config: config}} = OIDC.setup_verification("entra", [])
+
+      assert {:error, :invalid_entra_tenant} =
+               OIDC.build_entra_tenant_authorization_uri(
+                 config,
+                 "attacker-controlled-tenant",
+                 "auth-provider-verifier",
+                 "signed-state"
+               )
+    end
+  end
+
+  describe "exchange_code/3 for Entra" do
+    test "uses a configured client secret", %{config: config, provider: provider} do
+      Portal.Config.put_env_override(
+        :portal,
+        Entra.AuthProvider,
+        Keyword.put(config, :client_secret, "test-client-secret")
+      )
+
+      assert {:ok, _tokens} = OIDC.exchange_code(provider, "code", "verifier")
+
+      assert_receive {:oidc_request, discovery_path, _conn}
+      assert String.ends_with?(discovery_path, "/.well-known/openid-configuration")
+
+      assert_receive {:oidc_request, jwks_path, _conn}
+      assert String.ends_with?(jwks_path, "/.well-known/jwks.json")
+
+      assert_receive {:oidc_request, token_path, conn}
+      assert String.ends_with?(token_path, "/oauth/token")
+      assert conn.body_params["client_secret"] == "test-client-secret"
+      refute conn.body_params["client_assertion"]
+    end
+
+    test "uses a managed-identity assertion when no secret is configured", %{
+      config: config,
+      provider: provider
+    } do
+      Portal.Config.put_env_override(
+        :portal,
+        Entra.AuthProvider,
+        Keyword.put(config, :client_secret, nil)
+      )
+
+      test_pid = self()
+
+      Req.Test.expect(Portal.Azure.ManagedIdentity, fn conn ->
+        send(test_pid, {:managed_identity_request, conn})
+
+        Req.Test.json(conn, %{
+          "access_token" => "managed-identity-assertion",
+          "expires_on" => System.system_time(:second) + 3600
+        })
+      end)
+
+      assert {:ok, _tokens} = OIDC.exchange_code(provider, "code", "verifier")
+
+      assert_receive {:managed_identity_request, managed_identity_conn}
+      managed_identity_params = URI.decode_query(managed_identity_conn.query_string)
+      assert managed_identity_params["resource"] == "api://AzureADTokenExchange"
+
+      assert_receive {:oidc_request, discovery_path, _conn}
+      assert String.ends_with?(discovery_path, "/.well-known/openid-configuration")
+
+      assert_receive {:oidc_request, jwks_path, _conn}
+      assert String.ends_with?(jwks_path, "/.well-known/jwks.json")
+
+      assert_receive {:oidc_request, token_path, conn}
+      assert String.ends_with?(token_path, "/oauth/token")
+      assert conn.body_params["client_assertion"] == "managed-identity-assertion"
+      assert conn.body_params["client_assertion_type"] == @client_assertion_type
+      refute conn.body_params["client_secret"]
+    end
+  end
+
+  describe "exchange_code_with_config/3 for Entra verification" do
+    test "uses a managed-identity assertion when the verification client has no secret", %{
+      config: config
+    } do
+      config =
+        config
+        |> Keyword.put(:client_secret, nil)
+        |> Enum.into(%{verification_client_auth: :entra})
+
+      Req.Test.expect(Portal.Azure.ManagedIdentity, fn conn ->
+        Req.Test.json(conn, %{
+          "access_token" => "managed-identity-assertion",
+          "expires_on" => System.system_time(:second) + 3600
+        })
+      end)
+
+      assert {:ok, _tokens} =
+               OIDC.exchange_code_with_config(config, "code", "verification-verifier")
+
+      assert_receive {:oidc_request, discovery_path, _conn}
+      assert String.ends_with?(discovery_path, "/.well-known/openid-configuration")
+
+      assert_receive {:oidc_request, jwks_path, _conn}
+      assert String.ends_with?(jwks_path, "/.well-known/jwks.json")
+
+      assert_receive {:oidc_request, token_path, conn}
+      assert String.ends_with?(token_path, "/oauth/token")
+      assert conn.body_params["code_verifier"] == "verification-verifier"
+      assert conn.body_params["client_assertion"] == "managed-identity-assertion"
+      assert conn.body_params["client_assertion_type"] == @client_assertion_type
+    end
+  end
+
+  defp pkce_challenge(verifier) do
+    :crypto.hash(:sha256, verifier) |> Base.url_encode64(padding: false)
+  end
+
+  defp entra_nonce(verifier) do
+    :crypto.hash(:sha256, "entra-verification-nonce:" <> verifier)
+    |> Base.url_encode64(padding: false)
+  end
+end

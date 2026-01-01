@@ -1,0 +1,97 @@
+defmodule PortalWeb.Session.RedirectorTest do
+  use PortalWeb.ConnCase, async: true
+
+  alias PortalWeb.Session.Redirector
+
+  describe "portal_signed_in/4" do
+    test "persists an admin's marketing opt-out before clearing the session", %{conn: conn} do
+      account = Portal.AccountFixtures.account_fixture(metadata: %{
+        marketing_attribution: %{"marketing_allowed" => true, "captured_at" => System.os_time(:second)}
+      })
+      actor = %Portal.Actor{id: Ecto.UUID.generate(), type: :account_admin_user}
+      attribution = %{"marketing_allowed" => false, "captured_at" => System.os_time(:second)}
+      conn = conn
+        |> put_session("website_attribution", %{"marketing" => attribution})
+        |> Redirector.portal_signed_in(account, %{}, actor)
+      assert get_session(conn, "website_attribution") == nil
+      assert Portal.Repo.get!(Portal.Account, account.id).metadata.marketing_attribution == attribution
+    end
+
+    test "clears website attribution after a successful portal sign-in", %{conn: conn} do
+      account = %Portal.Account{id: Ecto.UUID.generate(), slug: "acme"}
+      actor = %Portal.Actor{id: Ecto.UUID.generate()}
+
+      conn =
+        conn
+        |> put_session("website_attribution", %{
+          "distinct_id" => Ecto.UUID.generate(),
+          "source" => "www.firezone.dev",
+          "website_path" => "/pricing"
+        })
+        |> Redirector.portal_signed_in(account, %{}, actor)
+
+      assert redirected_to(conn) == "/acme/sites"
+      assert get_session(conn, "website_attribution") == nil
+    end
+  end
+
+  describe "sanitize_redirect_to/3" do
+    setup do
+      account = %Portal.Account{id: Ecto.UUID.generate(), slug: "acme"}
+      other_account = %Portal.Account{id: Ecto.UUID.generate(), slug: "other_acme"}
+
+      {:ok, account: account, other_account: other_account}
+    end
+
+    test "allows paths scoped to the account slug", %{account: account} do
+      assert Redirector.sanitize_redirect_to(account, "/acme/sites") == "/acme/sites"
+      assert Redirector.sanitize_redirect_to(account, "/acme?tab=sites") == "/acme?tab=sites"
+    end
+
+    test "allows paths scoped to the account id", %{account: account} do
+      redirect_to = "/#{account.id}/resources?site_id=123"
+
+      assert Redirector.sanitize_redirect_to(account, redirect_to) == redirect_to
+    end
+
+    test "rejects paths scoped to another account", %{
+      account: account,
+      other_account: other_account
+    } do
+      assert Redirector.sanitize_redirect_to(account, "/#{other_account.slug}/sites") ==
+               "/#{account.slug}/sites"
+
+      assert Redirector.sanitize_redirect_to(account, "/#{other_account.id}/sites") ==
+               "/#{account.slug}/sites"
+    end
+
+    test "rejects paths whose first segment only prefixes the account slug or id", %{
+      account: account
+    } do
+      assert Redirector.sanitize_redirect_to(account, "/acme_other/sites") ==
+               "/#{account.slug}/sites"
+
+      assert Redirector.sanitize_redirect_to(account, "/#{account.id}0/sites") ==
+               "/#{account.slug}/sites"
+    end
+
+    test "rejects external, protocol-relative, and malformed redirect targets", %{account: account} do
+      assert Redirector.sanitize_redirect_to(account, "https://example.com/#{account.slug}/sites") ==
+               "/#{account.slug}/sites"
+
+      assert Redirector.sanitize_redirect_to(account, "//#{account.slug}/sites") ==
+               "/#{account.slug}/sites"
+
+      assert Redirector.sanitize_redirect_to(account, "/") == "/#{account.slug}/sites"
+    end
+  end
+
+  describe "sanitize_redirect_to/3 with unsafe characters" do
+    test "rejects an account-scoped path that Phoenix refuses to redirect to" do
+      account = %Portal.Account{id: Ecto.UUID.generate(), slug: "acme"}
+
+      assert Redirector.sanitize_redirect_to(account, "/acme/sites") == "/acme/sites"
+      refute Redirector.sanitize_redirect_to(account, "/acme/\\evil.com") == "/acme/\\evil.com"
+    end
+  end
+end

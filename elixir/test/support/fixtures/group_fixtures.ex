@@ -1,0 +1,174 @@
+defmodule Portal.GroupFixtures do
+  @moduledoc """
+  Test helpers for creating groups and related data.
+  """
+
+  import Portal.AccountFixtures
+  import Portal.DirectoryFixtures
+
+  @doc """
+  Generate valid group attributes with sensible defaults.
+  """
+  def valid_group_attrs(attrs \\ %{}) do
+    unique_num = System.unique_integer([:positive, :monotonic])
+
+    Enum.into(attrs, %{
+      name: "Group #{unique_num}",
+      type: :static,
+      entity_type: :group
+    })
+  end
+
+  @doc """
+  Inserts `count` plain groups into the directory in one statement, for tests
+  that need a directory the size of a real tenant.
+  """
+  def bulk_groups_fixture(%Portal.Directory{} = directory, count) do
+    now = DateTime.utc_now()
+
+    rows =
+      for i <- 1..count do
+        %{
+          id: Ecto.UUID.generate(),
+          account_id: directory.account_id,
+          directory_id: directory.id,
+          name: "Bulk group #{i}",
+          idp_id: "bulk-group-#{i}",
+          type: :static,
+          entity_type: :group,
+          nested_group_idp_ids: [],
+          inserted_at: now,
+          updated_at: now
+        }
+      end
+
+    {^count, _} = Portal.Repo.insert_all(Portal.Group, rows)
+    :ok
+  end
+
+  @doc """
+  Generate a group with valid default attributes.
+
+  The group will be created with an associated account unless one is provided.
+
+  ## Examples
+
+      group = group_fixture()
+      group = group_fixture(name: "Engineering")
+      group = group_fixture(account: account, type: :managed)
+
+  """
+  def group_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+
+    # Get or create account
+    account = Map.get(attrs, :account) || account_fixture()
+
+    # Build group attrs without the account key
+    group_attrs =
+      attrs
+      |> Map.delete(:account)
+      |> Map.delete(:directory)
+      |> valid_group_attrs()
+
+    changeset =
+      %Portal.Group{}
+      |> Ecto.Changeset.cast(group_attrs, [:name, :type, :entity_type, :idp_id, :nested_group_idp_ids])
+      |> Ecto.Changeset.put_assoc(:account, account)
+      |> Portal.Group.changeset()
+
+    # Optionally associate with directory
+    changeset =
+      if directory = Map.get(attrs, :directory) do
+        Ecto.Changeset.put_assoc(changeset, :directory, directory)
+      else
+        changeset
+      end
+
+    {:ok, group} = Portal.Repo.insert(changeset)
+
+    # If synced_at was provided, create a sync state record
+    if synced_at = Map.get(attrs, :synced_at) do
+      %Portal.GroupSyncState{
+        group_id: group.id,
+        account_id: account.id,
+        synced_at: synced_at
+      }
+      |> Portal.Repo.insert!(
+        on_conflict: {:replace, [:synced_at]},
+        conflict_target: [:account_id, :group_id]
+      )
+    end
+
+    group
+  end
+
+  @doc """
+  Generate a managed group (synced from identity provider).
+  """
+  def managed_group_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+    group_fixture(Map.put(attrs, :type, :managed))
+  end
+
+  @doc """
+  Generate an organizational unit group.
+  """
+  def org_unit_group_fixture(attrs \\ %{}) do
+    attrs =
+      attrs
+      |> Enum.into(%{})
+      |> Map.put(:entity_type, :org_unit)
+      |> Map.put(:type, :managed)
+
+    group_fixture(attrs)
+  end
+
+  @doc """
+  Generate a synced group (from identity provider).
+
+  Creates a static group with a directory_id, simulating a group that was
+  synced from an external directory service but is modifiable via PortalAPI.
+  This is different from a managed group which cannot be fetched via the PortalAPI.
+
+  ## Examples
+
+      group = synced_group_fixture()
+      group = synced_group_fixture(account: account)
+      group = synced_group_fixture(name: "Sales Team")
+      group = synced_group_fixture(directory: google_directory)
+
+  """
+  def synced_group_fixture(attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+
+    # Create a directory first if not provided (default to google)
+    directory =
+      if Map.has_key?(attrs, :directory) do
+        Map.get(attrs, :directory)
+      else
+        # Get account to create directory with same account
+        account = Map.get(attrs, :account) || account_fixture()
+
+        # Create a google directory (this returns a generic Directory not a GoogleDirectory)
+        google_directory_fixture(account: account)
+      end
+
+    attrs =
+      attrs
+      |> Map.put(:type, :static)
+      |> Map.put(:directory, directory)
+      |> Map.put_new(:synced_at, DateTime.utc_now())
+
+    # Add idp_id if not provided
+    attrs =
+      if Map.has_key?(attrs, :idp_id) do
+        attrs
+      else
+        unique_num = System.unique_integer([:positive, :monotonic])
+        Map.put(attrs, :idp_id, "synced_#{unique_num}")
+      end
+
+    group_fixture(attrs)
+  end
+end

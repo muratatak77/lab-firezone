@@ -1,0 +1,2564 @@
+mod allocations;
+mod buffered_candidates;
+mod connection_state;
+mod connections;
+mod inflight_stun_requests;
+mod timeout_cache;
+
+pub use connection_state::ConnectionPath;
+pub use connections::UnknownConnection;
+
+use crate::agent::Agent;
+use crate::allocation::{self, Allocation, RelaySocket, Socket};
+use crate::crypto::{CommittedBatch, DecapsulateBatch, DecryptedBatch, EncapsulateBatch};
+use crate::node::allocations::Allocations;
+use crate::node::buffered_candidates::BufferedCandidates;
+use crate::node::connection_state::{ConnectionState, PeerSocket};
+use crate::node::connections::Connections;
+use crate::node::inflight_stun_requests::InflightStunRequests;
+use crate::node::timeout_cache::TimeoutCache;
+use crate::utils::channel_data_packet_buffer;
+use anyhow::{Context, Result, anyhow};
+use bufferpool::Bytes;
+use core::fmt;
+use fast_random_state::FastRandomState;
+use ip_packet::{Ecn, IpPacket};
+use is::stun::{StunMessage, StunPacket};
+use is::{Candidate, CandidateKind, IceConnectionState};
+use is::{IceAgent, IceAgentEvent};
+use itertools::Itertools;
+use opentelemetry::metrics::Gauge;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use ringbuffer::{AllocRingBuffer, RingBuffer};
+use smallvec::SmallVec;
+use std::collections::{BTreeSet, HashSet};
+use std::hash::Hash;
+use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
+use std::{collections::VecDeque, net::SocketAddr};
+use std::{iter, mem};
+use stun_codec::rfc5389::attributes::{Realm, Username};
+use zeroize::Zeroizing;
+
+// Note: Taken from boringtun
+const HANDSHAKE_RATE_LIMIT: u64 = 100;
+
+/// How long we will at most wait for a candidate from the remote.
+const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Grace-period for when we will act on an ICE disconnect.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// For how long we will at most try to re-key a WireGuard tunnel.
+const WG_REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(20);
+
+/// For how long a Frostlink connection tries to re-key: WireGuard's default.
+const FROSTLINK_REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+
+/// For how long a Frostlink connection tries to re-key once its remote may have restarted.
+const SUSPECTED_REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(10);
+
+/// How often we record the number of connections per network path; metrics are exported every minute.
+const CONNECTION_COUNT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A node within a `snownet` network maintains connections to several other nodes.
+///
+/// [`Node`] is built in a SANS-IO fashion, meaning it neither advances time nor network state on its own.
+/// Instead, you need to call one of the following functions:
+///
+/// - [`Node::begin_decapsulate`] for handling incoming network traffic
+/// - [`Node::encapsulate`] for handling outgoing network traffic
+/// - [`Node::handle_timeout`] for waking the [`Node`]
+///
+/// As a counterpart, the following functions inform you about state changes and "actions" the [`Node`] would like to take:
+///
+/// - [`Node::poll_timeout`] for learning when to "wake" the [`Node`]
+/// - [`Node::poll_transmit`] for transferring buffered data
+/// - [`Node::poll_event`] for learning about state changes
+///
+/// These sets of functions need to be combined into an event-loop by the caller.
+/// Any time you change a [`Node`]'s state, you should call [`Node::poll_timeout`] to accurately update, when the [`Node`] wants to be woken up for any time-based actions.
+/// In other words, it should be a loop of:
+///
+/// 1. Change [`Node`]'s state (either via network messages, adding a new connection, etc)
+/// 2. Check [`Node::poll_timeout`] for when to wake the [`Node`]
+/// 3. Call [`Node::handle_timeout`] once that time is reached
+///
+/// A [`Node`] is generic over two things:
+/// - `TId`: The type to use for uniquely identifying connections.
+/// - `RId`: The type to use for uniquely identifying relays.
+///
+/// We favor these generic parameters over having our own IDs to avoid mapping back and forth in upper layers.
+pub struct Node<TId, RId> {
+    interface: sanstun::Interface,
+
+    buffered_transmits: VecDeque<Transmit>,
+
+    allocations: Allocations<RId>,
+    additional_host_candidates: Vec<Candidate>,
+
+    connections: Connections<TId, RId>,
+    buffered_candidates: BufferedCandidates<TId>,
+    inflight_stun_requests: InflightStunRequests<TId>,
+
+    pending_events: VecDeque<Event<TId, RId>>,
+    /// The most recent `now` passed to a mutating API; [`Node::poll_timeout`]
+    /// returns it while transmits or events are queued so the driver drains
+    /// them without delay.
+    last_now: Instant,
+
+    connection_count: Gauge<u64>,
+    next_connection_count: Instant,
+
+    rng: StdRng,
+
+    /// The number of seconds since the UNIX epoch.
+    unix_ts: Duration,
+    /// The [`Instant`] at the time we read the UNIX epoch above.
+    unix_now: Instant,
+}
+
+/// The connection exists but is not yet ready to send application packets because ICE is
+/// still in progress (no socket has been nominated yet) or the WireGuard handshake has not
+/// completed.
+///
+/// Callers should buffer the packet and retry once the connection is established.
+#[derive(thiserror::Error, Debug)]
+#[error("Connection is still establishing")]
+pub struct StillConnecting;
+
+#[derive(Debug, Clone, Copy)]
+pub struct IceConfig {
+    pub(crate) max_retrans: usize,
+    pub(crate) max_rto: Duration,
+    pub(crate) initial_rto: Duration,
+}
+
+impl IceConfig {
+    pub fn server_default() -> Self {
+        Self {
+            max_retrans: 45,
+            max_rto: Duration::from_millis(15_000),
+            initial_rto: Duration::from_millis(250),
+        }
+    }
+
+    pub fn server_idle() -> Self {
+        IceConfig {
+            max_retrans: 40,
+            max_rto: Duration::from_secs(25),
+            initial_rto: Duration::from_secs(25),
+        }
+    }
+
+    pub fn client_default() -> Self {
+        Self {
+            max_retrans: 12,
+            max_rto: Duration::from_millis(1500),
+            initial_rto: Duration::from_millis(250),
+        }
+    }
+
+    pub fn client_idle() -> Self {
+        Self {
+            max_retrans: 4,
+            max_rto: Duration::from_secs(25),
+            initial_rto: Duration::from_secs(25),
+        }
+    }
+
+    #[cfg(test)]
+    fn apply(&self, agent: &mut IceAgent) {
+        agent.set_max_stun_retransmits(self.max_retrans);
+        agent.set_max_stun_rto(self.max_rto);
+        agent.set_initial_stun_rto(self.initial_rto)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IceRole {
+    Controlling,
+    Controlled,
+}
+
+impl<TId, RId> Node<TId, RId>
+where
+    TId: Eq + Hash + Copy + Ord + fmt::Display,
+    RId: Copy + Eq + Hash + PartialEq + Ord + fmt::Debug + fmt::Display,
+{
+    pub fn new(seed: [u8; 32], now: Instant, unix_ts: Duration) -> Self {
+        let mut rng = StdRng::from_seed(seed);
+        let allocations = Allocations::new(&mut rng);
+        let interface = new_interface(&mut rng, now, unix_ts);
+
+        Self {
+            rng,
+            interface,
+            buffered_transmits: VecDeque::default(),
+            pending_events: VecDeque::default(),
+            last_now: now,
+            allocations,
+            additional_host_candidates: Default::default(),
+            inflight_stun_requests: Default::default(),
+            connections: Default::default(),
+            buffered_candidates: Default::default(),
+            connection_count: otel_instruments::connection_count(),
+            next_connection_count: now,
+            unix_now: now,
+            unix_ts,
+        }
+    }
+
+    /// Resets this [`Node`].
+    ///
+    /// # Implementation note
+    ///
+    /// This restarts all [`Allocation`]s (see [`Allocation::restart`]): we keep the
+    /// portal-issued credentials but re-run the TURN handshake from scratch, so relay
+    /// connectivity recovers without waiting for the portal to re-deliver the relay list.
+    /// An [`Allocation`] is identified by the client's 3-tuple (IP, port, protocol), so
+    /// re-handshaking from the same 3-tuple would collide with the relay's still-live
+    /// allocation. `snownet` cannot control which IP / port we are binding to, thus upper
+    /// layers MUST ensure that a new IP / port is allocated after calling [`Node::reset`].
+    pub fn reset(&mut self, now: Instant) {
+        self.last_now = now;
+
+        self.allocations.restart(now);
+        self.buffered_transmits.clear();
+        self.pending_events.clear();
+        self.inflight_stun_requests.clear();
+        self.buffered_candidates.clear();
+        self.connections.remove_closing(|_| true, now);
+
+        if self.connections.all_frostlink() {
+            let num_frostlink = self.connections.reset_for_roam(now);
+            tracing::debug!(
+                %num_frostlink,
+                "Soft-reset frostlink connections (path-agent reset, key kept)"
+            );
+
+            for (cid, c) in self.connections.iter_mut() {
+                for candidate in &self.additional_host_candidates {
+                    c.add_local_candidate(cid, candidate, &mut self.pending_events, now);
+                }
+            }
+
+            return;
+        }
+
+        let closed_connections = self
+            .connections
+            .iter_ids()
+            .map(Event::ConnectionClosed)
+            .collect::<Vec<_>>();
+        let num_connections = closed_connections.len();
+
+        self.pending_events.extend(closed_connections);
+
+        self.connections.clear();
+
+        self.interface = new_interface(
+            &mut self.rng,
+            now,
+            self.unix_ts + now.duration_since(self.unix_now),
+        );
+
+        tracing::debug!(%num_connections, "Closed all connections as part of reconnecting");
+    }
+
+    pub fn num_connections(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Whether the connection to `cid` has completed setup and is available for traffic.
+    pub fn is_connected(&self, cid: &TId) -> bool {
+        self.connections.is_connected(cid)
+    }
+
+    /// Returns the public key of the remote on the connection to `cid`.
+    pub fn remote_public_key(&self, cid: &TId) -> Option<sanstun::PublicKey> {
+        self.connections
+            .get_established(cid)
+            .map(|c| c.remote_pub_key)
+    }
+
+    /// Returns the network path currently selected for `cid`.
+    pub fn connection_path(&self, cid: &TId) -> Option<ConnectionPath> {
+        self.connections
+            .get_established(cid)?
+            .state
+            .peer_socket()
+            .map(ConnectionPath::from)
+    }
+
+    /// Upserts a connection to the given remote.
+    ///
+    /// If we already have a connection with the same parameters, this does nothing.
+    /// Otherwise, the existing connection is discarded and a new one will be created.
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn upsert_connection(
+        &mut self,
+        cid: TId,
+        remote: sanstun::PublicKey,
+        preshared_key: sanstun::StaticSecret,
+        local_creds: Credentials,
+        remote_creds: Credentials,
+        ice_role: IceRole,
+        default_ice_config: IceConfig,
+        idle_ice_config: IceConfig,
+        use_frostlink: bool,
+        now: Instant,
+    ) {
+        self.last_now = now;
+
+        let local_creds = local_creds.into();
+        let remote_creds = remote_creds.into();
+
+        // Reuse only if every parameter that feeds the WireGuard
+        // session matches, including the agent mode — a flag flip
+        // forces a replace.
+        if let Ok(c) = self.connections.get_mut(&cid, now)
+            && c.agent.matches_existing_connection(
+                &local_creds,
+                &remote_creds,
+                ice_role,
+                use_frostlink,
+            )
+            && c.tunnel.remote_static_public() == remote
+            && c.preshared_key.as_bytes() == preshared_key.as_bytes()
+        {
+            tracing::info!(local = ?local_creds, "Reusing existing connection");
+
+            c.state
+                .on_upsert(cid, &mut c.agent, c.default_ice_config, now);
+            if c.candidate_timeout.is_some() {
+                c.candidate_timeout = Some(now + CANDIDATE_TIMEOUT);
+            }
+
+            let frostlink = c.agent.is_frostlink();
+
+            // Take all current candidates.
+            let current_candidates = c.agent.local_candidates().collect::<SmallVec<[_; 16]>>();
+
+            // Re-seed connection with all candidates.
+            let new_candidates = seed_agent_with_local_candidates(
+                c.relay,
+                &mut c.agent,
+                &self.allocations,
+                &self.additional_host_candidates,
+                now,
+            );
+
+            // Tell the remote about all of them.
+            self.pending_events.extend(
+                std::iter::empty()
+                    .chain(current_candidates)
+                    .chain(new_candidates)
+                    .map(|candidate| new_ice_candidate_event(cid, candidate, frostlink)),
+            );
+
+            // Initiate a new WG session.
+            //
+            // We can have up to 8 concurrent WireGuard sessions in sanstun before the oldest one gets overwritten.
+            // Also, whilst we are handshaking a new session, we won't send another handshake.
+            // Thus, even rapid successive connection upserts should be handled just fine.
+            if c.agent.send_wg_handshake_after_nomination() {
+                c.initiate_wg_session(&mut self.allocations, &mut self.buffered_transmits, now);
+            }
+
+            return;
+        }
+
+        let existing = self.connections.remove_established(&cid, now);
+
+        if let Some(existing) = existing {
+            let current_local = existing.agent.local_ufrag();
+            tracing::info!(?current_local, new_local = ?local_creds, remote = ?remote_creds, current_index = %existing.tunnel.id(), "Replacing existing connection");
+        } else {
+            tracing::info!(local = ?local_creds, remote = ?remote_creds, "Creating new connection");
+        }
+
+        let mut agent = if use_frostlink {
+            tracing::debug!(%cid, "Using Frostlink for connection");
+            Agent::frostlink()
+        } else {
+            tracing::debug!(%cid, "Using ICE agent for connection");
+            Agent::ice(new_agent(ice_role))
+        };
+
+        agent.apply_ice_config(default_ice_config);
+        agent.set_local_credentials(local_creds);
+        agent.set_remote_credentials(remote_creds);
+
+        let mut connection = match self.init_connection(
+            agent,
+            remote,
+            preshared_key,
+            default_ice_config,
+            idle_ice_config,
+            now,
+            now,
+        ) {
+            Ok(connection) => connection,
+            Err(e) => {
+                tracing::info!("Connection failed (invalid WireGuard peer key: {e})");
+                self.pending_events.push_back(Event::ConnectionFailed(cid));
+
+                return;
+            }
+        };
+        tracing::debug!(index = %connection.tunnel.id(), "Created WireGuard tunnel");
+
+        connection.assign_relay(cid, &mut self.allocations, &mut self.pending_events, now);
+        for candidate in &self.additional_host_candidates {
+            connection.add_local_candidate(cid, candidate, &mut self.pending_events, now);
+        }
+
+        if self.allocations.is_empty() {
+            tracing::debug!("No relays available; requesting a new set");
+
+            self.pending_events.push_back(Event::NoRelays {
+                blocked: self.allocations.blocked(now).collect(),
+            });
+        }
+
+        // Only Controlling fans out the init, so we don't burn
+        // bandwidth and TURN channel bindings on a duplicate from
+        // each side.
+        if let Agent::Frostlink(agent) = &mut connection.agent
+            && matches!(ice_role, IceRole::Controlling)
+            && let Some(init) = connection.tunnel.initiate_handshake(now)
+        {
+            agent.send_handshake_initiation(init, now);
+        }
+
+        self.connections.insert_established(cid, connection);
+
+        for candidate in self.buffered_candidates.drain(&cid).collect::<Vec<_>>() {
+            self.add_remote_candidate(cid, candidate, now);
+        }
+    }
+
+    /// Removes a connection by just clearing its local memory.
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn remove_connection(&mut self, cid: TId, reason: impl fmt::Display, now: Instant) {
+        self.last_now = now;
+
+        let existing = self.connections.remove_established(&cid, now);
+
+        if existing.is_none() {
+            return;
+        }
+
+        tracing::info!("Connection removed ({reason})");
+    }
+
+    /// Handles a hint that the remote of the Frostlink connection to `cid` restarted with the `remote` key.
+    ///
+    /// A remote that restarted has lost the WireGuard session of the existing connection. This
+    /// starts a handshake and shortens how long the tunnel retries it, so the connection fails
+    /// soon unless the remote still answers. Further hints are ignored until it does.
+    /// Connections using ICE or already using `remote` are left alone.
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn handle_remote_key_changed(
+        &mut self,
+        cid: TId,
+        remote: sanstun::PublicKey,
+        now: Instant,
+    ) {
+        self.last_now = now;
+
+        let Ok(c) = self.connections.get_mut(&cid, now) else {
+            return;
+        };
+        let Agent::Frostlink(agent) = &mut c.agent else {
+            return;
+        };
+        if c.remote_pub_key == remote
+            || c.tunnel.rekey_attempt_time() == SUSPECTED_REKEY_ATTEMPT_TIME
+        {
+            return;
+        }
+
+        tracing::debug!("Remote may have restarted; checking connection");
+
+        c.tunnel
+            .set_rekey_attempt_time(SUSPECTED_REKEY_ATTEMPT_TIME);
+
+        if let Some(init) = c.tunnel.restart_handshake(now) {
+            agent.send_handshake_initiation(init, now);
+        }
+    }
+
+    /// Closes a connection to the provided peer.
+    ///
+    /// Reports [`Event::ConnectionClosed`] right away but keeps the connection's WireGuard session
+    /// and path alive until the provided "goodbye" packet can be encrypted and sent, giving up after
+    /// a few seconds.
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn close_connection(&mut self, cid: TId, goodbye: IpPacket, now: Instant) {
+        self.last_now = now;
+
+        if let Err(e) = self.connections.close(cid, goodbye, now) {
+            tracing::debug!("{e:#}");
+
+            return;
+        }
+
+        self.pending_events.push_back(Event::ConnectionClosed(cid));
+    }
+
+    pub fn close_all(&mut self, goodbye: IpPacket, now: Instant) {
+        self.last_now = now;
+
+        for id in self.connections.iter_ids().collect::<Vec<_>>() {
+            self.close_connection(id, goodbye.clone(), now);
+        }
+
+        // Callers shut down right after this, so no later timeout would send the goodbyes.
+        self.handle_timeout(now);
+    }
+
+    pub fn public_key(&self) -> sanstun::PublicKey {
+        self.interface.static_public()
+    }
+
+    pub fn connection_id(&self, key: sanstun::PublicKey, now: Instant) -> Option<TId> {
+        self.connections.iter_established().find_map(|(id, c)| {
+            (c.remote_pub_key == key && c.tunnel.time_since_last_handshake(now).is_some())
+                .then_some(id)
+        })
+    }
+
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn add_remote_candidate(&mut self, cid: TId, candidate: String, now: Instant) {
+        self.last_now = now;
+
+        let Ok(c) = self.connections.get_mut(&cid, now) else {
+            tracing::debug!(%candidate, "Buffering candidate for unknown connection");
+            self.buffered_candidates.push(cid, candidate, now);
+            return;
+        };
+
+        let Some(candidate) = crate::candidate::decode(c.agent.is_frostlink(), &candidate) else {
+            return;
+        };
+
+        tracing::debug!(?candidate, "Received candidate from remote");
+
+        c.add_remote_candidate(cid, candidate.clone(), now);
+
+        match candidate.kind() {
+            CandidateKind::Host => {
+                // Binding a TURN channel for host candidates does not make sense.
+                // They are only useful to circumvent restrictive NATs in which case we are either talking to another relay candidate or a server-reflexive address.
+                return;
+            }
+            CandidateKind::Relayed
+            | CandidateKind::ServerReflexive
+            | CandidateKind::PeerReflexive => {}
+        }
+
+        let Some(rid) = c.relay else {
+            tracing::debug!("No relay selected yet");
+            return;
+        };
+
+        let Some(allocation) = self.allocations.get_mut_by_id(&rid) else {
+            tracing::debug!(%rid, "Unknown relay");
+            return;
+        };
+
+        allocation.bind_channel(candidate.addr(), now);
+    }
+
+    #[tracing::instrument(level = "info", skip_all, fields(%cid))]
+    pub fn remove_remote_candidate(&mut self, cid: TId, candidate: String, now: Instant) {
+        self.last_now = now;
+
+        let Ok(c) = self.connections.get_mut(&cid, now) else {
+            if self.buffered_candidates.remove(&cid, &candidate) {
+                tracing::debug!(%candidate, "Removed buffered candidate for unknown connection");
+            } else {
+                tracing::debug!(ignored_candidate = %candidate, "Unknown connection");
+            }
+            return;
+        };
+
+        let Some(candidate) = crate::candidate::decode(c.agent.is_frostlink(), &candidate) else {
+            return;
+        };
+
+        tracing::debug!(?candidate, "Received invalidated candidate from remote");
+
+        c.remove_remote_candidate(cid, candidate, now);
+    }
+
+    /// Decapsulate an incoming packet.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(None)` if the packet was handled internally, for example, a response from a TURN server.
+    ///   Call [`Node::handle_timeout`] before suspending to send any replies.
+    /// - `Ok(Some)` if the packet was an encrypted WireGuard data message from a peer.
+    ///   Add further segments received on the same path with [`DecapsulateBatch::push`], finish
+    ///   the batch, decrypt it and pass the result to [`Node::commit_decrypted`].
+    pub fn begin_decapsulate(
+        &mut self,
+        local: SocketAddr,
+        from: SocketAddr,
+        datagram: &[u8],
+        now: Instant,
+    ) -> Result<Option<DecapsulateBatch<'_>>> {
+        self.last_now = now;
+
+        let (from, message, relayed) = match self.allocations_try_handle(from, local, datagram, now)
+        {
+            ControlFlow::Continue(c) => c,
+            ControlFlow::Break(()) => return Ok(None),
+        };
+
+        // For our agents, it is important what the initial "destination" of the packet was.
+        let destination = relayed.map(|r| r.socket.address()).unwrap_or(local);
+
+        match self.agents_try_handle(from, destination, message, now) {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(Ok(())) => return Ok(None),
+            ControlFlow::Break(Err(e)) => return Err(e),
+        };
+
+        let channel = relayed.map(|r| r.channel);
+
+        let batch = match self.connections_try_handle(from, destination, message, channel, now) {
+            ControlFlow::Continue(batch) => batch,
+            ControlFlow::Break(Ok(())) => return Ok(None),
+            ControlFlow::Break(Err(e)) => return Err(e),
+        };
+
+        Ok(Some(batch))
+    }
+
+    /// Commits the packets decrypted from a [`DecapsulateBatch`].
+    ///
+    /// Returns the result of each packet.
+    pub fn commit_decrypted(
+        &mut self,
+        batch: DecryptedBatch,
+        now: Instant,
+    ) -> Result<CommittedBatch<TId>> {
+        self.last_now = now;
+
+        let DecryptedBatch {
+            tunnel,
+            src,
+            dst,
+            data,
+            probes,
+        } = batch;
+
+        let (cid, conn) = self
+            .connections
+            .get_established_mut_by_tunnel_id(tunnel, now)?;
+
+        let packets = conn.commit_decrypted(cid, (dst, src), data, probes, now);
+        conn.handle_tunnel_events(
+            cid,
+            &mut self.allocations,
+            &mut self.buffered_transmits,
+            &mut self.pending_events,
+            now,
+        );
+        let packets = packets?;
+
+        if self.connections.is_closing(&cid) {
+            // A closing connection drops what it receives.
+            return Ok(CommittedBatch::new(cid, sanstun::CommittedBatch::default()));
+        }
+
+        Ok(CommittedBatch::new(cid, packets))
+    }
+
+    /// Starts a batch of outgoing IP packets to `cid`, beginning with `packet`.
+    ///
+    /// Wireguard is an IP tunnel, so we "enforce" that only IP packets are sent through it.
+    /// We say "enforce" an [`IpPacket`] can be created from an (almost) arbitrary byte buffer at virtually no cost.
+    /// Nevertheless, using [`IpPacket`] in our API has good documentation value.
+    pub fn encapsulate(
+        &mut self,
+        cid: TId,
+        packet: &IpPacket,
+        now: Instant,
+    ) -> Result<Option<EncapsulateBatch<'_>>> {
+        self.last_now = now;
+
+        let conn = self.connections.get_mut(&cid, now)?;
+        let socket = conn.ready_socket(cid)?;
+
+        let batch = conn
+            .encapsulate(cid, socket, packet, now, &mut self.allocations)
+            .with_context(|| format!("cid={cid}"))?;
+
+        Ok(batch)
+    }
+
+    /// Returns a pending [`Event`] from the pool.
+    #[must_use]
+    pub fn poll_event(&mut self) -> Option<Event<TId, RId>> {
+        let event = self.pending_events.pop_front()?;
+
+        if let Event::ConnectionClosed(id) | Event::ConnectionFailed(id) = &event {
+            self.inflight_stun_requests.remove_by_conn_id(*id);
+        }
+
+        Some(event)
+    }
+
+    /// Returns, when [`Node::handle_timeout`] should be called next.
+    ///
+    /// This function only takes `&mut self` because it caches certain computations internally.
+    /// The returned timestamp will **not** change unless other state is modified.
+    #[must_use]
+    pub fn poll_timeout(&mut self) -> Option<Instant> {
+        let queued_io = (!self.buffered_transmits.is_empty() || !self.pending_events.is_empty())
+            .then_some(self.last_now);
+
+        iter::empty()
+            .chain(queued_io)
+            .chain(self.connections.poll_timeout())
+            .chain(self.buffered_candidates.poll_timeout())
+            .chain(self.allocations.poll_timeout())
+            .min()
+    }
+
+    /// Advances time within the [`Node`].
+    ///
+    /// This function is the main "work-horse" outside of encapsulating or decapsulating network packets.
+    /// Any significant state changes happen in here.
+    ///
+    /// ## Implementation note
+    ///
+    /// [`Node`] composes several other components that are also designed in a SANS-IO fashion.
+    /// They all have similar functions like `poll_transmit`, `poll_event` etc.
+    ///
+    /// It might be tempting to e.g. define [`Node::poll_event`] as a composition of the lower-level `poll_event` functions.
+    /// Counter-intuitively, this is not a good design.
+    /// The reason is simple: An event generated by a lower-level components does not necessarily translate to an event for [`Node`].
+    /// Instead, it might translate into something completely different, like a [`Transmit`].
+    ///
+    /// As such, it ends up being cleaner to "drain" all lower-level components of their events, transmits etc within this function.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        self.last_now = now;
+
+        self.allocations.handle_timeout(now);
+
+        self.allocations_drain_events(now);
+
+        let gc = self.allocations.gc(now);
+
+        if gc.removed_last {
+            tracing::info!("No relays left; requesting a new set");
+
+            self.pending_events.push_back(Event::NoRelays {
+                blocked: self.allocations.blocked(now).collect(),
+            });
+        }
+
+        self.connections.clear_relays(gc.removed.into_iter());
+
+        self.connections.handle_timeout(
+            &mut self.allocations,
+            &mut self.buffered_transmits,
+            &mut self.pending_events,
+            &mut self.inflight_stun_requests,
+            now,
+        );
+
+        if now >= self.next_connection_count {
+            self.next_connection_count = now + CONNECTION_COUNT_INTERVAL;
+
+            let mut connections_by_path = [0u64; ConnectionPath::KINDS.len()];
+
+            for (_, connection) in self.connections.iter_established() {
+                if let Some(peer_socket) = connection.state.peer_socket() {
+                    connections_by_path[peer_socket.kind_index()] += 1;
+                }
+            }
+
+            // Report the current number of connections per network path. Every bucket is
+            // emitted (including `0`) so that a path draining to zero is not stuck at its
+            // last non-zero value.
+            for (kind, count) in ConnectionPath::KINDS.into_iter().zip(connections_by_path) {
+                self.connection_count
+                    .record(count, &[otel_attributes::connection_socket(kind)]);
+            }
+        }
+
+        self.buffered_candidates.handle_timeout(now);
+        self.inflight_stun_requests.handle_timeout(now);
+    }
+
+    /// Returns buffered data that needs to be sent on the socket.
+    #[must_use]
+    pub fn poll_transmit(&mut self) -> Option<Transmit> {
+        if let Some(transmit) = self.allocations.poll_transmit() {
+            tracing::trace!(?transmit);
+
+            return Some(transmit);
+        }
+
+        let transmit = self.buffered_transmits.pop_front()?;
+
+        tracing::trace!(?transmit);
+
+        Some(transmit)
+    }
+
+    pub fn update_relays(
+        &mut self,
+        to_remove: BTreeSet<RId>,
+        to_add: &BTreeSet<(RId, RelaySocket, String, String, String)>,
+        now: Instant,
+    ) {
+        self.last_now = now;
+
+        // First, invalidate all candidates from relays that we should stop using.
+        for rid in &to_remove {
+            let Some(allocation) = self.allocations.remove_by_id(rid) else {
+                tracing::debug!(%rid, "Cannot delete unknown allocation");
+
+                continue;
+            };
+
+            invalidate_allocation_candidates(
+                &mut self.connections,
+                &allocation,
+                &mut self.pending_events,
+                now,
+            );
+
+            tracing::info!(%rid, address = ?allocation.server(), "Removed TURN server");
+        }
+
+        // Second, insert new relays.
+        for (rid, server, username, password, realm) in to_add {
+            let Ok(username) = Username::new(username.to_owned()) else {
+                tracing::debug!(%username, "Invalid TURN username");
+                continue;
+            };
+            let Ok(realm) = Realm::new(realm.to_owned()) else {
+                tracing::debug!(%realm, "Invalid TURN realm");
+                continue;
+            };
+
+            match self
+                .allocations
+                .upsert(*rid, *server, username, password.clone(), realm, now)
+            {
+                allocations::UpsertResult::Added => {
+                    tracing::info!(%rid, address = ?server, "Added new TURN server")
+                }
+                allocations::UpsertResult::Skipped => {
+                    tracing::info!(%rid, address = ?server, "Skipping known TURN server")
+                }
+                allocations::UpsertResult::Blocked => {
+                    tracing::debug!(%rid, address = ?server, "Ignoring blocked TURN server")
+                }
+                allocations::UpsertResult::Replaced(previous) => {
+                    invalidate_allocation_candidates(
+                        &mut self.connections,
+                        &previous,
+                        &mut self.pending_events,
+                        now,
+                    );
+
+                    tracing::info!(%rid, address = ?server, "Replaced TURN server")
+                }
+            }
+        }
+
+        let newly_added_relays = to_add
+            .iter()
+            .map(|(id, _, _, _, _)| *id)
+            .collect::<HashSet<_, FastRandomState>>();
+
+        // Third, check if other relays are still present.
+        for (_, previous_allocation) in self
+            .allocations
+            .iter_mut()
+            .filter(|(id, _)| !newly_added_relays.contains(id))
+        {
+            previous_allocation.refresh(now);
+        }
+
+        // Fourth, detach existing connections from removed relays.
+        self.connections.clear_relays(to_remove.into_iter());
+    }
+
+    /// Sets the local addresses to advertise as host candidates in addition to the ones learned from relays.
+    ///
+    /// Existing connections get the new candidates and have the ones no longer present invalidated.
+    pub fn set_additional_host_candidates(&mut self, addrs: BTreeSet<SocketAddr>, now: Instant) {
+        self.last_now = now;
+
+        let candidates = addrs
+            .into_iter()
+            .filter_map(|addr| {
+                Candidate::host(addr, "udp")
+                    .inspect_err(|e| tracing::debug!(%addr, "Invalid host candidate: {e}"))
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        let removed = mem::replace(&mut self.additional_host_candidates, candidates)
+            .into_iter()
+            .filter(|c| !self.additional_host_candidates.contains(c))
+            .collect::<Vec<_>>();
+
+        for (cid, c) in self.connections.iter_mut() {
+            let relay_candidates = c
+                .relay
+                .map(|rid| self.allocations.candidates_for_relay(&rid))
+                .into_iter()
+                .flatten()
+                .collect::<SmallVec<[_; 8]>>();
+
+            for candidate in removed.iter().filter(|r| !relay_candidates.contains(r)) {
+                c.invalidate_local_candidate(cid, candidate, &mut self.pending_events, now);
+            }
+            for candidate in &self.additional_host_candidates {
+                c.add_local_candidate(cid, candidate, &mut self.pending_events, now);
+            }
+        }
+    }
+
+    fn init_connection(
+        &mut self,
+        mut agent: Agent,
+        remote: sanstun::PublicKey,
+        preshared_key: sanstun::StaticSecret,
+        default_ice_config: IceConfig,
+        idle_ice_config: IceConfig,
+        intent_sent_at: Instant,
+        now: Instant,
+    ) -> Result<Connection<RId>, sanstun::Error> {
+        agent.handle_timeout(now);
+
+        let config = sanstun::TunnelConfig::default().with_preshared_key(
+            sanstun::PresharedKey::from(Zeroizing::new(*preshared_key.as_bytes())),
+        );
+        let mut tunnel = self.interface.new_tunnel(remote, config, now)?;
+        // With classic ICE, a 90s rekey-attempt time is bad UX: ICE can think
+        // the pair is fine while WireGuard is desynced and stuck, so we shorten
+        // it to roughly our ICE timeout to fail fast and re-establish.
+        //
+        // Frostlink has no such gap: probes ride the session, so a stuck
+        // handshake means the path is genuinely down, and probe loss must not
+        // retire a connection (WireGuard is the sole liveness authority). We
+        // keep WireGuard's 90s rekey-attempt default so a transient outage (a
+        // relay partition, a roam) doesn't discard session state before the path
+        // can be probed back to life. We do tighten two timers: a 5s
+        // keepalive-timeout, so WireGuard sends a passive keepalive when 5s pass
+        // after it receives data without sending anything back (keeping the
+        // reverse path warm during one-way traffic), and a 2s rekey-timeout, so
+        // an unanswered handshake init is retried every 2s and distress surfaces
+        // within a couple of round trips.
+        if !agent.is_frostlink() {
+            tunnel.set_rekey_attempt_time(WG_REKEY_ATTEMPT_TIME);
+        } else {
+            tunnel.set_rekey_attempt_time(FROSTLINK_REKEY_ATTEMPT_TIME);
+            tunnel.set_keepalive_timeout(Duration::from_secs(5));
+            tunnel.set_rekey_timeout(Duration::from_secs(2));
+        }
+
+        let connection = Connection {
+            agent,
+            tunnel,
+            preshared_key,
+            intent_sent_at,
+            remote_pub_key: remote,
+            relay: None,
+            state: ConnectionState::Connecting {
+                wg_buffer: AllocRingBuffer::new(128),
+            },
+            disconnected_at: None,
+            last_proactive_handshake_sent_at: None,
+            first_handshake_completed_at: None,
+            default_ice_config,
+            idle_ice_config,
+            poll_timeout_cache: Default::default(),
+            candidate_timeout: Some(now + CANDIDATE_TIMEOUT),
+        };
+
+        Ok(connection)
+    }
+
+    /// Tries to handle the packet using one of our [`Allocation`]s.
+    ///
+    /// This function is in the hot-path of packet processing and thus must be as efficient as possible.
+    /// Even hash map look-ups and linear searches across small lists are expensive at this point.
+    /// Thus, we use the first byte of the message as a heuristic for whether we should attempt to handle it here.
+    ///
+    /// See <https://www.rfc-editor.org/rfc/rfc8656#name-channels-2> for details on de-multiplexing.
+    ///
+    /// This heuristic might fail because we are also handling wireguard packets.
+    /// Those are fully encrypted and thus any byte pattern may appear at the front of the packet.
+    /// We can detect this by further checking the origin of the packet.
+    fn allocations_try_handle<'p>(
+        &mut self,
+        from: SocketAddr,
+        local: SocketAddr,
+        packet: &'p [u8],
+        now: Instant,
+    ) -> ControlFlow<(), (SocketAddr, &'p [u8], Option<Relayed>)> {
+        if from.port() != 3478 {
+            // Relays always send & receive from port 3478.
+            //
+            // Some NATs may remap our p2p listening port (i.e. 52625 or another ephemeral one) to a port
+            // in the non-ephemeral range. If this happens, there is a chance that a peer is sending
+            // traffic originating from port 3478.
+            //
+            // The above check would wrongly classify a STUN request from such a peer as relay traffic and
+            // fail to process it because we don't have an `Allocation` for the peer's IP.
+            //
+            // At the same time, we may still receive packets on port 3478 for an allocation that we have discarded.
+            //
+            // To correctly handle these packets, we need to handle them differently, depending on whether we
+            // previously had an allocation on a certain relay:
+            // 1. If we previously had an allocation, we need to stop processing the packet.
+            // 2. If we don't recognize the IP, continue processing the packet (as it may be p2p traffic).
+            return ControlFlow::Continue((from, packet, None));
+        }
+
+        match packet.first().copied() {
+            // STUN method range
+            Some(0..=3) => {
+                let Ok(Ok(message)) = allocation::decode(packet) else {
+                    // False-positive, continue processing packet elsewhere
+                    return ControlFlow::Continue((from, packet, None));
+                };
+
+                let allocation = match self.allocations.get_mut_by_server(from) {
+                    allocations::MutAllocationRef::Connected(_, allocation) => allocation,
+                    allocations::MutAllocationRef::Disconnected => {
+                        tracing::debug!(
+                            %from,
+                            packet = %hex::encode(packet),
+                            "Packet was a STUN message but we are no longer connected to this relay"
+                        );
+
+                        return ControlFlow::Break(()); // Stop processing the packet.
+                    }
+                    allocations::MutAllocationRef::Unknown => {
+                        return ControlFlow::Continue((from, packet, None));
+                    }
+                };
+
+                if allocation.handle_input(from, local, message, now) {
+                    // Successfully handled the packet
+                    return ControlFlow::Break(());
+                }
+
+                tracing::debug!("Packet was a STUN message but not accepted");
+
+                ControlFlow::Break(()) // Stop processing the packet.
+            }
+            // Channel data number range
+            Some(64..=79) => {
+                let Ok(cd) = crate::channel_data::decode(packet) else {
+                    // False-positive, continue processing packet elsewhere
+                    return ControlFlow::Continue((from, packet, None));
+                };
+
+                let allocation = match self.allocations.get_mut_by_server(from) {
+                    allocations::MutAllocationRef::Connected(_, allocation) => allocation,
+                    allocations::MutAllocationRef::Disconnected => {
+                        tracing::debug!(
+                            %from,
+                            "Packet was a channel-data message but we are no longer connected to this relay"
+                        );
+
+                        return ControlFlow::Break(()); // Stop processing the packet.
+                    }
+                    allocations::MutAllocationRef::Unknown => {
+                        return ControlFlow::Continue((from, packet, None));
+                    }
+                };
+
+                let channel = cd.channel();
+                let message = cd.payload();
+
+                let Some((from, socket)) = allocation.decapsulate(from, cd, now) else {
+                    tracing::debug!("Packet was a channel data message but not accepted"); // i.e. unbound channel etc
+
+                    return ControlFlow::Break(()); // Stop processing the packet.
+                };
+
+                // Successfully handled the packet and decapsulated the channel data message.
+                // Continue processing with the _unwrapped_ packet.
+                ControlFlow::Continue((from, message, Some(Relayed { socket, channel })))
+            }
+            // Byte is in a different range? Move on with processing the packet.
+            Some(_) | None => ControlFlow::Continue((from, packet, None)),
+        }
+    }
+
+    fn agents_try_handle(
+        &mut self,
+        from: SocketAddr,
+        destination: SocketAddr,
+        packet: &[u8],
+        now: Instant,
+    ) -> ControlFlow<Result<()>> {
+        // Every STUN message carries the magic cookie (RFC 8489, section 5). `StunMessage::parse`
+        // rejects packets without it too, but allocates its error.
+        if packet.get(4..8) != Some([0x21, 0x12, 0xA4, 0x42].as_slice()) {
+            return ControlFlow::Continue(());
+        }
+
+        let Ok(message) = StunMessage::parse(packet) else {
+            return ControlFlow::Continue(());
+        };
+
+        let (_, c) = match self.connections.get_established_mut_for_stun_message(
+            &message,
+            &mut self.inflight_stun_requests,
+            now,
+        ) {
+            Ok(c) => c,
+            Err(e) => return ControlFlow::Break(Err(e)),
+        };
+
+        let handled = c.agent.handle_stun_packet(
+            now,
+            StunPacket {
+                proto: "udp".try_into().expect("UDP is a valid protocol"),
+                source: from,
+                destination,
+                message,
+            },
+        );
+
+        if !handled {
+            tracing::debug!(
+                "Agent did not handle STUN packet assigned by local ufrag or STUN Transaction ID"
+            );
+        }
+
+        ControlFlow::Break(Ok(()))
+    }
+
+    fn connections_try_handle(
+        &mut self,
+        from: SocketAddr,
+        destination: SocketAddr,
+        packet: &[u8],
+        channel: Option<u16>,
+        now: Instant,
+    ) -> ControlFlow<Result<()>, DecapsulateBatch<'_>> {
+        let parsed_packet = match self.interface.receive(from, packet, now) {
+            Ok(sanstun::Received::Message(parsed_packet)) => parsed_packet,
+            Ok(sanstun::Received::SendCookieReply(reply)) => {
+                tracing::debug!(%from, "Replying with cookie under load");
+
+                self.reply_on_arrival_path(destination, from, &reply, now);
+
+                return ControlFlow::Break(Ok(()));
+            }
+            // If the packet is not a WireGuard packet, bail early.
+            Err(sanstun::Error::InvalidPacket) => {
+                tracing::debug!(packet = %hex::encode(packet));
+
+                return ControlFlow::Break(Err(anyhow::Error::msg("Not a WireGuard packet")));
+            }
+            Err(e) => {
+                return ControlFlow::Break(Err(
+                    anyhow::Error::new(e).context("Failed to verify WireGuard packet")
+                ));
+            }
+        };
+
+        let connection = match &parsed_packet {
+            // When receiving a handshake, we need to look-up the peer by its public key because we don't have a session-index mapping yet.
+            sanstun::ReceivedMessage::HandshakeInitiation(init) => self
+                .connections
+                .get_established_mut_by_public_key(init.peer_static_public().to_bytes(), now),
+            sanstun::ReceivedMessage::HandshakeResponse(response) => self
+                .connections
+                .get_established_mut_by_tunnel_id(response.tunnel_id(), now),
+            sanstun::ReceivedMessage::CookieReply(reply) => self
+                .connections
+                .get_established_mut_by_tunnel_id(reply.tunnel_id(), now),
+            sanstun::ReceivedMessage::TransportData(data) => self
+                .connections
+                .get_established_mut_by_tunnel_id(data.tunnel_id(), now),
+        };
+        let (cid, conn) = match connection {
+            Ok(c) => c,
+            Err(e) => return ControlFlow::Break(Err(e)),
+        };
+        let tunnel = conn.tunnel.id();
+
+        let control_flow = conn.decapsulate(
+            cid,
+            from,
+            destination,
+            parsed_packet,
+            packet,
+            &mut self.allocations,
+            &mut self.buffered_transmits,
+            now,
+        );
+
+        match control_flow {
+            ControlFlow::Continue(batch) => ControlFlow::Continue(DecapsulateBatch::new(
+                &mut self.interface,
+                tunnel,
+                from,
+                destination,
+                channel,
+                batch,
+            )),
+            ControlFlow::Break(Ok(())) => ControlFlow::Break(Ok(())),
+            ControlFlow::Break(Err(e)) => {
+                ControlFlow::Break(Err(e.context(format!("cid={cid} length={}", packet.len()))))
+            }
+        }
+    }
+
+    /// Sends `message` back to `remote` on the path a packet from it arrived on at `local`.
+    fn reply_on_arrival_path(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        message: &[u8],
+        now: Instant,
+    ) {
+        let Some((_, allocation)) = self.allocations.get_mut_by_allocation(local) else {
+            self.buffered_transmits.push_back(Transmit {
+                src: Some(local),
+                dst: remote,
+                payload: Bytes::copied_from(message),
+                ecn: Ecn::NonEct,
+            });
+            return;
+        };
+
+        let mut channel_data = channel_data_packet_buffer(message);
+        let Some(encode_ok) = allocation.encode_channel_data_header(remote, &mut channel_data, now)
+        else {
+            return;
+        };
+
+        self.buffered_transmits.push_back(Transmit {
+            src: None,
+            dst: encode_ok.socket,
+            payload: Bytes::copied_from(&channel_data),
+            ecn: Ecn::NonEct,
+        });
+    }
+
+    fn allocations_drain_events(&mut self, now: Instant) {
+        while let Some((rid, event)) = self.allocations.poll_event() {
+            tracing::trace!(%rid, ?event);
+
+            match event {
+                allocation::Event::New(candidate) => {
+                    for (cid, c) in self.connections.iter_mut_by_relay(rid) {
+                        c.add_local_candidate(cid, &candidate, &mut self.pending_events, now);
+                    }
+                }
+                allocation::Event::Invalid(candidate) => {
+                    for (cid, c) in self.connections.iter_mut() {
+                        c.remove_local_candidate(cid, &candidate, &mut self.pending_events, now);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Seeds the agent with all local candidates, returning an iterator of all candidates that should be signalled to the remote.
+fn seed_agent_with_local_candidates<'a, RId>(
+    selected_relay: Option<RId>,
+    agent: &'a mut Agent,
+    allocations: &Allocations<RId>,
+    additional_host_candidates: &'a [Candidate],
+    now: Instant,
+) -> impl Iterator<Item = Candidate> + use<'a, RId>
+where
+    RId: Ord + Hash + fmt::Display + Copy,
+{
+    selected_relay
+        .map(|rid| allocations.candidates_for_relay(&rid))
+        .into_iter()
+        .flatten()
+        .chain(additional_host_candidates.iter().cloned())
+        .filter_map(move |c| agent.add_local_candidate(c, now))
+}
+
+/// Generate optimistic candidates based on the ones we have already received.
+///
+/// In order to aid the creation of peer-to-peer connections,
+/// we create an additional server-reflexive candidate
+/// for each combination of public IP and host listening port.
+///
+/// IF the listening port of the remote peer happened to be forwarded, this will
+/// allow us to create a direct connection despite the presence of a symmetric NAT.
+///
+/// Consider the following scenario:
+///
+/// - Agent 1 listens on `10.0.0.1:52625` and has a public IP of `1.1.1.1`
+/// - Agent 2 listens on `192.168.0.1:52625` and has a public IP of `2.2.2.2`
+///
+/// Both agents are behind symmetric NAT.
+/// Therefore, the observed port through STUN will not be 52625 but something else entirely.
+/// For this example, let's assume 40000.
+///
+/// Now let's assume that the network administrator forwards port 52625 on one symmetric NAT.
+/// With the below strategy, agent 2 will create an additional server-reflexive candidate
+/// of `1.1.1.1:52625` based on the observed public IP and the port of the host candidate.
+/// This is the port forwarded by the network administrator which will allow the traffic to
+/// flow through to the agent.
+///
+/// In a double symmetric NAT case, this will create a peer-reflexive candidate.
+/// If only one peer is behind symmetric NAT, this creates a predictable path through the NAT.
+///
+/// In both cases, a direct connection will be established and we don't need to fall back to a relay.
+fn generate_optimistic_candidates(agent: &mut Agent, now: Instant) {
+    let public_ips = agent
+        .remote_candidates()
+        .filter_map(|c| (c.kind() == CandidateKind::ServerReflexive).then_some(c.addr().ip()))
+        .collect::<SmallVec<[_; 8]>>();
+
+    let host_candidates = agent
+        .remote_candidates()
+        .filter_map(|c| (c.kind() == CandidateKind::Host).then_some(c.addr()))
+        .collect::<SmallVec<[_; 8]>>();
+
+    let optimistic_candidates = public_ips
+        .into_iter()
+        .cartesian_product(host_candidates)
+        .filter(|(ip, base)| ip.is_ipv4() && base.is_ipv4())
+        .filter_map(|(ip, base)| {
+            let addr = SocketAddr::new(ip, base.port());
+
+            Candidate::server_reflexive(addr, base, "udp")
+                .inspect_err(
+                    |e| tracing::debug!(%addr, %base, "Failed to create optimistic candidate: {e}"),
+                )
+                .ok()
+        })
+        .filter(|c| !agent.contains_remote_candidate(c))
+        .take(2)
+        .collect::<SmallVec<[_; 2]>>();
+
+    for c in optimistic_candidates {
+        tracing::debug!(candidate = ?c, "Adding optimistic candidate for remote");
+
+        agent.add_remote_candidate(c, now);
+    }
+}
+
+fn new_ice_candidate_event<TId, RId>(
+    id: TId,
+    candidate: Candidate,
+    frostlink: bool,
+) -> Event<TId, RId> {
+    let candidate = crate::candidate::encode(frostlink, &candidate);
+
+    tracing::debug!(%candidate, "Signalling candidate to remote");
+
+    Event::NewIceCandidate {
+        connection: id,
+        candidate,
+    }
+}
+
+fn invalidate_allocation_candidates<TId, RId>(
+    connections: &mut Connections<TId, RId>,
+    allocation: &Allocation,
+    pending_events: &mut VecDeque<Event<TId, RId>>,
+    now: Instant,
+) where
+    TId: Eq + Hash + Copy + Ord + fmt::Display,
+    RId: Copy + Eq + Hash + PartialEq + Ord + fmt::Debug + fmt::Display,
+{
+    for (cid, c) in connections.iter_mut() {
+        if c.agent.is_frostlink() {
+            c.reset_path_for_relay_replacement(cid, allocation, now);
+        } else {
+            for candidate in allocation.current_relay_candidates() {
+                c.remove_local_candidate(cid, &candidate, pending_events, now);
+            }
+        }
+    }
+}
+
+pub struct Credentials {
+    /// The ICE username (ufrag).
+    pub username: String,
+    /// The ICE password.
+    pub password: String,
+}
+
+#[doc(hidden)] // Not public API.
+impl From<Credentials> for is::IceCreds {
+    fn from(value: Credentials) -> Self {
+        is::IceCreds {
+            ufrag: value.username,
+            pass: value.password,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<is::IceCreds> for Credentials {
+    fn from(value: is::IceCreds) -> Self {
+        Credentials {
+            username: value.ufrag,
+            password: value.pass,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Event<TId, RId> {
+    /// We created a new candidate for this connection and ask to signal it to the remote party.
+    ///
+    /// Already SDP-encoded (str0m for ICE, frostlink for Frostlink).
+    NewIceCandidate {
+        connection: TId,
+        candidate: String,
+    },
+
+    /// We invalidated a candidate for this connection and ask to signal that to the remote party.
+    InvalidateIceCandidate {
+        connection: TId,
+        candidate: String,
+    },
+
+    ConnectionEstablished(TId),
+
+    /// We failed to establish a connection.
+    ///
+    /// All state associated with the connection has been cleared.
+    ConnectionFailed(TId),
+
+    /// We closed a connection (e.g. due to inactivity, roaming, etc).
+    ConnectionClosed(TId),
+
+    /// We don't have any relays and need a new set to make relayed connections.
+    ///
+    /// Emitted when the last remaining relay is removed or when a connection is created without
+    /// any relays.
+    /// Upper layers should obtain new relays other than the `blocked` ones and pass them to
+    /// [`Node::update_relays`].
+    NoRelays {
+        blocked: Vec<RId>,
+    },
+}
+
+#[derive(Clone, PartialEq, PartialOrd, Eq, Ord)]
+pub struct Transmit {
+    /// The local interface from which this packet should be sent.
+    ///
+    /// If `None`, it can be sent from any interface.
+    /// Typically, this will be `None` for any message that needs to be sent to a relay.
+    ///
+    /// For all direct communication with another peer, this will be set and must be honored.
+    pub src: Option<SocketAddr>,
+    /// The remote the packet should be sent to.
+    pub dst: SocketAddr,
+    /// The data that should be sent.
+    pub payload: Bytes,
+    /// The ECN bits to set for the UDP packet.
+    pub ecn: Ecn,
+}
+
+impl fmt::Debug for Transmit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Transmit")
+            .field("src", &self.src)
+            .field("dst", &self.dst)
+            .field("len", &self.payload.len())
+            .finish()
+    }
+}
+
+/// The relay a packet arrived through.
+#[derive(Clone, Copy)]
+struct Relayed {
+    /// Our socket on the relay.
+    socket: Socket,
+    channel: u16,
+}
+
+#[derive(derive_more::Debug)]
+struct Connection<RId> {
+    agent: Agent,
+
+    #[debug(skip)]
+    tunnel: sanstun::Tunnel,
+    #[debug(skip)]
+    preshared_key: sanstun::StaticSecret,
+    remote_pub_key: sanstun::PublicKey,
+
+    last_proactive_handshake_sent_at: Option<Instant>,
+
+    /// The relay we have selected for this connection.
+    ///
+    /// `None` while we wait for one to become available.
+    relay: Option<RId>,
+
+    state: ConnectionState,
+    disconnected_at: Option<Instant>,
+
+    intent_sent_at: Instant,
+    candidate_timeout: Option<Instant>,
+
+    first_handshake_completed_at: Option<Instant>,
+
+    default_ice_config: IceConfig,
+    idle_ice_config: IceConfig,
+
+    poll_timeout_cache: TimeoutCache,
+}
+
+impl<RId> Connection<RId> {
+    #[must_use]
+    fn poll_timeout(&mut self) -> Option<Instant> {
+        let timeout = iter::empty()
+            .chain(self.agent.poll_timeout())
+            .chain(self.tunnel.poll_timeout())
+            .chain(self.candidate_timeout)
+            .chain(self.disconnect_timeout())
+            .chain(self.state.poll_timeout(&self.agent))
+            .min();
+
+        self.poll_timeout_cache.update(timeout)
+    }
+
+    fn disconnect_timeout(&self) -> Option<Instant> {
+        let disconnected_at = self.disconnected_at?;
+
+        Some(disconnected_at + DISCONNECT_TIMEOUT)
+    }
+}
+
+impl<RId> Connection<RId>
+where
+    RId: PartialEq + Eq + Hash + fmt::Debug + fmt::Display + Copy + Ord,
+{
+    fn is_connected(&self) -> bool {
+        matches!(
+            self.state,
+            ConnectionState::Connected { .. } | ConnectionState::Idle { .. }
+        )
+    }
+
+    fn duration_since_intent(&self, now: Instant) -> Duration {
+        now.duration_since(self.intent_sent_at)
+    }
+
+    /// Returns the socket to send application packets on, if the connection can encrypt them.
+    fn ready_socket<TId>(&self, cid: TId) -> Result<PeerSocket>
+    where
+        TId: fmt::Display,
+    {
+        let socket = match &self.state {
+            ConnectionState::Connecting { .. } => {
+                return Err(StillConnecting.into());
+            }
+            ConnectionState::Connected { peer_socket, .. } => *peer_socket,
+            ConnectionState::Idle { peer_socket } => *peer_socket,
+            ConnectionState::Failed => {
+                return Err(anyhow!("Connection {cid} failed"));
+            }
+        };
+
+        if self.first_handshake_completed_at.is_none() {
+            return Err(StillConnecting.into());
+        }
+
+        Ok(socket)
+    }
+
+    fn handle_timeout<TId>(
+        &mut self,
+        cid: TId,
+        now: Instant,
+        allocations: &mut Allocations<RId>,
+        transmits: &mut VecDeque<Transmit>,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        inflight_stun_requests: &mut InflightStunRequests<TId>,
+    ) where
+        TId: Copy + Ord + fmt::Display,
+        RId: Copy + Ord + Hash + fmt::Display,
+    {
+        let due = self.poll_timeout_cache.check(now).is_continue();
+        let _guard = due.then(|| tracing::info_span!("handle_timeout", %cid).entered());
+
+        if due {
+            self.agent.handle_timeout(now);
+            self.state
+                .handle_timeout(&mut self.agent, self.idle_ice_config, now);
+
+            if self.candidate_timeout.is_some_and(|timeout| now >= timeout) {
+                tracing::info!(state = %self.state, index = %self.tunnel.id(), "Connection failed (no candidates received)");
+                self.state = ConnectionState::Failed;
+                return;
+            }
+
+            if self
+                .disconnect_timeout()
+                .is_some_and(|timeout| now >= timeout)
+            {
+                tracing::info!(state = %self.state, index = %self.tunnel.id(), "Connection failed (ICE timeout)");
+                self.state = ConnectionState::Failed;
+                return;
+            }
+
+            // Advance unconditionally, even in `Connecting`, so a stuck bootstrap eventually
+            // surfaces `ConnectionExpired` instead of hanging.
+            self.tunnel.handle_timeout(now);
+        }
+
+        self.handle_tunnel_events(cid, allocations, transmits, pending_events, now);
+
+        if !due {
+            return;
+        }
+
+        while let Some(event) = self.agent.poll_ice_event() {
+            match event {
+                IceAgentEvent::DiscoveredRecv { .. } => {}
+                IceAgentEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                    tracing::debug!(grace_period = ?DISCONNECT_TIMEOUT, "Received ICE disconnect");
+
+                    self.disconnected_at = Some(now);
+                }
+                IceAgentEvent::IceConnectionStateChange(
+                    IceConnectionState::Checking | IceConnectionState::Connected,
+                ) => {
+                    let existing = self.disconnected_at.take();
+
+                    if let Some(disconnected_at) = existing {
+                        let offline = now.duration_since(disconnected_at);
+
+                        tracing::debug!(?offline, "ICE agent reconnected");
+                    }
+                }
+                IceAgentEvent::NominatedSend {
+                    destination,
+                    source,
+                    ..
+                } => {
+                    if let Some((r, _)) = allocations.get_mut_by_allocation(source)
+                        && self.relay != Some(r)
+                    {
+                        tracing::warn!(
+                            "Nominated a relay different from what we set out to! Weird?"
+                        );
+                    }
+
+                    let remote_socket =
+                        self.peer_socket_for_tuple(allocations, source, destination);
+
+                    let old = match mem::replace(&mut self.state, ConnectionState::Failed) {
+                        ConnectionState::Connecting { wg_buffer } => {
+                            tracing::debug!(
+                                num_buffered = %wg_buffer.len(),
+                                "Flushing WireGuard packets buffered during ICE"
+                            );
+
+                            transmits.extend(wg_buffer.into_iter().flat_map(|packet| {
+                                make_owned_transmit(
+                                    self.relay,
+                                    remote_socket,
+                                    &packet,
+                                    allocations,
+                                    now,
+                                )
+                            }));
+
+                            self.state = ConnectionState::Connected {
+                                peer_socket: remote_socket,
+                                last_activity: now,
+                            };
+
+                            // If the WireGuard handshake already completed while we were still
+                            // running ICE, the connection only becomes usable now that a socket is
+                            // nominated, so this is when we signal establishment.
+                            if self.first_handshake_completed_at.is_some() {
+                                pending_events.push_back(Event::ConnectionEstablished(cid));
+                            }
+
+                            None
+                        }
+                        ConnectionState::Connected {
+                            peer_socket,
+                            last_activity,
+                        } if peer_socket == remote_socket => {
+                            self.state = ConnectionState::Connected {
+                                peer_socket,
+                                last_activity,
+                            };
+
+                            continue; // If we re-nominate the same socket, don't just continue. TODO: Should this be fixed upstream?
+                        }
+                        ConnectionState::Connected {
+                            peer_socket,
+                            last_activity,
+                        } => {
+                            self.state = ConnectionState::Connected {
+                                peer_socket: remote_socket,
+                                last_activity,
+                            };
+
+                            Some(peer_socket)
+                        }
+                        ConnectionState::Idle { peer_socket } => {
+                            self.state = ConnectionState::Idle {
+                                peer_socket: remote_socket,
+                            };
+
+                            Some(peer_socket)
+                        }
+                        ConnectionState::Failed => continue, // Failed connections are cleaned up, don't bother handling events.
+                    };
+
+                    let relay = self.relay;
+
+                    tracing::info!(
+                        old = old.map(|s| s.fmt(relay)).map(tracing::field::display),
+                        new = %remote_socket.fmt(relay),
+                        duration_since_intent = ?self.duration_since_intent(now),
+                        "Updating remote socket"
+                    );
+
+                    if self.agent.send_wg_handshake_after_nomination() {
+                        self.initiate_wg_session(allocations, transmits, now);
+                    }
+                }
+                IceAgentEvent::IceRestart(_) | IceAgentEvent::IceConnectionStateChange(_) => {}
+            }
+        }
+
+        while let Some(event) = self.agent.poll_frostlink_event() {
+            match event {
+                frostlink::Event::PrimaryChanged { local, remote } => {
+                    let peer_socket = self.peer_socket_for_tuple(allocations, local, remote);
+                    self.adopt_frostlink_peer_socket(
+                        peer_socket,
+                        allocations,
+                        transmits,
+                        pending_events,
+                        cid,
+                        now,
+                    );
+                }
+            }
+        }
+
+        // Plaintext payloads (probes) need encapsulation; ciphertext
+        // goes straight to the wire.
+        while let Some(pt) = self.agent.poll_frostlink_transmit() {
+            let peer_socket = self.peer_socket_for_tuple(allocations, pt.local, pt.remote);
+            match pt.payload {
+                frostlink::Payload::Ciphertext(ref bytes) => {
+                    if let Some(transmit) =
+                        make_owned_transmit(self.relay, peer_socket, bytes, allocations, now)
+                    {
+                        transmits.push_back(transmit);
+                    }
+                }
+                frostlink::Payload::Plaintext(ref ip) => {
+                    if let Ok(Some(batch)) =
+                        self.encapsulate(cid, peer_socket, ip, now, allocations)
+                        && let Ok(transmit) = batch.encrypt_single(ip)
+                    {
+                        transmits.push_back(transmit);
+                    }
+                }
+            }
+        }
+
+        while let Some(transmit) = self.agent.poll_ice_transmit() {
+            let source = transmit.source;
+            let dst = transmit.destination;
+            let stun_packet_bytes = Vec::from(transmit.contents);
+            match StunMessage::parse(&stun_packet_bytes) {
+                Ok(msg) if msg.is_binding_request() => {
+                    inflight_stun_requests.add(cid, msg.trans_id(), now);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("`is` emitted invalid STUN message: {e}")
+                }
+            }
+
+            // Check if `is` wants us to send from a "remote" socket, i.e. one that we allocated with a relay.
+            let Some((relay, allocation)) = allocations.get_mut_by_allocation(source) else {
+                // `source` did not match any of our allocated sockets, must be a local one then!
+                transmits.push_back(Transmit {
+                    src: Some(source),
+                    dst,
+                    payload: Bytes::copied_from(&stun_packet_bytes),
+                    ecn: Ecn::NonEct,
+                });
+                continue;
+            };
+
+            let mut data_channel_packet = channel_data_packet_buffer(&stun_packet_bytes);
+
+            // Payload should be sent from a "remote socket", let's wrap it in a channel data message!
+            let Some(encode_ok) =
+                allocation.encode_channel_data_header(dst, &mut data_channel_packet, now)
+            else {
+                // Unlikely edge-case, drop the packet and continue.
+                tracing::trace!(%relay, peer = %dst, "Dropping packet because allocation does not offer a channel to peer");
+                continue;
+            };
+
+            transmits.push_back(Transmit {
+                src: None,
+                dst: encode_ok.socket,
+                payload: Bytes::copied_from(&data_channel_packet),
+                ecn: Ecn::NonEct,
+            });
+        }
+    }
+
+    fn handle_tunnel_events<TId>(
+        &mut self,
+        cid: TId,
+        allocations: &mut Allocations<RId>,
+        transmits: &mut VecDeque<Transmit>,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        now: Instant,
+    ) where
+        TId: Copy + fmt::Display,
+        RId: Copy + Ord + Hash + fmt::Display,
+    {
+        while let Some(event) = self.tunnel.poll_event() {
+            match event {
+                sanstun::Event::SendHandshakeInitiation(init) => match &mut self.agent {
+                    Agent::Frostlink(agent) => agent.send_handshake_initiation(init, now),
+                    Agent::Ice(_) => self.buffer_or_send(&cid, init, allocations, transmits, now),
+                },
+                sanstun::Event::SendKeepalive(keepalive) => {
+                    self.buffer_or_send(&cid, keepalive, allocations, transmits, now)
+                }
+                sanstun::Event::Established {
+                    started_at,
+                    confirmed_at,
+                } => {
+                    self.first_handshake_completed_at = Some(confirmed_at);
+                    self.agent.confirm_session(confirmed_at);
+
+                    tracing::debug!(%cid, duration_since_intent = ?self.duration_since_intent(confirmed_at), handshake_duration = ?confirmed_at.duration_since(started_at), "Completed wireguard handshake");
+
+                    // Only signal establishment once we can actually send, i.e. ICE has nominated
+                    // a socket. Otherwise, the event is emitted once a socket is nominated.
+                    if self.state.has_nominated_socket() {
+                        pending_events.push_back(Event::ConnectionEstablished(cid));
+                    }
+                }
+                sanstun::Event::ConnectionExpired => {
+                    tracing::info!(state = %self.state, index = %self.tunnel.id(), "Connection failed (wireguard tunnel expired)");
+                    self.state = ConnectionState::Failed;
+                }
+            }
+        }
+    }
+
+    fn adopt_frostlink_peer_socket<TId>(
+        &mut self,
+        peer_socket: PeerSocket,
+        allocations: &mut Allocations<RId>,
+        transmits: &mut VecDeque<Transmit>,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        cid: TId,
+        now: Instant,
+    ) where
+        TId: Copy + fmt::Display,
+    {
+        match mem::replace(&mut self.state, ConnectionState::Failed) {
+            ConnectionState::Connecting { wg_buffer } => {
+                tracing::debug!(
+                    %cid,
+                    num_wg = wg_buffer.len(),
+                    "Frostlink primary selected; flushing buffered packets",
+                );
+                transmits.extend(wg_buffer.into_iter().flat_map(|packet| {
+                    make_owned_transmit(self.relay, peer_socket, &packet, allocations, now)
+                }));
+                self.state = ConnectionState::Connected {
+                    peer_socket,
+                    last_activity: now,
+                };
+
+                // The connection only becomes usable now that a socket is
+                // selected, so this is when we signal establishment if the
+                // WireGuard handshake already completed.
+                if self.first_handshake_completed_at.is_some() {
+                    pending_events.push_back(Event::ConnectionEstablished(cid));
+                }
+            }
+            ConnectionState::Connected {
+                peer_socket: old,
+                last_activity,
+            } => {
+                if old != peer_socket {
+                    tracing::info!(%cid, ?old, new = ?peer_socket, "Updating peer socket");
+                }
+                self.state = ConnectionState::Connected {
+                    peer_socket,
+                    last_activity,
+                };
+            }
+            ConnectionState::Idle { peer_socket: old } => {
+                if old != peer_socket {
+                    tracing::info!(%cid, ?old, new = ?peer_socket, "Updating peer socket");
+                }
+                self.state = ConnectionState::Idle { peer_socket };
+            }
+            ConnectionState::Failed => {
+                self.state = ConnectionState::Failed;
+            }
+        }
+    }
+
+    /// Starts a batch of packets to send, beginning with `packet`, and decides where to send it.
+    fn encapsulate<TId>(
+        &mut self,
+        cid: TId,
+        socket: PeerSocket,
+        packet: &IpPacket,
+        now: Instant,
+        allocations: &mut Allocations<RId>,
+    ) -> Result<Option<EncapsulateBatch<'_>>>
+    where
+        TId: fmt::Display,
+    {
+        self.state
+            .on_outgoing(cid, &mut self.agent, self.default_ice_config, packet, now);
+
+        let (src, dst, relay) = match socket {
+            PeerSocket::PeerToPeer { source, dest } | PeerSocket::PeerToRelay { source, dest } => {
+                (Some(source), dest, None)
+            }
+            PeerSocket::RelayToPeer { dest: peer } | PeerSocket::RelayToRelay { dest: peer } => {
+                let relay_id = self.relay.context("No relay selected")?;
+                let allocation = allocations
+                    .get_mut_by_id(&relay_id)
+                    .with_context(|| format!("No allocation for relay {relay_id}"))?;
+                let dst = allocation
+                    .active_socket()
+                    .with_context(|| format!("No active socket for relay {relay_id}"))?;
+
+                (None, dst, Some((peer, allocation)))
+            }
+        };
+
+        let batch = self.tunnel.begin_encapsulate(now)?;
+
+        let channel = match relay {
+            Some((peer, allocation)) => {
+                // A missing channel is an expected part of channel setup (`channel_to_peer` logs
+                // it and queues a binding), so drop the packet instead of surfacing an error.
+                let Some((channel, _)) = allocation.channel_to_peer(peer, now) else {
+                    return Ok(None);
+                };
+
+                Some(channel)
+            }
+            None => None,
+        };
+
+        Ok(Some(EncapsulateBatch::new(src, dst, channel, batch)))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Handshake replies are sent while decapsulating."
+    )]
+    fn decapsulate<TId>(
+        &mut self,
+        cid: TId,
+        from: SocketAddr,
+        destination: SocketAddr,
+        packet: sanstun::ReceivedMessage,
+        message: &[u8],
+        allocations: &mut Allocations<RId>,
+        transmits: &mut VecDeque<Transmit>,
+        now: Instant,
+    ) -> ControlFlow<Result<()>, sanstun::DecapsulateBatch<'_>>
+    where
+        TId: fmt::Display,
+        RId: Ord + Hash + fmt::Display + Copy,
+    {
+        let path = (destination, from);
+
+        match packet {
+            sanstun::ReceivedMessage::HandshakeInitiation(init) => {
+                let result = match &mut self.agent {
+                    Agent::Frostlink(agent) => {
+                        agent.handle_handshake_initiation(&mut self.tunnel, init, path, now)
+                    }
+                    Agent::Ice(_) => self
+                        .tunnel
+                        .handle_handshake_initiation(init, now)
+                        .map(|reply| self.buffer_or_send(&cid, reply, allocations, transmits, now)),
+                };
+
+                ControlFlow::Break(result.context("handshake packet"))
+            }
+            sanstun::ReceivedMessage::HandshakeResponse(response) => {
+                let result = match &mut self.agent {
+                    Agent::Frostlink(agent) => agent.handle_handshake_response(
+                        &mut self.tunnel,
+                        response,
+                        message,
+                        path,
+                        now,
+                    ),
+                    Agent::Ice(_) => self
+                        .tunnel
+                        .handle_handshake_response(response, now)
+                        .map(|reply| self.buffer_or_send(&cid, reply, allocations, transmits, now)),
+                };
+                if result.is_ok() {
+                    self.restore_rekey_attempt_time();
+                }
+
+                ControlFlow::Break(result.context("handshake packet"))
+            }
+            sanstun::ReceivedMessage::CookieReply(reply) => ControlFlow::Break(
+                self.tunnel
+                    .handle_cookie_reply(reply, now)
+                    .context("cookie reply"),
+            ),
+            sanstun::ReceivedMessage::TransportData(data) => {
+                match self.tunnel.begin_decapsulate(data, now) {
+                    Ok(batch) => ControlFlow::Continue(batch),
+                    Err(e) => ControlFlow::Break(Err(anyhow::Error::new(e).context("data packet"))),
+                }
+            }
+        }
+    }
+
+    /// Hands the probes to the agent and returns the data packets.
+    fn commit_decrypted<TId>(
+        &mut self,
+        cid: TId,
+        path: (SocketAddr, SocketAddr),
+        data: sanstun::DecryptedBatch<Result<IpPacket>>,
+        probes: sanstun::DecryptedBatch<frostlink::Probe>,
+        now: Instant,
+    ) -> Result<sanstun::CommittedBatch<Result<IpPacket>>>
+    where
+        TId: fmt::Display + Copy,
+        RId: Ord + fmt::Display + Copy,
+    {
+        if !probes.is_empty() {
+            let probes = self
+                .tunnel
+                .commit_decapsulate(probes, now)
+                .context("Failed to commit path probes")
+                .with_context(|| format!("cid={cid}"))?;
+
+            for probe in probes {
+                let probe = match probe {
+                    Ok(sanstun::Committed::Data { buffer: probe, .. }) => probe,
+                    Ok(sanstun::Committed::Keepalive) => continue,
+                    Err(e) => {
+                        tracing::debug!(%cid, "Failed to commit probe: {e}");
+                        continue;
+                    }
+                };
+
+                self.state
+                    .on_incoming(cid, &mut self.agent, self.default_ice_config, &probe, now);
+                self.agent.handle_probe(probe, path, now);
+            }
+        }
+
+        let committed = self
+            .tunnel
+            .commit_decapsulate(data, now)
+            .context("Failed to commit data packets")
+            .with_context(|| format!("cid={cid}"))?;
+
+        if let Some(packet) = committed.data().find_map(|packet| packet.as_ref().ok()) {
+            self.state
+                .on_incoming(cid, &mut self.agent, self.default_ice_config, packet, now);
+            self.agent.handle_inbound_data(now);
+        }
+
+        Ok(committed)
+    }
+
+    fn restore_rekey_attempt_time(&mut self) {
+        if self.tunnel.rekey_attempt_time() != SUSPECTED_REKEY_ATTEMPT_TIME {
+            return;
+        }
+
+        self.tunnel
+            .set_rekey_attempt_time(FROSTLINK_REKEY_ATTEMPT_TIME);
+    }
+
+    fn buffer_or_send<TId>(
+        &mut self,
+        cid: &TId,
+        message: sanstun::Datagram,
+        allocations: &mut Allocations<RId>,
+        transmits: &mut VecDeque<Transmit>,
+        now: Instant,
+    ) where
+        TId: fmt::Display,
+        RId: Ord + fmt::Display + Copy,
+    {
+        match &mut self.state {
+            ConnectionState::Connecting { wg_buffer, .. } => {
+                tracing::debug!(%cid, "No socket has been nominated yet, buffering WG packet");
+
+                wg_buffer.enqueue(message);
+            }
+            ConnectionState::Connected { peer_socket, .. }
+            | ConnectionState::Idle { peer_socket } => {
+                transmits.extend(make_owned_transmit(
+                    self.relay,
+                    *peer_socket,
+                    &message,
+                    allocations,
+                    now,
+                ));
+            }
+            ConnectionState::Failed => {}
+        }
+    }
+
+    fn peer_socket_for_tuple(
+        &self,
+        allocations: &mut Allocations<RId>,
+        local: SocketAddr,
+        from: SocketAddr,
+    ) -> PeerSocket
+    where
+        RId: Ord + Hash + fmt::Display + Copy,
+    {
+        let source_relay = allocations.get_mut_by_allocation(local).map(|(r, _)| r);
+        let dest_is_relay = self.agent.remote_candidate_is_relayed(from);
+
+        match (source_relay, dest_is_relay) {
+            (None, false) => PeerSocket::PeerToPeer {
+                source: local,
+                dest: from,
+            },
+            (None, true) => PeerSocket::PeerToRelay {
+                source: local,
+                dest: from,
+            },
+            (Some(_), false) => PeerSocket::RelayToPeer { dest: from },
+            (Some(_), true) => PeerSocket::RelayToRelay { dest: from },
+        }
+    }
+
+    fn reset_for_roam(&mut self, now: Instant)
+    where
+        RId: Ord + Hash + fmt::Display + Copy,
+    {
+        self.agent.rebuild_frostlink(|_| true, now);
+    }
+
+    /// Frostlink-only. Receiver rediscovers the connection by the
+    /// init's sender pubkey.
+    fn reset_path_for_relay_replacement<TId>(
+        &mut self,
+        cid: TId,
+        allocation: &Allocation,
+        now: Instant,
+    ) where
+        TId: fmt::Display,
+        RId: Ord + Hash + fmt::Display + Copy,
+    {
+        debug_assert!(
+            self.agent.is_frostlink(),
+            "reset_path_for_relay_replacement is frostlink-only"
+        );
+
+        // Host + reflexive per allocation.
+        let dropped = allocation
+            .current_relay_candidates()
+            .map(|c| crate::candidate::to_frostlink(&c))
+            .collect::<SmallVec<[_; 2]>>();
+        self.agent.rebuild_frostlink(|c| dropped.contains(c), now);
+
+        tracing::info!(%cid, "Reset frostlink path-agent after relay invalidation");
+    }
+
+    fn initiate_wg_session(
+        &mut self,
+        allocations: &mut Allocations<RId>,
+        transmits: &mut VecDeque<Transmit>,
+        now: Instant,
+    ) where
+        RId: Copy,
+    {
+        let Some(socket) = self.socket() else {
+            tracing::debug!("Cannot initiate WG session without a socket");
+            return;
+        };
+
+        // If we have sent a handshake in the last 20s, don't bother making a new session.
+        // Our re-key timeout is 15s, meaning if more than 20s have passed and we are still
+        // here, we have a working connection and can refresh it.
+        if let Some(last_handshake) = self
+            .last_proactive_handshake_sent_at
+            .map(|last_sent_at| now.duration_since(last_sent_at))
+            && last_handshake < Duration::from_secs(20)
+        {
+            tracing::debug!(?last_handshake, "Suppressing repeated handshake");
+
+            return;
+        }
+
+        let Some(bytes) = self.tunnel.initiate_handshake(now) else {
+            tracing::debug!("Another handshake is already in progress");
+
+            return;
+        };
+
+        self.last_proactive_handshake_sent_at = Some(now);
+
+        if let Some(transmit) = make_owned_transmit(self.relay, socket, &bytes, allocations, now) {
+            transmits.push_back(transmit);
+        }
+    }
+
+    fn add_local_candidate<TId>(
+        &mut self,
+        cid: TId,
+        candidate: &Candidate,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        now: Instant,
+    ) where
+        TId: fmt::Display + Copy,
+    {
+        if let Some(candidate) = self.agent.add_local_candidate(candidate.clone(), now) {
+            let frostlink = self.agent.is_frostlink();
+            pending_events.push_back(new_ice_candidate_event(cid, candidate, frostlink));
+        }
+
+        self.state
+            .on_candidate(cid, &mut self.agent, self.default_ice_config, now);
+    }
+
+    fn remove_local_candidate<TId>(
+        &mut self,
+        id: TId,
+        candidate: &Candidate,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        now: Instant,
+    ) where
+        TId: fmt::Display,
+    {
+        if candidate.kind() != CandidateKind::Relayed {
+            debug_assert_eq!(
+                candidate.kind(),
+                CandidateKind::Relayed,
+                "we should only ever invalidate relay candidates"
+            );
+            return;
+        }
+
+        self.invalidate_local_candidate(id, candidate, pending_events, now);
+    }
+
+    fn invalidate_local_candidate<TId>(
+        &mut self,
+        id: TId,
+        candidate: &Candidate,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        now: Instant,
+    ) {
+        let was_present = self.agent.invalidate_candidate(candidate, now);
+
+        if was_present {
+            pending_events.push_back(Event::InvalidateIceCandidate {
+                connection: id,
+                candidate: crate::candidate::encode(self.agent.is_frostlink(), candidate),
+            })
+        }
+    }
+
+    fn add_remote_candidate<TId>(&mut self, cid: TId, candidate: Candidate, now: Instant)
+    where
+        TId: fmt::Display,
+    {
+        self.agent.add_remote_candidate(candidate, now);
+        self.candidate_timeout = None;
+
+        generate_optimistic_candidates(&mut self.agent, now);
+
+        // Make sure we move out of idle mode when we add new candidates.
+        self.state
+            .on_candidate(cid, &mut self.agent, self.default_ice_config, now);
+    }
+
+    fn remove_remote_candidate<TId>(&mut self, cid: TId, candidate: Candidate, now: Instant)
+    where
+        TId: fmt::Display,
+    {
+        self.agent.invalidate_candidate(&candidate, now);
+        self.agent.handle_timeout(now); // We may have invalidated the last candidate, ensure we check our nomination state.
+
+        self.state
+            .on_candidate(cid, &mut self.agent, self.default_ice_config, now)
+    }
+
+    fn socket(&self) -> Option<PeerSocket> {
+        match self.state {
+            ConnectionState::Connected { peer_socket, .. }
+            | ConnectionState::Idle { peer_socket } => Some(peer_socket),
+            ConnectionState::Connecting { .. } | ConnectionState::Failed => None,
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(self.state, ConnectionState::Failed)
+    }
+
+    fn clear_relay<TId>(&mut self, cid: TId)
+    where
+        TId: fmt::Display,
+    {
+        if let Some(rid) = self.relay.take() {
+            tracing::debug!(%cid, %rid, "Cleared relay of connection");
+        }
+    }
+
+    /// Samples a relay for this connection and seeds the agent with its candidates.
+    fn assign_relay<TId>(
+        &mut self,
+        cid: TId,
+        allocations: &mut Allocations<RId>,
+        pending_events: &mut VecDeque<Event<TId, RId>>,
+        now: Instant,
+    ) where
+        TId: fmt::Display + Copy,
+    {
+        let Some(rid) = allocations.sample() else {
+            return;
+        };
+
+        tracing::debug!(%cid, %rid, "Selected relay");
+
+        self.relay = Some(rid);
+
+        // The full set, not just the relay candidates: a new or roamed agent has
+        // no local candidates, so host and reflexive candidates need seeding too.
+        // The agent dedups, so candidates it already knows are not re-signalled.
+        for candidate in allocations.candidates_for_relay(&rid) {
+            self.add_local_candidate(cid, &candidate, pending_events, now);
+        }
+    }
+}
+
+fn new_interface(rng: &mut impl Rng, now: Instant, unix_ts: Duration) -> sanstun::Interface {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut seed[..]);
+
+    sanstun::Interface::new(seed, now, unix_ts).with_handshake_limit(HANDSHAKE_RATE_LIMIT)
+}
+
+#[must_use]
+fn make_owned_transmit<RId>(
+    relay: Option<RId>,
+    socket: PeerSocket,
+    message: &[u8],
+    allocations: &mut Allocations<RId>,
+    now: Instant,
+) -> Option<Transmit>
+where
+    RId: Ord + Hash + fmt::Display + Copy,
+{
+    let transmit = match socket {
+        PeerSocket::PeerToPeer {
+            dest: remote,
+            source,
+        }
+        | PeerSocket::PeerToRelay {
+            dest: remote,
+            source,
+        } => Transmit {
+            src: Some(source),
+            dst: remote,
+            payload: Bytes::copied_from(message),
+            ecn: Ecn::NonEct,
+        },
+        PeerSocket::RelayToPeer { dest: peer } | PeerSocket::RelayToRelay { dest: peer } => {
+            let allocation = allocations.get_mut_by_id(&relay?)?;
+
+            let mut channel_data = channel_data_packet_buffer(message);
+            let encode_ok = allocation.encode_channel_data_header(peer, &mut channel_data, now)?;
+
+            Transmit {
+                src: None,
+                dst: encode_ok.socket,
+                payload: Bytes::copied_from(&channel_data),
+                ecn: Ecn::NonEct,
+            }
+        }
+    };
+
+    Some(transmit)
+}
+
+fn new_agent(role: IceRole) -> IceAgent {
+    let mut agent = IceAgent::new(is::IceCreds::new());
+    agent.set_controlling(matches!(role, IceRole::Controlling));
+    agent.set_timing_advance(Duration::ZERO);
+
+    agent
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    use super::*;
+
+    #[test]
+    fn client_default_ice_timeout() {
+        let mut agent = new_agent(IceRole::Controlling);
+
+        IceConfig::client_default().apply(&mut agent);
+
+        assert_eq!(agent.ice_timeout(), Duration::from_millis(16500))
+    }
+
+    // Our WireGuard rekey attempt time must be greater than the ICE timeout,
+    // otherwise we cannot migrate an existing tunnel to a new candidate pair.
+    #[test]
+    fn client_default_ice_timeout_less_than_wg_rekey_attempt_time() {
+        let mut agent = new_agent(IceRole::Controlling);
+
+        IceConfig::client_default().apply(&mut agent);
+
+        assert!(agent.ice_timeout() < WG_REKEY_ATTEMPT_TIME)
+    }
+
+    #[test]
+    fn client_idle_ice_timeout() {
+        let mut agent = new_agent(IceRole::Controlling);
+
+        IceConfig::client_idle().apply(&mut agent);
+
+        assert_eq!(agent.ice_timeout(), Duration::from_secs(100))
+    }
+
+    #[test]
+    fn server_default_ice_timeout() {
+        let mut agent = new_agent(IceRole::Controlling);
+
+        IceConfig::server_default().apply(&mut agent);
+
+        assert_eq!(agent.ice_timeout(), Duration::from_millis(615_500))
+    }
+
+    #[test]
+    fn server_idle_ice_timeout() {
+        let mut agent = new_agent(IceRole::Controlling);
+
+        IceConfig::server_idle().apply(&mut agent);
+
+        assert_eq!(agent.ice_timeout(), Duration::from_secs(1000))
+    }
+
+    #[test]
+    fn generates_correct_optimistic_candidates() {
+        let base = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 52625));
+        let addr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+        let host = Candidate::host(base, "udp").unwrap();
+        let srvflx =
+            Candidate::server_reflexive(SocketAddr::new(addr, 40000), base, "udp").unwrap();
+
+        let now = Instant::now();
+        let mut agent = Agent::ice(IceAgent::new(is::IceCreds::new()));
+        agent.add_remote_candidate(host, now);
+        agent.add_remote_candidate(srvflx, now);
+
+        generate_optimistic_candidates(&mut agent, now);
+
+        let expected_candidate =
+            Candidate::server_reflexive(SocketAddr::new(addr, 52625), base, "udp").unwrap();
+
+        assert!(agent.remote_candidates().contains(&expected_candidate))
+    }
+
+    #[test]
+    fn skips_optimistic_candidates_for_ipv6() {
+        let base = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(10, 0, 0, 0, 0, 0, 0, 1),
+            52625,
+            0,
+            0,
+        ));
+        let addr = IpAddr::V6(Ipv6Addr::new(1, 1, 1, 1, 1, 1, 1, 1));
+
+        let host = Candidate::host(base, "udp").unwrap();
+        let srvflx =
+            Candidate::server_reflexive(SocketAddr::new(addr, 40000), base, "udp").unwrap();
+
+        let now = Instant::now();
+        let mut agent = Agent::ice(IceAgent::new(is::IceCreds::new()));
+        agent.add_remote_candidate(host, now);
+        agent.add_remote_candidate(srvflx, now);
+
+        generate_optimistic_candidates(&mut agent, now);
+
+        let unexpected_candidate =
+            Candidate::server_reflexive(SocketAddr::new(addr, 52625), base, "udp").unwrap();
+
+        assert!(!agent.remote_candidates().contains(&unexpected_candidate))
+    }
+
+    #[test]
+    fn limits_optimistic_ipv4_candidates_to_2() {
+        let base = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 52625));
+        let addr1 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let addr2 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2));
+        let addr3 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 3));
+
+        let host = Candidate::host(base, "udp").unwrap();
+        let srflx1 =
+            Candidate::server_reflexive(SocketAddr::new(addr1, 40000), base, "udp").unwrap();
+        let srflx2 =
+            Candidate::server_reflexive(SocketAddr::new(addr2, 40000), base, "udp").unwrap();
+        let srflx3 =
+            Candidate::server_reflexive(SocketAddr::new(addr3, 40000), base, "udp").unwrap();
+
+        let now = Instant::now();
+        let mut agent = Agent::ice(IceAgent::new(is::IceCreds::new()));
+        agent.add_remote_candidate(host, now);
+        agent.add_remote_candidate(srflx1, now);
+        agent.add_remote_candidate(srflx2, now);
+        agent.add_remote_candidate(srflx3, now);
+
+        generate_optimistic_candidates(&mut agent, now);
+
+        let expected_candidate1 =
+            Candidate::server_reflexive(SocketAddr::new(addr1, 52625), base, "udp").unwrap();
+        let expected_candidate2 =
+            Candidate::server_reflexive(SocketAddr::new(addr2, 52625), base, "udp").unwrap();
+        let unexpected_candidate3 =
+            Candidate::server_reflexive(SocketAddr::new(addr3, 52625), base, "udp").unwrap();
+
+        assert!(agent.remote_candidates().contains(&expected_candidate1));
+        assert!(agent.remote_candidates().contains(&expected_candidate2));
+        assert!(!agent.remote_candidates().contains(&unexpected_candidate3));
+    }
+}

@@ -1,0 +1,726 @@
+# Couple rules:
+#
+# 1. This file should contain all supported application environment variables,
+# even if they are overridden in `runtime.exs`, because it's the main source of
+# truth and self-documentation.
+#
+# 2. The configurations here should be as close to `dev` environment as possible,
+# to prevent having too many overrides in other files.
+import Config
+
+parse_log_level = fn
+  nil ->
+    :info
+
+  value ->
+    case value |> String.trim() |> String.downcase() do
+      "debug" -> :debug
+      "info" -> :info
+      "warning" -> :warning
+      "warn" -> :warning
+      "error" -> :error
+      _ -> :info
+    end
+end
+
+###############################
+##### Portal ##################
+###############################
+
+config :portal, ecto_repos: [Portal.Repo]
+config :portal, generators: [binary_id: true]
+
+config :req,
+  default_options: [plugins: [Portal.Req.SSRFProtection]]
+
+config :portal, Portal.OAuth.ClientMetadata,
+  req_opts: [],
+  ssrf_protection_opts: []
+
+config :portal, sql_sandbox: false
+
+config :portal, flow_logs_upload_batch_size: 1000
+
+# Don't run manual migrations by default
+config :portal, run_manual_migrations: false
+
+config :portal, data_residency_region: :on_prem
+config :portal, slug_registry_table_url: nil
+
+config :portal, Portal.Repo,
+  hostname: "localhost",
+  username: "postgres",
+  password: "postgres",
+  database: "firezone_dev",
+  show_sensitive_data_on_connection_error: true,
+  pool_size: :erlang.system_info(:logical_processors_available) * 2,
+  queue_target: 500,
+  queue_interval: 1000,
+  migration_timestamps: [type: :timestamptz],
+  migration_lock: :pg_advisory_lock,
+  start_apps_before_migration: [:ssl, :logger_json, :req],
+  parameters: [application_name: "portal"]
+
+# Isolated connection pools (web/api/job/poller)
+for {repo, app_name} <- [
+      {Portal.Repo.Web, "web"},
+      {Portal.Repo.Api, "api"},
+      {Portal.Repo.Job, "job"},
+      {Portal.Repo.Poller, "poller"}
+    ] do
+  config :portal, repo,
+    hostname: "localhost",
+    username: "postgres",
+    password: "postgres",
+    database: "firezone_dev",
+    show_sensitive_data_on_connection_error: true,
+    pool_size: :erlang.system_info(:logical_processors_available) * 2,
+    queue_target: 500,
+    queue_interval: 1000,
+    parameters: [application_name: app_name]
+end
+
+config :portal, Portal.ChangeLogs.Consumer,
+  repo: Portal.Repo.Poller,
+  replication_slot_name: "change_logs_slot",
+  publication_name: "change_logs_publication",
+  region: "",
+  enabled: true,
+  # When changing these, make sure to also:
+  #   1. Make appropriate changes to `Portal.ChangeLogs.Consumer`
+  #   2. Add tests and test WAL locally
+  table_subscriptions: ~w[
+    accounts
+    account_slugs
+    memberships
+    groups
+    actors
+    external_identities
+    google_auth_providers
+    github_auth_providers
+    entra_auth_providers
+    okta_auth_providers
+    oidc_auth_providers
+    email_otp_auth_providers
+    userpass_auth_providers
+    x509_auth_providers
+    entra_directories
+    okta_directories
+    google_directories
+    devices
+    sites
+    gateway_tokens
+    policies
+    resources
+    client_tokens
+    one_time_passcodes
+    api_tokens
+    trust_anchors
+    trust_anchor_certificates
+    intune_posture_providers
+    iru_posture_providers
+    defender_posture_providers
+    santa_posture_providers
+    sentinelone_posture_providers
+    sophos_posture_providers
+    splunk_log_sinks
+    datadog_log_sinks
+    newrelic_log_sinks
+    elastic_log_sinks
+    sentinel_log_sinks
+    s3_log_sinks
+    qradar_log_sinks
+    http_log_sinks
+  ],
+  # Allow up to 5 minutes of processing lag before alerting. This needs to be able to survive
+  # deploys without alerting.
+  warning_threshold: :timer.minutes(5),
+
+  # We almost never want to bypass changelog inserts
+  error_threshold: :timer.hours(30 * 24),
+
+  # The audit trail tolerates more latency in exchange for fewer poll queries
+  poll_interval: :timer.seconds(30),
+  batch_size: 500
+
+config :portal, Portal.Changes.Consumer,
+  repo: Portal.Repo.Poller,
+  replication_slot_name: "changes_slot",
+  publication_name: "changes_publication",
+  region: "",
+  enabled: true,
+  # When changing these, make sure to also:
+  #   1. Make appropriate changes to `Portal.Changes.Consumer`
+  #   2. Add an appropriate `Portal.Changes.Hooks` module
+  #   3. Add tests and test WAL locally
+  table_subscriptions: ~w[
+    accounts
+    account_slugs
+    actors
+    groups
+    memberships
+    devices
+    external_identities
+    policy_authorizations
+    gateway_tokens
+    sites
+    policies
+    resources
+    client_tokens
+    google_auth_providers
+    github_auth_providers
+    entra_auth_providers
+    okta_auth_providers
+    oidc_auth_providers
+    email_otp_auth_providers
+    userpass_auth_providers
+    x509_auth_providers
+    entra_directories
+    okta_directories
+    google_directories
+    intune_posture_providers
+    iru_posture_providers
+    defender_posture_providers
+    santa_posture_providers
+    sentinelone_posture_providers
+    sophos_posture_providers
+    intune_devices
+    iru_devices
+    defender_devices
+    santa_devices
+    sentinelone_devices
+    sophos_devices
+    relay_tokens
+    portal_sessions
+    trust_anchor_certificates
+  ],
+  # Allow up to 60 seconds of lag before alerting
+  warning_threshold: :timer.seconds(60),
+
+  # Allow up to 30 minutes of lag before bypassing hooks
+  error_threshold: :timer.minutes(30),
+
+  # Changes power cache invalidation; balance broadcast latency against poll query volume
+  poll_interval: :timer.seconds(5),
+  batch_size: 500
+
+config :portal, Portal.Tokens,
+  key_base: "5OVYJ83AcoQcPmdKNksuBhJFBhjHD1uUa9mDOHV/6EIdBQ6pXksIhkVeWIzFk5S2",
+  salt: "t01wa0K4lUd7mKa0HAtZdE+jFOPDDej2"
+
+config :portal, Portal.Telemetry,
+  metrics_reporter: nil,
+  enabled: true
+
+config :portal, Portal.Health,
+  web_endpoint: PortalWeb.Endpoint,
+  api_endpoint: PortalAPI.Endpoint,
+  ops_endpoint: PortalOps.Endpoint,
+  # TODO: Remove draining_file_path after Azure migration is complete
+  draining_file_path: "/var/run/firezone/draining"
+
+config :portal, Portal.Azure.ManagedIdentity,
+  endpoint: "http://169.254.169.254",
+  client_id: nil,
+  req_opts: [
+    connect_options: [timeout: 1_000],
+    receive_timeout: 5_000,
+    retry: :transient
+  ]
+
+config :portal, Portal.OTLP.MetricsExporter,
+  req_opts: [
+    connect_options: [timeout: 1_000],
+    receive_timeout: 5_000,
+    retry: :transient,
+    max_retries: 2
+  ]
+
+config :portal, Portal.OTLP.TracesExporter,
+  sample_ratio: 0.01,
+  req_opts: [
+    connect_options: [timeout: 1_000],
+    receive_timeout: 5_000,
+    retry: :transient,
+    max_retries: 2
+  ]
+
+config :portal, Portal.SlugRegistry.AzureTable,
+  req_opts: [
+    connect_options: [timeout: 2_000],
+    receive_timeout: 5_000,
+    retry: :transient
+  ]
+
+config :portal, Portal.Microsoft.Graph.APIClient,
+  endpoint: "https://graph.microsoft.com",
+  token_base_url: "https://login.microsoftonline.com",
+  applications: [
+    entra: [
+      client_id: System.get_env("ENTRA_SYNC_CLIENT_ID"),
+      client_secret: System.get_env("ENTRA_SYNC_CLIENT_SECRET")
+    ],
+    intune: [
+      client_id: System.get_env("INTUNE_SYNC_CLIENT_ID"),
+      client_secret: System.get_env("INTUNE_SYNC_CLIENT_SECRET")
+    ],
+    windows_updates: [
+      client_id: System.get_env("WINDOWS_UPDATES_CLIENT_ID"),
+      client_secret: System.get_env("WINDOWS_UPDATES_CLIENT_SECRET")
+    ]
+  ],
+  req_opts: [
+    # 15 minutes
+    receive_timeout: 900_000,
+    # Fixes `pool_not_available` errors on a cold Finch pool right after a deploy,
+    # since some requests are POSTs and the default `:safe_transient` retry strategy only retries HEADS and GETs.
+    retry: :transient
+  ]
+
+# Defender for Endpoint is reached at api.security.microsoft.com, but tokens
+# still have to be minted for the legacy api.securitycenter.microsoft.com
+# audience or the API answers 403.
+config :portal, Portal.Defender.APIClient,
+  endpoint: "https://api.security.microsoft.com",
+  token_base_url: "https://login.microsoftonline.com",
+  token_scope: "https://api.securitycenter.microsoft.com/.default",
+  client_id: System.get_env("DEFENDER_SYNC_CLIENT_ID"),
+  client_secret: System.get_env("DEFENDER_SYNC_CLIENT_SECRET"),
+  req_opts: [
+    # 15 minutes
+    receive_timeout: 900_000,
+    # Fixes `pool_not_available` errors on a cold Finch pool right after a deploy,
+    # since the token request is a POST and the default `:safe_transient` retry
+    # strategy only retries HEADS and GETs.
+    retry: :transient
+  ]
+
+# Iru still serves its API from the Kandji hosts it used before the rename, so
+# the domains are configuration rather than a constant.
+config :portal, Portal.Iru.APIClient,
+  api_domains: [us: "api.kandji.io", eu: "api.eu.kandji.io"],
+  req_opts: [
+    # 15 minutes
+    receive_timeout: 900_000,
+    retry: :safe_transient
+  ]
+
+config :portal, Portal.Santa.APIClient,
+  req_opts: [
+    # 15 minutes
+    receive_timeout: 900_000,
+    retry: :safe_transient
+  ]
+
+config :portal, Portal.SentinelOne.APIClient,
+  req_opts: [
+    # 15 minutes
+    receive_timeout: 900_000,
+    retry: :safe_transient
+  ]
+
+config :portal, Portal.Sophos.APIClient,
+  req_opts: [
+    # 15 minutes
+    receive_timeout: 900_000,
+    retry: :safe_transient
+  ]
+
+config :portal, Portal.Google.APIClient,
+  endpoint: "https://admin.googleapis.com",
+  service_account_key: System.get_env("GOOGLE_SERVICE_ACCOUNT_KEY"),
+  service_account_email: System.get_env("GOOGLE_SERVICE_ACCOUNT_EMAIL"),
+  workload_identity_provider: System.get_env("GOOGLE_WORKLOAD_IDENTITY_PROVIDER"),
+  workload_identity_audience: System.get_env("GOOGLE_WORKLOAD_IDENTITY_AUDIENCE"),
+  sts_endpoint: "https://sts.googleapis.com/v1/token",
+  iam_credentials_endpoint: "https://iamcredentials.googleapis.com",
+  token_endpoint: "https://oauth2.googleapis.com/token",
+  req_opts: [
+    # 1 minute
+    receive_timeout: 60_000
+    # Don't set :retry here; Portal.Google.APIClient owns the strategy.
+  ]
+
+config :portal, Portal.TokenCache, enabled: true
+
+config :portal, Portal.Google.AuthProvider,
+  # Should match an external OAuth2 client in Google Cloud Console
+  client_id: System.get_env("GOOGLE_OIDC_CLIENT_ID"),
+  client_secret: System.get_env("GOOGLE_OIDC_CLIENT_SECRET"),
+  response_type: "code",
+  scope: "openid email profile",
+  discovery_document_uri: "https://accounts.google.com/.well-known/openid-configuration"
+
+config :portal, Portal.GitHub.AuthProvider,
+  # Should match an OAuth App registered under the Firezone GitHub organization
+  client_id: System.get_env("GITHUB_OAUTH_CLIENT_ID"),
+  client_secret: System.get_env("GITHUB_OAUTH_CLIENT_SECRET"),
+  authorize_endpoint: "https://github.com/login/oauth/authorize",
+  token_endpoint: "https://github.com/login/oauth/access_token",
+  api_endpoint: "https://api.github.com",
+  req_opts: []
+
+config :portal, Portal.Google.SyncAuthorization,
+  # Dedicated OAuth client used only to authorize Google Workspace directory setup
+  client_id: System.get_env("GOOGLE_SYNC_AUTHZ_CLIENT_ID"),
+  client_secret: System.get_env("GOOGLE_SYNC_AUTHZ_CLIENT_SECRET"),
+  response_type: "code",
+  scope: "openid email",
+  discovery_document_uri: "https://accounts.google.com/.well-known/openid-configuration"
+
+config :portal, Portal.Okta.AuthProvider,
+  # Should match an external OAuth2 client in Okta
+  response_type: "code",
+  scope: "openid email profile"
+
+# 15 minutes in milliseconds
+config :portal, Portal.Okta.APIClient, req_opts: [receive_timeout: 900_000]
+
+config :portal, Portal.Analytics.PostHog,
+  enabled: false,
+  host: nil,
+  project_api_key: nil,
+  web_external_url: nil,
+  req_opts: [receive_timeout: 5_000, retry: :transient]
+
+config :portal, Portal.Mailer.PostureProviderInterestEmail, recipient: nil
+
+config :portal, Portal.Workers.SignUpFollowUp, from_email: nil, bcc_email: nil
+
+# Log sink deliveries are POSTs (S3: PUTs), which the default `:safe_transient`
+# retry strategy never retries. Redelivery is safe: destinations dedupe on log_id.
+config :portal, Portal.Splunk.APIClient, req_opts: [retry: :transient]
+
+config :portal, Portal.Datadog.APIClient, req_opts: [retry: :transient]
+
+config :portal, Portal.NewRelic.APIClient, req_opts: [retry: :transient]
+
+config :portal, Portal.Elastic.APIClient, req_opts: [retry: :transient]
+
+config :portal, Portal.Sentinel.APIClient,
+  client_id: System.get_env("SENTINEL_SYNC_CLIENT_ID"),
+  client_secret: System.get_env("SENTINEL_SYNC_CLIENT_SECRET"),
+  token_base_url: "https://login.microsoftonline.com",
+  discovery_document_uri:
+    "https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration",
+  req_opts: [retry: :transient]
+
+config :portal, Portal.S3.APIClient,
+  req_opts: [retry: :transient],
+  access_key_id: nil,
+  secret_access_key: nil,
+  session_token: nil,
+  aws_account_id: System.get_env("LOG_SINKS_AWS_ACCOUNT_ID", "000000000000")
+
+config :portal, Portal.QRadar.APIClient, req_opts: [retry: :transient]
+config :portal, Portal.HTTP.APIClient, req_opts: [retry: :transient]
+
+config :portal, Portal.Entra.AuthProvider,
+  # Should match an external OAuth2 client in Azure
+  client_id: System.get_env("ENTRA_OIDC_CLIENT_ID"),
+  client_secret: System.get_env("ENTRA_OIDC_CLIENT_SECRET"),
+  response_type: "code",
+  scope: "openid email profile",
+  discovery_document_uri:
+    "https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration"
+
+config :portal, Portal.OIDC.AuthProvider,
+  response_type: "code",
+  scope: "openid email profile"
+
+config :portal, Portal.Billing.Stripe.APIClient, endpoint: "https://api.stripe.com"
+
+config :portal, Portal.Billing,
+  enabled: true,
+  secret_key: "sk_test_1111",
+  webhook_signing_secret: "whsec_test_1111",
+  default_price_id: "price_1OkUIcADeNU9NGxvTNA4PPq6",
+  # Stripe sandbox/test mode product IDs
+  plan_product_ids: [
+    # Starter
+    "prod_PZdZiSBX1HdXO2",
+    # Team
+    "prod_PZdbLazRNU3Bdi",
+    # Business
+    "prod_VMyDXDNwtDbpYa",
+    # Enterprise
+    "prod_PZdb7NJhcdyjRV"
+  ]
+
+config :portal, Portal.Crl.Sync, req_opts: []
+
+config :portal, Portal.Ocsp.Sync, req_opts: []
+
+config :portal, Portal.OSReleases, reload_every: :timer.minutes(10)
+config :portal, Portal.OSReleases.Sync, req_opts: []
+
+config :portal, Portal.ComponentVersions,
+  firezone_releases_url: "https://www.firezone.dev/api/releases",
+  fetch_from_url: true,
+  versions: [
+    apple: "1.5.14",
+    android: "1.5.9",
+    gateway: "1.5.1",
+    gui: "1.5.11",
+    headless: "1.5.7"
+  ]
+
+config :portal, Portal.ClockDriftAlarm, enabled: true
+
+config :portal, Portal.Cluster,
+  adapter: nil,
+  adapter_config: []
+
+config :portal, sign_up_whitelisted_domains: []
+
+config :portal, docker_registry: "ghcr.io/firezone"
+
+config :portal, outbound_email_adapter_configured?: false
+
+config :portal, relay_presence_topic: "presences:relays"
+
+config :portal, region: ""
+
+config :portal, web_external_url: "https://localhost:13443"
+
+config :portal, client_handler: "firezone-fd0020211111://"
+
+###############################
+##### PortalWeb Endpoint ######
+###############################
+
+config :portal, PortalWeb.Endpoint,
+  adapter: Bandit.PhoenixAdapter,
+  url: [
+    scheme: "http",
+    host: "localhost",
+    port: 13_000,
+    path: nil
+  ],
+  render_errors: [
+    formats: [
+      html: PortalWeb.ErrorHTML,
+      json: PortalWeb.ErrorJSON,
+      xml: PortalWeb.ErrorXML
+    ],
+    layout: false
+  ],
+  pubsub_server: Portal.PubSub,
+  secret_key_base: "5OVYJ83AcoQcPmdKNksuBhJFBhjHD1uUa9mDOHV/6EIdBQ6pXksIhkVeWIzFk5SD",
+  live_view: [
+    signing_salt: "t01wa0K4lUd7mKa0HAtZdE+jFOPDDejX"
+  ]
+
+###############################
+##### Public Endpoint #########
+###############################
+
+config :portal, Portal.Endpoint,
+  adapter: Bandit.PhoenixAdapter,
+  url: [
+    scheme: "https",
+    host: "localhost",
+    port: 443,
+    path: nil
+  ],
+  render_errors: [
+    formats: [json: PortalAPI.ErrorView],
+    layout: false
+  ],
+  pubsub_server: Portal.PubSub,
+  secret_key_base: "5OVYJ83AcoQcPmdKNksuBhJFBhjHD1uUa9mDOHV/6EIdBQ6pXksIhkVeWIzFk5SD"
+
+config :portal,
+  api_external_url: "http://localhost:13001"
+
+config :portal,
+  cookie_secure: true,
+  cookie_signing_salt: "WjllcThpb2Y=",
+  cookie_encryption_salt: "M0EzM0R6NEMyaw==",
+  ops_cookie_signing_salt: "tXeFEZ+WMutTXeH3oDDV50YcUeA3X5DX"
+
+config :portal,
+  external_trusted_proxies: [],
+  private_clients: [%{__struct__: Postgrex.INET, address: {172, 28, 0, 0}, netmask: 16}]
+
+config :portal,
+  flow_logs_api_url: "https://flow-api.firezone.dev/",
+  flow_logs_upload_interval_secs: 60
+
+config :portal, country_code_blocklist: []
+
+config :portal, PortalWeb.Plugs.PutSecurityHeaders,
+  csp_policy: [
+    "default-src 'self' https://firezone.statuspage.io",
+    "img-src 'self' data: https://www.gravatar.com https://firezone.statuspage.io",
+    "style-src 'self'",
+    "script-src 'self' 'nonce-${nonce}'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'"
+  ]
+
+config :portal, api_url_override: "ws://localhost:13001/"
+
+###############################
+##### PortalAPI Endpoint ######
+###############################
+
+config :portal, PortalAPI.Endpoint,
+  adapter: Bandit.PhoenixAdapter,
+  url: [
+    scheme: "http",
+    host: "localhost",
+    port: 13_001,
+    path: nil
+  ],
+  render_errors: [
+    formats: [json: PortalAPI.ErrorView],
+    layout: false
+  ],
+  secret_key_base: "5OVYJ83AcoQcPmdKNksuBhJFBhjHD1uUa9mDOHV/6EIdBQ6pXksIhkVeWIzFk5SD",
+  pubsub_server: Portal.PubSub
+
+###############################
+##### PortalOps Endpoint ######
+###############################
+
+config :portal, PortalOps.Endpoint,
+  adapter: Bandit.PhoenixAdapter,
+  url: [
+    scheme: "http",
+    host: "localhost",
+    port: 13_002,
+    path: nil
+  ],
+  render_errors: [
+    formats: [
+      html: PortalWeb.ErrorHTML
+    ],
+    layout: false
+  ],
+  secret_key_base: "MG9VUq7d0UdezhKtiQBa+8r9mnY/i74qxZN2CRnb6cHoXIcjfREIskr1bcxDgH5h",
+  live_view: [
+    signing_salt: "x9+QI+p/jXqWHuBf4oI9mPZ2G/zUrQgg"
+  ],
+  pubsub_server: Portal.PubSub
+
+config :portal,
+  ops_admin_username: "admin",
+  ops_admin_password: "firezone"
+
+config :portal, relays_presence_debounce_timeout_ms: 1_000
+
+config :portal, PortalAPI.RateLimit,
+  refill_rate: 10,
+  capacity: 200,
+  read_refill_rate: 10,
+  read_capacity: 200
+
+# MCP has an additional pre-authentication IP bucket. Its cost is one token,
+# versus ten for the authenticated per-account API bucket, allowing a modest
+# connection burst without permitting unbounded token verification or parsing.
+config :portal, PortalAPI.Plugs.MCPRateLimit,
+  refill_rate: 10,
+  capacity: 200
+
+config :portal, PortalAPI.Sockets.RateLimit,
+  refill_rate: 1,
+  capacity: 1
+
+# Flow-log ingestion: 1 request per second per source IP, no burst. Each request
+# batches up to 10k records, so one per second is ample for reporters.
+config :portal, PortalAPI.Plugs.IngestionRateLimit,
+  refill_rate: 1,
+  capacity: 1
+
+config :portal, PortalWeb.RateLimit,
+  refill_rate: 10,
+  capacity: 200
+
+config :portal, PortalWeb.PublicEmailRateLimit,
+  per_ip_per_hour: 10,
+  global_per_hour: 500
+
+###############################
+##### Third-party configs #####
+###############################
+
+config :portal,
+  http_client_ssl_opts: []
+
+config :mime, :types, %{
+  "application/xml" => ["xml"],
+  "application/x-pem-file" => ["pem"],
+  "application/x-x509-ca-cert" => ["crt", "cer", "der"]
+}
+
+config :opentelemetry, processors: []
+
+config :logger,
+  level: System.get_env("LOG_LEVEL", "info") |> parse_log_level.()
+
+config :logger, :default_formatter,
+  format: "$time $metadata[$level] $message\n",
+  metadata: :all
+
+config :phoenix, :json_library, JSON
+
+config :swoosh, :api_client, Swoosh.ApiClient.Req
+
+config :portal, Portal.Mailer.InternalEmail, recipient: nil
+
+config :portal, Portal.Mailer,
+  adapter: Portal.Mailer.NoopAdapter,
+  from_email: "test@firez.one"
+
+config :portal, Portal.Mailer.Secondary,
+  adapter: Portal.Mailer.NoopAdapter,
+  from_email: "test@firez.one",
+  req_opts: [retry: :transient]
+
+config :portal, Portal.AzureCommunicationServices, event_grid_webhook_signing_secret: nil
+
+config :esbuild,
+  version: "0.25.4",
+  portal: [
+    args: [
+      "js/app.js",
+      "--bundle",
+      "--loader:.woff2=file",
+      "--loader:.woff=file",
+      "--target=es2022",
+      "--outdir=../priv/static/assets",
+      "--external:/fonts/*",
+      "--external:/images/*",
+      "--define:__DEV__=#{Mix.env() == :dev}"
+    ],
+    cd: Path.expand("../assets", __DIR__),
+    env: %{"NODE_PATH" => System.get_env("MIX_DEPS_PATH", Path.expand("../deps", __DIR__))}
+  ]
+
+# Configure tailwind (the version is required)
+config :tailwind,
+  version: "4.3.3",
+  portal: [
+    args: [
+      "--input=css/main.css",
+      "--output=../priv/static/assets/main.css"
+    ],
+    cd: Path.expand("../assets", __DIR__)
+  ]
+
+# Base Sentry config
+config :sentry,
+  before_send: {Portal.Telemetry.Sentry, :before_send},
+  # disable Sentry by default, enable in runtime.exs
+  dsn: nil,
+  environment_name: :unknown,
+  enable_source_code_context: true,
+  root_source_code_paths: [File.cwd!()]
+
+config :logger_json, encoder: JSON
+
+# Import environment specific config. This must remain at the bottom
+# of this file so it overrides the configuration defined above.
+import_config "#{Mix.env()}.exs"

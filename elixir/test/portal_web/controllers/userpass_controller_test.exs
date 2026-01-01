@@ -1,0 +1,742 @@
+defmodule PortalWeb.UserpassControllerTest do
+  use PortalWeb.ConnCase, async: true
+
+  import Portal.AccountFixtures
+  import Portal.ActorFixtures
+  import Portal.AuthProviderFixtures
+
+  @password "TestPassword1234!"
+
+  setup do
+    account = account_fixture()
+    provider = userpass_provider_fixture(account: account, context: :clients_and_portal)
+    password_hash = Portal.Crypto.hash(:argon2, @password)
+
+    {:ok, account: account, provider: provider, password_hash: password_hash}
+  end
+
+  describe "sign_in/2" do
+    test "redirects with error when account does not exist", %{conn: conn} do
+      conn =
+        post(conn, ~p"/nonexistent-account/sign_in/userpass/#{Ecto.UUID.generate()}", %{
+          "userpass" => %{"idp_id" => "test@example.com", "secret" => @password}
+        })
+
+      assert redirected_to(conn) =~ "nonexistent-account"
+    end
+
+    test "redirects with error for invalid password", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => "wrong-password"}
+        })
+
+      assert redirected_to(conn) =~ "/sign_in/userpass/#{provider.id}"
+      assert flash(conn, :error) =~ "Invalid username or password"
+    end
+
+    test "successfully authenticates admin user in portal context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password}
+        })
+
+      assert redirected_to(conn) =~ "/sites"
+    end
+
+    test "redirects to portal redirect_to when it is scoped to the signed-in account", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      redirect_to = ~p"/#{account}/resources"
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "redirect_to" => redirect_to
+        })
+
+      assert redirected_to(conn) == redirect_to
+    end
+
+    test "approving an app connection does not sign you into the portal", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "oauth",
+          "redirect_to" => ~p"/#{account}/oauth/authorize"
+        })
+
+      # The approval cookie is set and the portal one is not, so getting through
+      # this flow leaves no portal session behind. The portal key can still be
+      # present as a deletion, which carries no value.
+      assert approval = conn.resp_cookies["oauth_sess_#{account.id}"]
+      assert approval.value != ""
+
+      portal_cookie = Map.get(conn.resp_cookies, "sess_#{account.id}", %{})
+      refute Map.has_key?(portal_cookie, :value)
+
+      assert approval.max_age == PortalWeb.Cookie.OAuthSession.lifetime_secs()
+      assert approval.max_age == 15 * 60
+    end
+
+    test "falls back when portal redirect_to is scoped to another account", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      other_account = account_fixture()
+
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "redirect_to" => ~p"/#{other_account}/sites"
+        })
+
+      assert redirected_to(conn) == ~p"/#{account}/sites"
+    end
+
+    test "falls back when portal redirect_to only prefixes the signed-in account slug", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      prefix_account = account_fixture(slug: "#{account.slug}_other")
+
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "redirect_to" => ~p"/#{prefix_account}/sites"
+        })
+
+      assert redirected_to(conn) == ~p"/#{account}/sites"
+    end
+
+    test "rejects account_user in portal context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password}
+        })
+
+      assert redirected_to(conn) =~ "/#{account.id}"
+      assert flash(conn, :error) =~ "admin privileges"
+    end
+
+    test "successfully authenticates admin user in client context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "successfully authenticates account_user in client context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "successfully authenticates admin user in gui-client context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "successfully authenticates admin user in headless-client context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "Copy to clipboard"
+      assert conn.resp_body =~ actor.name
+    end
+
+    test "successfully authenticates account_user in headless-client context", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "Copy to clipboard"
+    end
+
+    test "rejects account_user in gui-client context when using gui-client param", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # account_user should be allowed in gui-client context
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "rejects client sign-in when account has exceeded user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      # Set limit exceeded flag on the account
+      update_account(account, %{users_limit_exceeded: true})
+
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert redirected_to(conn) =~ "/#{account.id}"
+      assert flash(conn, :error) =~ "exceeding billing limits"
+    end
+
+    test "rejects a new user on a full Business account but lets an active user sign in",
+         %{
+           conn: conn,
+           account: account,
+           provider: provider,
+           password_hash: password_hash
+         } do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{product_name: "Business"}},
+          limits: %{monthly_active_users_count: 1}
+        })
+
+      active =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      client = Portal.DeviceFixtures.client_fixture(account: account, actor: active)
+
+      Portal.ClientSessionFixtures.client_session_fixture(
+        account: account,
+        actor: active,
+        client: client
+      )
+
+      new_user =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      params = fn actor ->
+        %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        }
+      end
+
+      blocked = post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", params.(new_user))
+      assert flash(blocked, :error) =~ "exceeding billing limits"
+
+      allowed = post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", params.(active))
+      assert allowed.status == 200
+      assert allowed.resp_body =~ "client_redirect"
+    end
+
+    test "allows gui-client sign-in when account has exceeded monthly active users limits (soft limit)",
+         %{
+           conn: conn,
+           account: account,
+           provider: provider,
+           password_hash: password_hash
+         } do
+      # Set limit exceeded flag on the account (seats_limit_exceeded is used for monthly active users)
+      update_account(account, %{seats_limit_exceeded: true})
+
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      # Sign-in should still succeed since seats is a soft limit
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "rejects headless-client sign-in when account has exceeded limits", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      # Set multiple limit exceeded flags including users
+      update_account(account, %{users_limit_exceeded: true, sites_limit_exceeded: true})
+
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      assert redirected_to(conn) =~ "/#{account.id}"
+      assert flash(conn, :error) =~ "exceeding billing limits"
+    end
+
+    test "allows client sign-in when account warning does not include user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      # Set a limit flag that doesn't include users or seats
+      update_account(account, %{sites_limit_exceeded: true})
+
+      actor =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # Should be allowed - sites warning doesn't block client auth
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "allows portal sign-in when account has exceeded user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      # Set limit exceeded flag on the account
+      update_account(account, %{users_limit_exceeded: true})
+
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password}
+        })
+
+      # Portal sign-in should still be allowed so admins can manage billing
+      assert redirected_to(conn) =~ "/sites"
+    end
+
+    test "rejects portal sign-in when provider context is clients_only", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      provider
+      |> Ecto.Changeset.change(context: :clients_only)
+      |> Portal.Repo.update!()
+
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password}
+        })
+
+      assert redirected_to(conn) == ~p"/#{account.id}"
+      assert flash(conn, :error) == "This authentication method is not available for your sign-in context."
+    end
+
+    test "rejects GUI client sign-in when provider context is portal_only", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      provider
+      |> Ecto.Changeset.change(context: :portal_only)
+      |> Portal.Repo.update!()
+
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert redirected_to(conn) == ~p"/#{account.id}"
+      assert flash(conn, :error) == "This authentication method is not available for your sign-in context."
+    end
+
+    test "rejects headless client sign-in when provider context is portal_only", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      provider
+      |> Ecto.Changeset.change(context: :portal_only)
+      |> Portal.Repo.update!()
+
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => @password},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      assert redirected_to(conn) == ~p"/#{account.id}"
+      assert flash(conn, :error) == "This authentication method is not available for your sign-in context."
+    end
+  end
+
+  describe "malformed input" do
+    test "rejects a non-string password before checking it", %{
+      conn: conn,
+      account: account,
+      provider: provider,
+      password_hash: password_hash
+    } do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => %{"x" => "1"}}
+        })
+
+      assert redirected_to(conn) =~ account.id
+    end
+
+    test "rejects a userpass parameter that is not a map", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      conn = post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{"userpass" => "abc"})
+
+      assert redirected_to(conn) =~ account.id
+    end
+
+    test "does not log the password of a malformed request", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          conn =
+            post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+              "userpass" => %{"idp_id" => ["a@example.com"], "secret" => @password}
+            })
+
+          assert redirected_to(conn) =~ account.id
+        end)
+
+      assert log =~ "Invalid request parameters"
+      refute log =~ @password
+    end
+  end
+
+  describe "account enumeration" do
+    setup %{account: account, provider: provider, password_hash: password_hash} do
+      sign_in_path = ~p"/#{account.id}/sign_in/userpass/#{provider.id}"
+
+      sign_in = fn conn, email, extra ->
+        post(
+          conn,
+          sign_in_path,
+          Map.merge(%{"userpass" => %{"idp_id" => email, "secret" => "wrong-password"}}, extra)
+        )
+      end
+
+      admin =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      {:ok, sign_in: sign_in, sign_in_path: sign_in_path, admin: admin}
+    end
+
+    defp assert_generic_failure(conn, sign_in_path) do
+      assert redirected_to(conn) == sign_in_path
+      assert flash(conn, :error) == "Invalid username or password."
+    end
+
+    test "does not reveal that an email belongs to a non-admin", %{
+      conn: conn,
+      account: account,
+      password_hash: password_hash,
+      sign_in: sign_in,
+      sign_in_path: sign_in_path,
+      admin: admin
+    } do
+      user = actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      assert_generic_failure(sign_in.(conn, admin.email, %{}), sign_in_path)
+      assert_generic_failure(sign_in.(conn, user.email, %{}), sign_in_path)
+      assert_generic_failure(sign_in.(conn, "unknown@example.com", %{}), sign_in_path)
+    end
+
+    test "does not reveal disabled actors or actors without a password", %{
+      conn: conn,
+      account: account,
+      password_hash: password_hash,
+      sign_in: sign_in,
+      sign_in_path: sign_in_path
+    } do
+      disabled =
+        disabled_actor_fixture(
+          type: :account_admin_user,
+          account: account,
+          password_hash: password_hash
+        )
+
+      passwordless = actor_fixture(type: :account_admin_user, account: account)
+
+      assert_generic_failure(sign_in.(conn, disabled.email, %{}), sign_in_path)
+      assert_generic_failure(sign_in.(conn, passwordless.email, %{}), sign_in_path)
+    end
+
+    test "does not reveal seat restrictions before the password is verified", %{
+      conn: conn,
+      account: account,
+      password_hash: password_hash,
+      sign_in: sign_in,
+      sign_in_path: sign_in_path
+    } do
+      account =
+        update_account(account, %{
+          metadata: %{stripe: %{product_name: "Business"}},
+          limits: %{monthly_active_users_count: 1}
+        })
+
+      active = actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+      client = Portal.DeviceFixtures.client_fixture(account: account, actor: active)
+
+      Portal.ClientSessionFixtures.client_session_fixture(
+        account: account,
+        actor: active,
+        client: client
+      )
+
+      new_user =
+        actor_fixture(type: :account_user, account: account, password_hash: password_hash)
+
+      client_params = %{"as" => "client", "state" => "test-state", "nonce" => "test-nonce"}
+
+      assert_generic_failure(sign_in.(conn, new_user.email, client_params), sign_in_path)
+    end
+  end
+
+  describe "failed attempt throttling" do
+    setup %{account: account, provider: provider, password_hash: password_hash} do
+      actor =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      sign_in = fn conn, email, password ->
+        post(conn, ~p"/#{account.id}/sign_in/userpass/#{provider.id}", %{
+          "userpass" => %{"idp_id" => email, "secret" => password}
+        })
+      end
+
+      {:ok, actor: actor, sign_in: sign_in}
+    end
+
+    defp assert_throttled(conn) do
+      assert flash(conn, :error) == "Too many sign-in attempts. Please try again in a minute."
+    end
+
+    test "throttles an email after a burst of attempts, even with the right password", %{
+      conn: conn,
+      actor: actor,
+      sign_in: sign_in
+    } do
+      for _ <- 1..10 do
+        assert flash(sign_in.(conn, actor.email, "wrong-password"), :error) =~
+                 "Invalid username or password"
+      end
+
+      assert_throttled(sign_in.(conn, actor.email, "wrong-password"))
+      assert_throttled(sign_in.(conn, actor.email, @password))
+    end
+
+    test "throttles unknown emails the same way as known ones", %{conn: conn, sign_in: sign_in} do
+      for _ <- 1..10, do: sign_in.(conn, "unknown@example.com", "wrong-password")
+
+      assert_throttled(sign_in.(conn, "unknown@example.com", "wrong-password"))
+    end
+
+    test "case and whitespace variants of an email share one bucket", %{
+      conn: conn,
+      actor: actor,
+      sign_in: sign_in
+    } do
+      for _ <- 1..10, do: sign_in.(conn, actor.email, "wrong-password")
+
+      assert_throttled(sign_in.(conn, " " <> String.upcase(actor.email) <> " ", "wrong-password"))
+    end
+
+    test "buckets are independent per email and per account", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      sign_in: sign_in,
+      password_hash: password_hash
+    } do
+      for _ <- 1..10, do: sign_in.(conn, actor.email, "wrong-password")
+      assert_throttled(sign_in.(conn, actor.email, @password))
+
+      other =
+        actor_fixture(type: :account_admin_user, account: account, password_hash: password_hash)
+
+      assert redirected_to(sign_in.(conn, other.email, @password)) =~ "/sites"
+
+      other_account = account_fixture()
+      other_provider = userpass_provider_fixture(account: other_account, context: :clients_and_portal)
+
+      conn =
+        post(conn, ~p"/#{other_account.id}/sign_in/userpass/#{other_provider.id}", %{
+          "userpass" => %{"idp_id" => actor.email, "secret" => "wrong-password"}
+        })
+
+      assert flash(conn, :error) == "Invalid username or password."
+    end
+  end
+end

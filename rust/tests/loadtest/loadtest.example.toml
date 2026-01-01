@@ -1,0 +1,74 @@
+# Loadtest Configuration
+#
+# Every section is optional. Copy this file and modify as needed.
+# A random test is selected from whichever sections are present.
+#
+# Usage:
+#   firezone-loadtest                     # Run random test from loadtest.toml
+#   firezone-loadtest --config test.toml  # Use custom config file
+#   firezone-loadtest --seed 12345        # Reproducible random test
+
+# HTTP load testing via Goose framework
+[http]
+# Target URLs to test against
+addresses = [
+    "https://example.com",
+]
+# HTTP versions: 1 (HTTP/1.1) or 2 (HTTP/2)
+http_version = [1, 2]
+# Number of max concurrent connections
+max_connections = 100
+
+# TCP connection testing
+[tcp]
+# Target addresses (host:port)
+addresses = [
+    "127.0.0.1:8080",
+]
+# Number of concurrent connections
+concurrent = "5..50"
+# How long to hold connections (seconds)
+duration_secs = "30..300"
+# Enable echo mode for round-trip verification
+echo_mode = false
+# Payload size for echo messages (bytes)
+echo_payload_size = "64..64"
+# Interval between echo messages (seconds)
+echo_interval_secs = "1..1"
+# Timeout for echo responses (seconds)
+echo_read_timeout_secs = "5..5"
+
+# WebSocket connection testing
+[websocket]
+# Target WebSocket URLs
+addresses = [
+    "wss://echo.websocket.org",
+]
+# Number of concurrent connections
+concurrent = "5..50"
+# How long to hold connections (seconds)
+duration_secs = "30..300"
+# How long to at most wait between messages. Zero means we won't send any messages.
+max_echo_interval_secs = 10
+
+# TURN relay load testing (e.g. Firezone's eBPF relay).
+#
+# Streams UDP datagrams through a channel binding and observes packet loss at the
+# peer. Credentials are scoped to a single relay, so configure only one at a time.
+# Left commented out because it requires real, relay-specific credentials.
+# [turn]
+# Relay socket address (ip:port)
+# address = "127.0.0.1:3478"
+# Long-term credentials for the relay
+# username = "<username>"
+# password = "<password>"
+# UDP payload size in bytes (default 1280)
+# payload_size = 1280
+# Target send bitrate per flow (e.g. "2mbps", "500kbps", or a raw bits/sec value)
+# bitrate = "2mbps"
+# How long to stream datagrams, in seconds (default 30)
+# duration_secs = 30
+# Number of parallel flows: distinct peer ports fed from one allocation (default 1)
+# flows = 1
+# Fail the test if packet loss exceeds this percentage (optional)
+# max_loss_percent = 1.0

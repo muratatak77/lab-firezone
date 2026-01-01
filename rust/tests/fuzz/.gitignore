@@ -1,0 +1,6 @@
+target
+artifacts
+crash-*
+afl-output
+candidates
+coverage

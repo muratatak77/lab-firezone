@@ -1,0 +1,22 @@
+<%= @record.name %> Sync Error!
+
+The "<%= @record.name %>" <%= @noun %> has encountered an unrecoverable error and sync has been disabled.
+Please visit your <%= @settings_link_text %> <%= @settings_action %>
+<%= @settings_url %>
+
+Below is the last sync error message:
+
+<%= @record.error_message || "No error message available" %>
+
+<%= @details_heading %>:
+  Account: <%= @account.name %>
+  Account ID: <%= @account.id %>
+  <%= @record_label %> Name: <%= @record.name %>
+  <%= @record_label %> ID: <%= @record.id %>
+<%= for {label, value} <- @details_rows do %>  <%= label %>: <%= value %>
+<% end %>  Error Occurred At: <%= @record.errored_at || "Unknown" %>
+
+<%= @remediation %> If the problem persists, please reach out to Firezone support via Slack or email.
+
+Thanks,
+The Firezone Team

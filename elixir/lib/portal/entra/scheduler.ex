@@ -1,0 +1,42 @@
+defmodule Portal.Entra.Scheduler do
+  @moduledoc """
+  Oban worker for scheduling the sync job.
+  """
+
+  use Oban.Worker, queue: :entra_scheduler, max_attempts: 1
+  alias __MODULE__.Database
+  require Logger
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{}) do
+    Logger.debug("Scheduling Entra directory sync jobs")
+
+    Database.queue_sync_jobs()
+  end
+
+  defmodule Database do
+    alias Portal.Safe
+    import Ecto.Query
+
+    def queue_sync_jobs do
+      Safe.transact(fn ->
+        from(d in Portal.Entra.Directory,
+          join: a in Portal.Account,
+          on: a.id == d.account_id,
+          where: d.is_disabled == false,
+          where: a.is_disabled == false,
+          where: fragment("(?)->>'idp_sync' = 'true'", a.features)
+        )
+        |> Safe.unscoped()
+        |> Safe.stream()
+        |> Stream.each(fn directory ->
+          args = %{account_id: directory.account_id, directory_id: directory.id}
+          {:ok, _job} = Portal.Entra.Sync.new(args) |> Oban.insert()
+        end)
+        |> Stream.run()
+
+        {:ok, :scheduled}
+      end)
+    end
+  end
+end

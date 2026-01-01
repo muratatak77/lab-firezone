@@ -1,0 +1,2327 @@
+defmodule PortalWeb.PoliciesTest do
+  use PortalWeb.ConnCase, async: true
+
+  import Phoenix.LiveViewTest, except: [live: 2]
+
+  # The table loads in an async task, so wait for it before returning.
+  defp live(conn, path) do
+    case Phoenix.LiveViewTest.live(conn, path) do
+      {:ok, lv, _html} -> {:ok, lv, render_async(lv)}
+      other -> other
+    end
+  end
+
+  alias Portal.{Policy, Repo}
+  alias Portal.Changes.Change
+
+  import Portal.AccountFixtures
+  import Portal.DevicePostureFixtures
+  import Portal.ActorFixtures
+  import Portal.AuthProviderFixtures
+  import Portal.FeaturesFixtures
+  import Portal.GroupFixtures
+  import Portal.MembershipFixtures
+  import Portal.PolicyAuthorizationFixtures
+  import Portal.PolicyFixtures
+  import Portal.ResourceFixtures
+  import Portal.SiteFixtures
+  import Portal.TrustAnchorFixtures
+
+  setup do
+    account = account_fixture()
+    actor = admin_actor_fixture(account: account)
+    %{account: account, actor: actor}
+  end
+
+  describe "unauthorized" do
+    test "redirects to sign-in when not authenticated", %{conn: conn, account: account} do
+      path = ~p"/#{account}/policies"
+
+      assert live(conn, path) ==
+               {:error,
+                {:redirect,
+                 %{
+                   to: ~p"/#{account}/sign_in?#{%{redirect_to: path}}",
+                   flash: %{"error" => "You must sign in to access that page."}
+                 }}}
+    end
+  end
+
+  describe "index (default action)" do
+    test "looks up the filtered site and resource only after the socket connects", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      site = site_fixture(account: account, name: "Notice Site")
+      resource = resource_fixture(account: account, name: "Notice Resource")
+      conn = authorize_conn(conn, actor)
+
+      for {filter, notice} <- [
+            {%{"policies_filter[site_id]" => site.id}, "Viewing Policies for Site"},
+            {%{"policies_filter[resource_id]" => resource.id}, "Viewing Policies for Resource"}
+          ] do
+        static = conn |> get(~p"/#{account}/policies?#{filter}") |> html_response(200)
+        refute static =~ notice
+
+        {:ok, _lv, html} = live(conn, ~p"/#{account}/policies?#{filter}")
+        assert html =~ notice
+      end
+    end
+
+    test "loads the table only after the socket connects", %{conn: conn, account: account, actor: actor} do
+      policy_fixture(account: account)
+
+      conn = authorize_conn(conn, actor)
+
+      static = conn |> get(~p"/#{account}/policies") |> html_response(200) |> Floki.parse_document!()
+      assert [_] = Floki.find(static, "#policies-skeleton")
+      assert Floki.find(static, "#policies-rows tr") == []
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies")
+      assert has_element?(lv, "#policies-rows tr")
+      refute has_element?(lv, "#policies-skeleton")
+    end
+
+    test "renders policy list page", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      _policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies")
+
+      assert html =~ "Policies"
+      assert html =~ group.name
+      assert html =~ resource.name
+    end
+
+    test "opens new policy panel from list and closes it", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies")
+
+      assert html =~ "New Policy"
+
+      render_click(lv, "open_new_policy_form")
+      assert_patch(lv, ~p"/#{account}/policies/new")
+      assert render(lv) =~ "Add Policy"
+
+      render_click(lv, "cancel_policy_form")
+      assert_patch(lv, ~p"/#{account}/policies")
+    end
+  end
+
+  describe ":new action" do
+    test "renders add policy form", %{conn: conn, account: account, actor: actor} do
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      assert html =~ "Add Policy"
+      assert html =~ "Group"
+      assert html =~ "Resource"
+    end
+
+    test "creates a policy on submit", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "Allow group access"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "created successfully"
+
+      policy =
+        Repo.get_by!(Policy,
+          group_id: group.id,
+          resource_id: resource.id,
+          description: "Allow group access"
+        )
+
+      assert policy
+    end
+
+    test "shows blurred upgrade state for starter accounts without policy conditions", %{
+      conn: conn
+    } do
+      account =
+        starter_account_fixture(
+          features: %{
+            internet_resource: false,
+            policy_conditions: false,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      assert html =~ "Upgrade your plan to unlock policy conditions and device posture checks."
+      assert length(Floki.find(Floki.parse_fragment!(html), "[data-locked-section]")) == 1
+      assert [_, _] = String.split(html, "Upgrade to Unlock")
+      assert :binary.match(html, "Flow log reporting") < :binary.match(html, "data-locked-section")
+      assert html =~ "Upgrade to Unlock"
+      assert html =~ ~s(href="/#{account.slug}/settings/account")
+      assert html =~ ~s(data-locked-section="policy-restrictions")
+      assert html =~ "blur-[2px]"
+      assert html =~ "ri-lock-2-line"
+      refute html =~ "Add condition"
+      refute html =~ ~s(phx-click="remove_condition")
+    end
+
+    test "does not list Internet Resource in policy creation for starter accounts", %{conn: conn} do
+      account =
+        starter_account_fixture(
+          features: %{
+            internet_resource: false,
+            policy_conditions: true,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+      _internet_resource = internet_resource_fixture(account: account, name: "Starter Internet")
+      _resource = resource_fixture(account: account, name: "Starter DNS")
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      assert html =~ "Starter DNS"
+      refute html =~ "Starter Internet"
+    end
+
+    test "rejects manual Internet Resource submission for starter accounts", %{conn: conn} do
+      account =
+        starter_account_fixture(
+          features: %{
+            internet_resource: false,
+            policy_conditions: true,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      internet_resource = internet_resource_fixture(account: account, name: "Blocked Internet")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: internet_resource.id,
+            description: "Blocked by plan"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Internet Resource is not available on your plan"
+
+      refute Repo.get_by(Policy,
+               group_id: group.id,
+               resource_id: internet_resource.id,
+               description: "Blocked by plan"
+             )
+    end
+
+    test "creates a policy with flow log reporting disabled on submit", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      assert html =~ "Flow log reporting"
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            flow_log_uploads_enabled: false
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "created successfully"
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      assert policy.flow_log_uploads_enabled == false
+    end
+
+    test "defaults flow log reporting to enabled on submit", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      lv
+      |> form("[phx-submit='submit_policy_form']",
+        policy: %{group_id: group.id, resource_id: resource.id}
+      )
+      |> render_submit()
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id)
+      assert policy.flow_log_uploads_enabled == true
+    end
+
+    test "defaults flow log reporting off for Internet Resource policies", %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      internet_resource = internet_resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      lv
+      |> form("[phx-change='change_policy_form']",
+        policy: %{
+          group_id: group.id,
+          resource_id: internet_resource.id
+        }
+      )
+      |> render_change()
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: internet_resource.id
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "created successfully"
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: internet_resource.id)
+      assert policy.flow_log_uploads_enabled == false
+    end
+
+    test "allows flow log reporting for Internet Resource policies and shows a volume warning",
+         %{conn: conn} do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      internet_resource = internet_resource_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      lv
+      |> form("[phx-change='change_policy_form']",
+        policy: %{
+          group_id: group.id,
+          resource_id: internet_resource.id
+        }
+      )
+      |> render_change()
+
+      html =
+        lv
+        |> form("[phx-change='change_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: internet_resource.id,
+            flow_log_uploads_enabled: true
+          }
+        )
+        |> render_change()
+
+      assert html =~
+               "Enabling flow log collection for the internet resource can result in substantial log volume."
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: internet_resource.id,
+            flow_log_uploads_enabled: true
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "created successfully"
+
+      policy = Repo.get_by!(Policy, group_id: group.id, resource_id: internet_resource.id)
+      assert policy.flow_log_uploads_enabled == true
+    end
+  end
+
+  describe ":show action" do
+    test "renders policy detail panel with group and resource names", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      assert html =~ group.name
+      assert html =~ resource.name
+    end
+
+    test "closes panel, opens edit form, disables, enables, and cancels delete", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      render_click(lv, "open_edit_form")
+      assert_patch(lv, ~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "cancel_policy_form")
+      assert_patch(lv, ~p"/#{account}/policies/#{policy.id}")
+
+      html = render_click(lv, "confirm_disable_policy")
+      assert html =~ "Disable this policy?"
+
+      render_click(lv, "cancel_disable_policy")
+      refute render(lv) =~ "Disable this policy?"
+
+      render_click(lv, "confirm_disable_policy")
+      render_click(lv, "disable_policy")
+      # The next reload would kill this one mid-query, which breaks the test's sandbox connection
+      render_async(lv)
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+      assert policy.is_disabled
+
+      render_click(lv, "enable_policy")
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+      refute policy.is_disabled
+
+      html = render_click(lv, "confirm_delete_policy")
+      assert html =~ "Delete this policy?"
+
+      render_click(lv, "cancel_delete_policy")
+      refute render(lv) =~ "Delete this policy?"
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/policies")
+    end
+
+    test "ignores a tab switch queued while the policy panel is closing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/policies")
+
+      render_click(lv, "switch_policy_tab", %{"tab" => "authorizations"})
+
+      refute has_element?(lv, "#policy-panel > div")
+    end
+
+    test "ignores an edit click queued while the policy panel is closing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/policies")
+
+      render_click(lv, "open_edit_form")
+
+      refute has_element?(lv, "#policy-panel > div")
+    end
+
+    test "ignores an authorizations page change queued while the policy panel is closing", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}?tab=authorizations")
+
+      render_click(lv, "close_panel")
+      assert_patch(lv, ~p"/#{account}/policies")
+
+      render_click(lv, "change_policy_authorizations_page", %{"page" => "2"})
+
+      refute has_element?(lv, "#policy-panel > div")
+    end
+
+    test "patches to policies index with flash when policy does not exist", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      missing_id = Ecto.UUID.generate()
+      path = ~p"/#{account}/policies/#{missing_id}"
+
+      assert {:error, {:live_redirect, %{to: to, flash: flash}}} =
+               conn
+               |> authorize_conn(actor)
+               |> live(path)
+
+      assert to == ~p"/#{account}/policies"
+      assert flash["error"] =~ "Policy does not exist"
+    end
+
+    test "preserves filter query params when redirecting from missing policy", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      site = site_fixture(account: account)
+      missing_id = Ecto.UUID.generate()
+
+      assert {:error, {:live_redirect, %{to: to}}} =
+               conn
+               |> authorize_conn(actor)
+               |> live(
+                 ~p"/#{account}/policies/#{missing_id}?#{[policies_filter: %{site_id: site.id}]}"
+               )
+
+      assert to =~ "policies_filter"
+      assert to =~ site.id
+    end
+  end
+
+  describe ":edit action" do
+    test "renders edit policy form", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ "Edit Policy"
+      assert html =~ "Group"
+      assert html =~ "Resource"
+    end
+
+    test "does not render saved policy conditions for starter accounts without the feature", %{
+      conn: conn
+    } do
+      account =
+        starter_account_fixture(
+          features: %{
+            policy_conditions: false,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :remote_ip,
+              operator: :is_in_cidr,
+              values: ["10.10.0.0/16"]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      refute html =~ "10.10.0.0/16"
+      refute html =~ ~s(phx-click="remove_condition")
+    end
+
+    test "shows flow log reporting checkbox when editing an Internet Resource policy", %{
+      conn: conn
+    } do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = internet_resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ "Flow log reporting"
+      assert html =~ "policy[flow_log_uploads_enabled]"
+      assert html =~
+               "Enabling flow log collection for the internet resource can result in substantial log volume."
+    end
+
+    test "asks before saving a change that revokes access, and only then", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      other_group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      conn = authorize_conn(conn, actor)
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{description: "harmless"})
+        |> render_submit()
+
+      refute html =~ "Save these changes?"
+      assert html =~ "updated successfully"
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{group_id: other_group.id})
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      assert html =~ "Existing connections using this policy will be reset."
+      refute lv |> element("#policy-breaking-change-modal") |> render() =~ "reconnect"
+      assert Repo.get_by!(Policy, id: policy.id, account_id: account.id).group_id == group.id
+
+      html = render_click(lv, "cancel_policy_breaking_change")
+      refute html =~ "Save these changes?"
+      assert Repo.get_by!(Policy, id: policy.id, account_id: account.id).group_id == group.id
+
+      lv
+      |> form("[phx-submit='submit_policy_form']", policy: %{flow_log_uploads_enabled: false})
+      |> render_submit()
+
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+      assert Repo.get_by!(Policy, id: policy.id, account_id: account.id).flow_log_uploads_enabled == false
+    end
+
+    test "moving a policy onto the Internet Resource disables flow log reporting", %{
+      conn: conn
+    } do
+      account = account_fixture(features: %{internet_resource: true})
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      internet_resource = internet_resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource, flow_log_uploads_enabled: true)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      lv
+      |> form("[phx-change='change_policy_form']",
+        policy: %{
+          group_id: group.id,
+          resource_id: internet_resource.id
+        }
+      )
+      |> render_change()
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: internet_resource.id
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      reloaded = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+      assert reloaded.flow_log_uploads_enabled == false
+    end
+
+    test "renders existing Internet Resource policy on edit after feature loss", %{conn: conn} do
+      account =
+        starter_account_fixture(
+          features: %{
+            internet_resource: false,
+            policy_conditions: true,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = internet_resource_fixture(account: account, name: "Existing Internet Resource")
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ "Edit Policy"
+      assert html =~ "Existing Internet Resource"
+    end
+
+    test "blocks saving an existing Internet Resource policy on starter accounts",
+         %{conn: conn} do
+      account =
+        starter_account_fixture(
+          features: %{
+            internet_resource: false,
+            policy_conditions: true,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = internet_resource_fixture(account: account, name: "Existing Internet Resource")
+      policy = policy_fixture(group: group, resource: resource, description: "Original")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "Updated Description"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Internet Resource is not available on your plan"
+
+      reloaded = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+      assert reloaded.description == "Original"
+    end
+
+    test "rejects manual Internet Resource assignment when editing for starter accounts",
+         %{conn: conn} do
+      account =
+        starter_account_fixture(
+          features: %{
+            internet_resource: false,
+            policy_conditions: true,
+            idp_sync: true
+          }
+        )
+
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, name: "Starter DNS")
+      internet_resource = internet_resource_fixture(account: account, name: "Blocked Internet")
+      policy = policy_fixture(group: group, resource: resource, description: "Original")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: internet_resource.id,
+            description: "Switched to Internet"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Internet Resource is not available on your plan"
+
+      reloaded = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+      assert reloaded.resource_id == resource.id
+      assert reloaded.description == "Original"
+    end
+
+    test "updates policy description and condition state", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource, description: "Old Description")
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      assert render_click(lv, "add_condition", %{"type" => "remote_ip"}) =~ "IP Range"
+
+      html =
+        lv
+        |> element("input[name='_ip_range_input']")
+        |> render_change(%{"_ip_range_input" => "10.10.0.0/16"})
+
+      assert html =~ "10.10.0.0/16"
+
+      html = render_click(lv, "add_ip_range_value")
+      assert html =~ "10.10.0.0/16"
+
+      html = render_click(lv, "remove_ip_range_value", %{"range" => "10.10.0.0/16"})
+      refute html =~ "10.10.0.0/16"
+
+      lv
+      |> element("input[name='_ip_range_input']")
+      |> render_change(%{"_ip_range_input" => "10.10.0.0/16"})
+
+      render_click(lv, "add_ip_range_value")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "Updated Description"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+      assert policy.description == "Updated Description"
+
+      assert Enum.any?(
+               policy.conditions,
+               &(&1.property == :remote_ip and &1.values == ["10.10.0.0/16"])
+             )
+    end
+  end
+
+  describe ":conditions" do
+    test "saves time-of-day condition to DB", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "current_utc_datetime"})
+      render_click(lv, "start_add_tod_range")
+
+      lv
+      |> element("input[name='_tod_on']")
+      |> render_change(%{"_tod_on" => "09:00"})
+
+      lv
+      |> element("input[name='_tod_off']")
+      |> render_change(%{"_tod_off" => "17:00"})
+
+      render_click(lv, "toggle_tod_pending_day", %{"day" => "M"})
+      render_click(lv, "toggle_tod_pending_day", %{"day" => "T"})
+      render_click(lv, "confirm_tod_range")
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "With TOD condition"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+
+      assert Enum.any?(
+               policy.conditions,
+               &(&1.property == :current_utc_datetime and
+                   "M/09:00-17:00/UTC" in &1.values and
+                   "T/09:00-17:00/UTC" in &1.values)
+             )
+    end
+
+    test "removes a condition from edit form", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      html = render_click(lv, "add_condition", %{"type" => "remote_ip"})
+      assert html =~ "IP Range"
+
+      html = render_click(lv, "remove_condition", %{"type" => "remote_ip"})
+      refute html =~ "IP Range"
+    end
+
+    test "manages auth provider conditions", %{conn: conn, account: account, actor: actor} do
+      auth_provider = email_otp_provider_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, auth_provider)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      html = render_click(lv, "add_condition", %{"type" => "auth_provider_id"})
+      assert html =~ "Authentication Provider"
+
+      html = render_click(lv, "toggle_auth_provider_value", %{"id" => auth_provider.id})
+      assert html =~ auth_provider.name
+
+      html = render_click(lv, "change_auth_provider_operator", %{"operator" => "is_not_in"})
+      assert html =~ "is not in"
+    end
+
+    test "warns when X.509 is selected and the account has no trust anchors", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      enable_feature(:x509_auth)
+      x509_provider = x509_provider_fixture(account: account, is_disabled: false)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "auth_provider_id"})
+
+      html = render_click(lv, "toggle_auth_provider_value", %{"id" => x509_provider.id})
+
+      assert html =~ "No devices will be able to use this authentication provider"
+
+      assert has_element?(
+               lv,
+               "a[href='/#{account.slug}/settings/trust_anchors']",
+               "Trust Anchors"
+             )
+    end
+
+    test "does not warn for a selected X.509 provider when a trust anchor exists", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      enable_feature(:x509_auth)
+      x509_provider = x509_provider_fixture(account: account, is_disabled: false)
+      _anchor = trust_anchor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "auth_provider_id"})
+      html = render_click(lv, "toggle_auth_provider_value", %{"id" => x509_provider.id})
+
+      refute html =~ "No devices will be able to use this authentication provider"
+    end
+
+    test "manages time-of-day conditions via add range form", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      html = render_click(lv, "add_condition", %{"type" => "current_utc_datetime"})
+
+      assert html =~ "Add range"
+      refute html =~ ~s(type="time")
+
+      html = render_click(lv, "start_add_tod_range")
+      assert html =~ ~s(type="time")
+      assert html =~ ~s(name="_tod_on")
+      assert html =~ ~s(name="_tod_off")
+
+      for code <- ["M", "T", "W", "R", "F", "S", "U"] do
+        assert html =~ ~s(phx-value-day="#{code}")
+      end
+    end
+
+    test "keeps selected timezone when toggling tod day buttons", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "current_utc_datetime"})
+
+      lv
+      |> element("select[name='policy[conditions][current_utc_datetime][timezone]']")
+      |> render_change(%{
+        "policy" => %{
+          "conditions" => %{"current_utc_datetime" => %{"timezone" => "America/New_York"}}
+        }
+      })
+
+      render_click(lv, "start_add_tod_range")
+      html = render_click(lv, "toggle_tod_pending_day", %{"day" => "M"})
+
+      assert html =~ ~s(value="America/New_York" selected)
+      refute html =~ ~s(value="UTC" selected)
+    end
+
+    test "renders time-of-day condition from saved policy", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :current_utc_datetime,
+              operator: :is_in_day_of_week_time_ranges,
+              values: ["M/09:30-17:45/America/New_York"]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ ~s(value="09:30")
+      assert html =~ ~s(value="17:45")
+    end
+
+    test "manages location conditions", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      html = render_click(lv, "add_condition", %{"type" => "remote_ip_location_region"})
+      assert html =~ "Search countries"
+
+      html =
+        lv
+        |> element("input[name='_location_search']")
+        |> render_change(%{"_location_search" => "United"})
+
+      assert html =~ "United States"
+
+      html = render_click(lv, "toggle_location_value", %{"code" => "US"})
+      assert html =~ "US"
+
+      html = render_click(lv, "toggle_location_value", %{"code" => "US"})
+      refute html =~ ">US<"
+    end
+
+    test "saves location condition to DB", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "remote_ip_location_region"})
+
+      lv
+      |> element("input[name='_location_search']")
+      |> render_change(%{"_location_search" => "United"})
+
+      render_click(lv, "toggle_location_value", %{"code" => "US"})
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "With location condition"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+
+      assert Enum.any?(
+               policy.conditions,
+               &(&1.property == :remote_ip_location_region and "US" in &1.values)
+             )
+    end
+
+    test "renders location condition from saved policy", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :remote_ip_location_region,
+              operator: :is_in,
+              values: ["US"]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ "United States"
+    end
+
+    test "saves auth_provider condition to DB", %{conn: conn, account: account, actor: actor} do
+      auth_provider = email_otp_provider_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn_with_provider(actor, auth_provider)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "auth_provider_id"})
+      render_click(lv, "toggle_auth_provider_value", %{"id" => auth_provider.id})
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "With auth provider condition"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+
+      assert Enum.any?(
+               policy.conditions,
+               &(&1.property == :auth_provider_id and auth_provider.id in &1.values)
+             )
+    end
+
+    test "renders auth_provider condition from saved policy", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      auth_provider = email_otp_provider_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :auth_provider_id,
+              operator: :is_in,
+              values: [auth_provider.id]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn_with_provider(actor, auth_provider)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ auth_provider.name
+    end
+
+    test "flags disabled and deleted providers referenced by a saved condition", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      active = google_provider_fixture(account: account, name: "Active Google")
+      disabled = github_provider_fixture(account: account, name: "Old GitHub", is_disabled: true)
+      deleted_id = Ecto.UUID.generate()
+
+      policy =
+        policy_fixture(
+          account: account,
+          conditions: [
+            %{
+              property: :auth_provider_id,
+              operator: :is_in,
+              values: [active.id, disabled.id, deleted_id]
+            }
+          ]
+        )
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      assert render(lv) =~ "Active Google"
+      assert has_element?(lv, "[data-auth-provider-status='disabled']", "Old GitHub (disabled)")
+      assert has_element?(lv, "[data-auth-provider-status='deleted']", "Deleted provider")
+    end
+
+    test "keeps stale provider values on the edit form until they are removed", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      disabled = github_provider_fixture(account: account, name: "Old GitHub", is_disabled: true)
+      deleted_id = Ecto.UUID.generate()
+
+      policy =
+        policy_fixture(
+          account: account,
+          conditions: [
+            %{
+              property: :auth_provider_id,
+              operator: :is_in,
+              values: [disabled.id, deleted_id]
+            }
+          ]
+        )
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      value_input = "input[name='policy[conditions][auth_provider_id][values][]']"
+
+      assert has_element?(lv, "[data-auth-provider-status='disabled']", "Old GitHub (disabled)")
+      assert has_element?(lv, "[data-auth-provider-status='deleted']", "Deleted provider")
+      assert has_element?(lv, "#{value_input}[value='#{disabled.id}']")
+      assert has_element?(lv, "#{value_input}[value='#{deleted_id}']")
+
+      # Disabled providers stay out of the selection list
+      refute has_element?(lv, "label[phx-click='toggle_auth_provider_value'][phx-value-id='#{disabled.id}']")
+
+      lv
+      |> element("button[phx-click='toggle_auth_provider_value'][phx-value-id='#{deleted_id}']")
+      |> render_click()
+
+      refute has_element?(lv, "[data-auth-provider-status='deleted']")
+      refute has_element?(lv, "#{value_input}[value='#{deleted_id}']")
+      assert has_element?(lv, "#{value_input}[value='#{disabled.id}']")
+    end
+
+    test "warns when a saved policy condition uses X.509 without a trust anchor", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      enable_feature(:x509_auth)
+      x509_provider = x509_provider_fixture(account: account, is_disabled: false)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :auth_provider_id,
+              operator: :is_in,
+              values: [x509_provider.id]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      assert html =~ "No devices will be able to use this authentication provider"
+      assert html =~ "/#{account.slug}/settings/trust_anchors"
+    end
+
+    test "looks up the X.509 trust anchor warning only after the socket connects", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      enable_feature(:x509_auth)
+      x509_provider = x509_provider_fixture(account: account, is_disabled: false)
+
+      policy =
+        policy_fixture(
+          group: group_fixture(account: account),
+          resource: resource_fixture(account: account),
+          conditions: [%{property: :auth_provider_id, operator: :is_in, values: [x509_provider.id]}]
+        )
+
+      conn = authorize_conn(conn, actor)
+      warning = "No devices will be able to use this authentication provider"
+
+      static = conn |> get(~p"/#{account}/policies/#{policy.id}") |> html_response(200)
+      refute static =~ warning
+
+      {:ok, _lv, html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      assert html =~ warning
+    end
+
+    test "renders ip_range condition from saved policy", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :remote_ip,
+              operator: :is_in_cidr,
+              values: ["192.168.0.0/24"]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ "192.168.0.0/24"
+    end
+
+    test "changes ip_range operator", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "remote_ip"})
+
+      refute html =~ ~s(value="is_not_in_cidr")
+
+      html = render_click(lv, "change_ip_range_operator", %{"operator" => "is_not_in_cidr"})
+      assert html =~ ~s(value="is_not_in_cidr")
+    end
+
+    test "manages client_verified condition", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      html = render_click(lv, "add_condition", %{"type" => "client_verified"})
+      assert html =~ "Require Verified Device"
+    end
+
+    test "saves client_verified condition to DB", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "toggle_conditions_dropdown")
+      render_click(lv, "add_condition", %{"type" => "client_verified"})
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']",
+          policy: %{
+            group_id: group.id,
+            resource_id: resource.id,
+            description: "With client verified condition"
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      policy = Repo.get_by!(Policy, id: policy.id, account_id: account.id)
+
+      assert Enum.any?(
+               policy.conditions,
+               &(&1.property == :client_verified and &1.values == ["true"])
+             )
+    end
+
+    test "renders client_verified condition from saved policy", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+
+      policy =
+        policy_fixture(
+          group: group,
+          resource: resource,
+          conditions: [
+            %{
+              property: :client_verified,
+              operator: :is,
+              values: ["true"]
+            }
+          ]
+        )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert html =~ "Require Verified Device"
+    end
+
+    test "the attestation toggle is disabled without trust anchors", %{conn: conn, account: account, actor: actor} do
+      policy = policy_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert lv |> element("#policy-postures-require-attestation") |> render() =~ "disabled"
+
+      render_click(lv, "postures_require_attestation", %{})
+      refute lv |> element("#policy-postures-require-attestation") |> render() =~ "checked"
+    end
+
+    test "saves require_attestation", %{conn: conn, account: account, actor: actor} do
+      trust_anchor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      render_click(lv, "postures_require_attestation", %{})
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{group_id: group.id, resource_id: resource.id})
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      assert Repo.get_by!(Policy, id: policy.id, account_id: account.id).require_attestation
+    end
+
+    test "turns off require_attestation after the last trust anchor is gone", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      anchor = trust_anchor_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource, require_attestation: true)
+      Repo.delete!(anchor)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      toggle = lv |> element("#policy-postures-require-attestation") |> render()
+      assert toggle =~ "checked"
+      refute toggle =~ "disabled"
+
+      render_click(lv, "postures_require_attestation", %{})
+
+      lv
+      |> form("[phx-submit='submit_policy_form']", policy: %{group_id: group.id, resource_id: resource.id})
+      |> render_submit()
+
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+
+      refute Repo.get_by!(Policy, id: policy.id, account_id: account.id).require_attestation
+    end
+
+    test "is available without the policy conditions feature", %{conn: conn} do
+      account = account_fixture(features: %{policy_conditions: false})
+      actor = admin_actor_fixture(account: account)
+      trust_anchor_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      refute lv |> element("#policy-postures-require-attestation") |> render() =~ "disabled"
+    end
+  end
+
+  describe ":device postures" do
+    setup do
+      account = device_posture_account_fixture()
+      actor = admin_actor_fixture(account: account)
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      %{account: account, actor: actor, group: group, resource: resource}
+    end
+
+    defp expansion(name) do
+      {:ok, check} = PortalWeb.Policies.Postures.Checks.fetch(name)
+      check.expansion
+    end
+
+    defp saved_postures(group, resource) do
+      Policy
+      |> Repo.get_by!(group_id: group.id, resource_id: resource.id)
+      |> Map.fetch!(:postures)
+      |> Portal.Policies.Postures.to_map()
+    end
+
+    defp toggle(lv, id), do: lv |> element("#policy-postures-checks-#{id}") |> render()
+
+    test "the section is locked when the account lacks the feature", %{conn: conn} do
+      account = account_fixture()
+      actor = admin_actor_fixture(account: account)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      assert html =~ "Device posture"
+      assert html =~ "Upgrade your plan to unlock device posture checks."
+      assert html =~ ~s(data-locked-section="device-posture")
+      refute html =~ ~s(name="policy[postures]")
+    end
+
+    test "toggles checks, gates them on connected providers and saves their rules", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      assert html =~ "Disk encryption"
+      assert html =~ "Connect Intune or Iru to use this check."
+      assert html =~ "to configure over 300 posture fields"
+      assert html =~ "kb/device-posture/grammar?utm_source=product"
+      assert html =~ "settings/trust_anchors"
+      refute html =~ "Unattested devices are matched on the serial number their Client reports"
+
+      assert toggle(lv, "disk_encryption") =~ "disabled"
+      refute toggle(lv, "client_up_to_date") =~ "disabled"
+
+      html = render_click(lv, "postures_toggle_check", %{"name" => "client_up_to_date"})
+      assert toggle(lv, "client_up_to_date") =~ "checked"
+      assert html =~ ~s(&quot;field&quot;:&quot;firezone.last_seen_version&quot;)
+      assert html =~ "Unattested devices are matched on the serial number their Client reports"
+      assert html =~ "kb/device-trust?utm_source=product#device-attributes"
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{group_id: group.id, resource_id: resource.id})
+        |> render_submit()
+
+      assert html =~ "created successfully"
+      assert saved_postures(group, resource) == expansion(:client_up_to_date)
+      assert html =~ "Firezone Client up to date"
+      refute html =~ "Click to expand"
+    end
+
+    test "every connected provider type unlocks its checks, disabled ones do not", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account)
+      Portal.IruFixtures.iru_posture_provider_fixture(account: account)
+      Portal.SentinelOneFixtures.sentinelone_posture_provider_fixture(account: account)
+      Portal.DefenderFixtures.defender_posture_provider_fixture(account: account, is_disabled: true)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      refute toggle(lv, "compliant") =~ "disabled"
+      refute toggle(lv, "disk_encryption") =~ "disabled"
+      refute toggle(lv, "agent_up_to_date") =~ "disabled"
+      assert toggle(lv, "app_allowlisting") =~ "disabled"
+    end
+
+    test "connected providers unlock checks and required attestation silences the warning", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account)
+      trust_anchor_fixture(account: account)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/new")
+
+      refute toggle(lv, "compliant") =~ "disabled"
+      assert toggle(lv, "firewall") =~ "disabled"
+
+      render_click(lv, "postures_toggle_check", %{"name" => "compliant"})
+      html = render_click(lv, "postures_toggle_check", %{"name" => "disk_encryption"})
+      assert html =~ ~s(&quot;field&quot;:&quot;intune.compliance_state&quot;)
+      assert html =~ ~s(&quot;field&quot;:&quot;iru.filevault_enabled&quot;)
+      assert html =~ "Unattested devices are matched on the serial number their Client reports"
+
+      html = render_click(lv, "postures_require_attestation", %{})
+      refute html =~ "Unattested devices are matched on the serial number their Client reports"
+
+      html = render_click(lv, "postures_toggle_check", %{"name" => "compliant"})
+      refute html =~ ~s(&quot;field&quot;:&quot;intune.compliance_state&quot;)
+      refute toggle(lv, "compliant") =~ "checked"
+      assert toggle(lv, "disk_encryption") =~ "checked"
+    end
+
+    test "a policy saved from checks shows them checked when edited", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account)
+      {:ok, postures} = Portal.Policies.Postures.cast(%{"and" => [expansion(:compliant), expansion(:client_up_to_date)]})
+
+      policy =
+        policy_fixture(account: account, group: group, resource: resource)
+        |> Ecto.Changeset.change(postures: postures)
+        |> Repo.update!()
+
+      conn = authorize_conn(conn, actor)
+      {:ok, lv, html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      assert html =~ "Device posture"
+      assert has_element?(lv, "li", "Compliant")
+      assert has_element?(lv, "li", "Firezone Client up to date")
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert toggle(lv, "compliant") =~ "checked"
+      assert toggle(lv, "client_up_to_date") =~ "checked"
+      refute toggle(lv, "disk_encryption") =~ "checked"
+
+      render_click(lv, "postures_toggle_check", %{"name" => "compliant"})
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{description: "fewer checks"})
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+      assert saved_postures(group, resource) == expansion(:client_up_to_date)
+    end
+
+    test "rules written through the API are shown as custom, kept on save, and summarised", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      custom = %{"not" => %{"field" => "intune.jail_broken", "op" => "is", "value" => true}}
+      {:ok, postures} = Portal.Policies.Postures.cast(custom)
+
+      policy =
+        policy_fixture(account: account, group: group, resource: resource)
+        |> Ecto.Changeset.change(postures: postures)
+        |> Repo.update!()
+
+      conn = authorize_conn(conn, actor)
+
+      {:ok, lv, html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      assert html =~ "Device posture"
+      assert html =~ "intune.jail_broken"
+      assert has_element?(lv, "#policy-postures-rules", "Click to expand")
+      assert html =~ "Custom rules"
+      assert html =~ ~r/>\s*Posture\s*</
+
+      {:ok, lv, html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+      assert has_element?(lv, "#policy-postures-json-input")
+      assert html =~ "intune.jail_broken"
+
+      render_click(lv, "postures_tab", %{"tab" => "simple"})
+      assert has_element?(lv, "#policy-postures-checks", "rules these checks cannot show")
+      assert toggle(lv, "client_up_to_date") =~ "disabled"
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{description: "still custom"})
+        |> render_submit()
+
+      assert html =~ "updated successfully"
+      assert saved_postures(group, resource) == custom
+    end
+    test "a check whose provider was removed can still be turned off", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      {:ok, postures} = Portal.Policies.Postures.cast(expansion(:compliant))
+
+      policy =
+        policy_fixture(account: account, group: group, resource: resource)
+        |> Ecto.Changeset.change(postures: postures)
+        |> Repo.update!()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      assert toggle(lv, "compliant") =~ "checked"
+      refute toggle(lv, "compliant") =~ "disabled"
+      assert toggle(lv, "disk_encryption") =~ "disabled"
+
+      render_click(lv, "postures_toggle_check", %{"name" => "compliant"})
+      assert toggle(lv, "compliant") =~ "disabled"
+
+      html =
+        lv
+        |> form("[phx-submit='submit_policy_form']", policy: %{description: "no checks"})
+        |> render_submit()
+
+      assert html =~ "Save these changes?"
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+      assert Repo.get_by!(Policy, group_id: group.id, resource_id: resource.id).postures == nil
+    end
+    test "flags checks no connected provider can answer", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      {:ok, postures} = Portal.Policies.Postures.cast(%{"and" => [expansion(:compliant), expansion(:client_up_to_date)]})
+
+      policy =
+        policy_fixture(account: account, group: group, resource: resource)
+        |> Ecto.Changeset.change(postures: postures)
+        |> Repo.update!()
+
+      conn = authorize_conn(conn, actor)
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      assert has_element?(lv, "li:has([data-posture-check-unavailable])", "Compliant")
+      refute has_element?(lv, "li:has([data-posture-check-unavailable])", "Firezone Client up to date")
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+      assert has_element?(lv, "tr:has(#policy-postures-checks-compliant) [data-posture-check-unavailable]")
+      refute has_element?(lv, "tr:has(#policy-postures-checks-client_up_to_date) [data-posture-check-unavailable]")
+
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account)
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      refute has_element?(lv, "[data-posture-check-unavailable]")
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+      refute has_element?(lv, "[data-posture-check-unavailable]")
+    end
+
+    test "warns when custom rules use providers that are not connected", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account, is_disabled: true)
+
+      custom = %{"not" => %{"field" => "intune.jail_broken", "op" => "is", "value" => true}}
+      {:ok, postures} = Portal.Policies.Postures.cast(custom)
+
+      policy =
+        policy_fixture(account: account, group: group, resource: resource)
+        |> Ecto.Changeset.change(postures: postures)
+        |> Repo.update!()
+
+      conn = authorize_conn(conn, actor)
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      assert has_element?(lv, "[data-postures-unconnected]", "These rules use Intune")
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}/edit")
+      assert has_element?(lv, "[data-postures-unconnected]", "These rules use Intune")
+
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account)
+
+      {:ok, lv, _html} = live(conn, ~p"/#{account}/policies/#{policy.id}")
+      refute has_element?(lv, "[data-postures-unconnected]")
+    end
+
+    test "the JSON tab edits the rules, the Simplified tab follows, and a broken document blocks saving", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      resource: resource
+    } do
+      Portal.IntuneFixtures.intune_posture_provider_fixture(account: account)
+      {:ok, postures} = Portal.Policies.Postures.cast(expansion(:compliant))
+
+      policy =
+        policy_fixture(account: account, group: group, resource: resource)
+        |> Ecto.Changeset.change(postures: postures)
+        |> Repo.update!()
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}/edit")
+
+      refute has_element?(lv, "button[phx-click='postures_reset']")
+      html = render_click(lv, "postures_tab", %{"tab" => "json"})
+      assert html =~ "intune.compliance_state"
+
+      broken = ~s({"and": [)
+      html = lv |> element("#policy-postures-json-input") |> render_change(%{"_postures_json" => broken})
+      assert has_element?(lv, "[data-postures-json-error]", "Unexpected end of input")
+      assert html =~ ~s(data-error-start="8")
+      assert has_element?(lv, "#policy-form button[type='submit'][disabled]")
+      assert has_element?(lv, "button[phx-click='postures_reset']")
+
+      render_click(lv, "postures_tab", %{"tab" => "simple"})
+      assert has_element?(lv, "#policy-postures-checks", "The JSON tab holds an error")
+      assert toggle(lv, "compliant") =~ "checked"
+
+      render_click(lv, "postures_reset")
+      refute has_element?(lv, "button[phx-click='postures_reset']")
+      render_click(lv, "postures_tab", %{"tab" => "json"})
+      refute has_element?(lv, "[data-postures-json-error]")
+
+      lv
+      |> element("#policy-postures-json-input")
+      |> render_change(%{"_postures_json" => JSON.encode!(%{"and" => [expansion(:compliant), expansion(:client_up_to_date)]})})
+
+      refute has_element?(lv, "#policy-form button[type='submit'][disabled]")
+      render_click(lv, "postures_tab", %{"tab" => "simple"})
+      assert toggle(lv, "client_up_to_date") =~ "checked"
+
+      lv
+      |> form("[phx-submit='submit_policy_form']", policy: %{description: "from json"})
+      |> render_submit()
+
+      html = render_click(lv, "save_policy_breaking_change")
+      assert html =~ "updated successfully"
+      assert saved_postures(group, resource) == %{"and" => [expansion(:compliant), expansion(:client_up_to_date)]}
+    end
+  end
+
+  describe ":show action authorizations tab" do
+    test "tab bar shows Overview and Authorizations tabs", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      assert html =~ "Overview"
+      assert html =~ "Authorizations"
+    end
+
+    test "switching to Authorizations tab patches URL", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      render_click(lv, "switch_policy_tab", %{"tab" => "authorizations"})
+      assert_patch(lv, ~p"/#{account}/policies/#{policy.id}?tab=authorizations")
+    end
+
+    test "switching back to Overview tab patches URL", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}?tab=authorizations")
+
+      render_click(lv, "switch_policy_tab", %{"tab" => "overview"})
+      assert_patch(lv, ~p"/#{account}/policies/#{policy.id}?tab=overview")
+    end
+
+    test "Authorizations tab shows empty state when no authorizations exist", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}?tab=authorizations")
+
+      assert html =~ "No recent authorizations"
+
+      assert has_element?(
+               lv,
+               "[data-authorization-flow-logs-notice] a[href='#{~p"/#{account}/logs/flow_logs"}']",
+               "flow logs"
+             )
+    end
+
+    test "Authorizations tab renders actor name", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      site = site_fixture(account: account)
+      named_actor = actor_fixture(account: account, name: "Bob Jones")
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account, site: site)
+      membership = membership_fixture(account: account, actor: named_actor, group: group)
+      policy = policy_fixture(account: account, group: group, resource: resource)
+
+      policy_authorization_fixture(
+        account: account,
+        actor: named_actor,
+        resource: resource,
+        group: group,
+        policy: policy,
+        membership: membership
+      )
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}?tab=authorizations")
+
+      assert html =~ "Bob Jones"
+    end
+
+    test "Overview tab still renders correctly as default (regression)", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      assert html =~ group.name
+      assert html =~ resource.name
+    end
+  end
+
+  describe "delete" do
+    test "shows confirm delete then deletes policy", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      policy = policy_fixture(group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{policy.id}")
+
+      html = render_click(lv, "confirm_delete_policy")
+      assert html =~ "Delete"
+
+      render_click(lv, "delete_policy")
+      assert_patch(lv, ~p"/#{account}/policies")
+    end
+  end
+
+  describe "count badge" do
+    test "shows total policy count after async load", %{conn: conn, account: account, actor: actor} do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      _policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> Phoenix.LiveViewTest.live(~p"/#{account}/policies")
+
+      assert html =~ "Loading..."
+
+      html = render_async(lv)
+
+      assert html =~ "1"
+      assert html =~ "Total"
+      refute html =~ "Loading..."
+    end
+
+    test "increments count on policy insert change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :insert, struct: %Policy{}})
+
+      html = render(lv)
+      assert html =~ "1"
+      assert html =~ "Total"
+    end
+
+    test "decrements count on policy delete change", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      group = group_fixture(account: account)
+      resource = resource_fixture(account: account)
+      _policy = policy_fixture(account: account, group: group, resource: resource)
+
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies")
+
+      render_async(lv)
+
+      send(lv.pid, %Change{op: :delete, old_struct: %Policy{}})
+
+      html = render(lv)
+      assert html =~ "0"
+      assert html =~ "Total"
+    end
+  end
+  describe "live table filters across panel operations" do
+    setup %{account: account} do
+      group = group_fixture(account: account, name: "Engineering Team")
+      other_group = group_fixture(account: account, name: "Marketing Team")
+      resource = resource_fixture(account: account)
+      other_resource = resource_fixture(account: account)
+      matching = policy_fixture(group: group, resource: resource)
+      policy_fixture(group: other_group, resource: other_resource)
+      filter = %{"policies_filter[group_name]" => "Engineering"}
+
+      %{
+        group: group,
+        other_group: other_group,
+        resource: resource,
+        other_resource: other_resource,
+        matching: matching,
+        filter: filter
+      }
+    end
+
+    test "are kept when creating a policy", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      other_group: other_group,
+      other_resource: other_resource,
+      filter: filter
+    } do
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies?#{filter}")
+
+      refute html =~ other_group.name
+
+      render_click(lv, "open_new_policy_form")
+      assert_patch(lv, ~p"/#{account}/policies/new?#{filter}")
+
+      render_click(lv, "cancel_policy_form")
+      assert_patch(lv, ~p"/#{account}/policies?#{filter}")
+
+      render_click(lv, "open_new_policy_form")
+
+      lv
+      |> form("[phx-submit='submit_policy_form']",
+        policy: %{
+          group_id: group.id,
+          resource_id: other_resource.id,
+          description: "Engineering access"
+        }
+      )
+      |> render_submit()
+
+      policy =
+        Portal.Repo.get_by!(Portal.Policy, group_id: group.id, resource_id: other_resource.id)
+
+      assert_patch(lv, ~p"/#{account}/policies/#{policy.id}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "Engineering access"
+      refute html =~ other_group.name
+    end
+
+    test "are kept when editing a policy", %{
+      conn: conn,
+      account: account,
+      actor: actor,
+      group: group,
+      other_group: other_group,
+      resource: resource,
+      matching: matching,
+      filter: filter
+    } do
+      {:ok, lv, _html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/policies/#{matching.id}?#{filter}")
+
+      render_click(lv, "open_edit_form")
+      assert_patch(lv, ~p"/#{account}/policies/#{matching.id}/edit?#{filter}")
+
+      render_click(lv, "cancel_policy_form")
+      assert_patch(lv, ~p"/#{account}/policies/#{matching.id}?#{filter}")
+
+      render_click(lv, "open_edit_form")
+
+      lv
+      |> form("[phx-submit='submit_policy_form']",
+        policy: %{
+          group_id: group.id,
+          resource_id: resource.id,
+          description: "Updated description"
+        }
+      )
+      |> render_submit()
+
+      assert_patch(lv, ~p"/#{account}/policies/#{matching.id}?#{filter}")
+
+      html = render(lv)
+      assert html =~ "Updated description"
+      refute html =~ other_group.name
+    end
+  end
+end
