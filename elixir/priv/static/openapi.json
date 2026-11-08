@@ -6342,6 +6342,23 @@
         "title": "IntunePostureProviderUpdateRequest",
         "type": "object"
       },
+      "ClientVerificationListResponse": {
+        "description": "Response schema for the verifications of a Client",
+        "properties": {
+          "data": {
+            "description": "Verifications, most recent first",
+            "items": {
+              "$ref": "#/components/schemas/ClientVerification"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PaginationMetadata"
+          }
+        },
+        "title": "ClientVerificationListResponse",
+        "type": "object"
+      },
       "IruPostureProviderListResponse": {
         "properties": {
           "data": {
@@ -9889,6 +9906,69 @@
         "title": "SentinelOnePostureProviderListResponse",
         "type": "object"
       },
+      "ClientVerification": {
+        "description": "A period a Client spent verified",
+        "properties": {
+          "client_id": {
+            "description": "ID of the verified Client",
+            "example": "42a7f82f-831a-4a9d-8f17-c66c2bb6e205",
+            "format": "uuid",
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "When the verification stops counting. Null when it holds until revoked.",
+            "example": "2025-04-01T00:00:00Z",
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "id": {
+            "description": "Verification ID",
+            "example": "0b2d4c1e-7a8f-4e3b-9c6d-5f1a2b3c4d5e",
+            "format": "uuid",
+            "type": "string"
+          },
+          "note": {
+            "description": "Why the Client was verified",
+            "example": "Asset tag 4471, checked by IT",
+            "nullable": true,
+            "type": "string"
+          },
+          "revoked_at": {
+            "description": "When the verification ended before or after expiring, by unverifying the Client or by verifying it again on different terms",
+            "example": "2025-02-01T00:00:00Z",
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "description": "Where the verification stands now",
+            "enum": [
+              "active",
+              "expired",
+              "revoked"
+            ],
+            "type": "string"
+          },
+          "verified_at": {
+            "description": "When the verification started",
+            "example": "2025-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "client_id",
+          "verified_at",
+          "expires_at",
+          "revoked_at",
+          "note",
+          "status"
+        ],
+        "title": "ClientVerification",
+        "type": "object"
+      },
       "PoolMemberResponse": {
         "description": "Response schema for Pool Member updates",
         "properties": {
@@ -10100,8 +10180,15 @@
             "format": "date-time",
             "type": "string"
           },
+          "verification_expires_at": {
+            "description": "When the Client's verification stops counting. Null when the Client is not verified or its verification holds until revoked.",
+            "example": "2025-04-01T00:00:00Z",
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
           "verified_at": {
-            "description": "Client verification timestamp",
+            "description": "When an admin verified the Client. Set to the start of the current verification and kept once it expires, so check `verification_expires_at` too.",
             "example": "2025-01-01T00:00:00Z",
             "format": "date-time",
             "nullable": true,
@@ -10139,9 +10226,36 @@
           "online",
           "public_key",
           "updated_at",
+          "verification_expires_at",
           "verified_at"
         ],
         "title": "Client",
+        "type": "object"
+      },
+      "ClientVerifyRequest": {
+        "description": "Optional PUT body for verifying a Client. Without it the Client is verified until the verification is revoked.",
+        "properties": {
+          "verification": {
+            "properties": {
+              "expires_at": {
+                "description": "When the verification stops counting, in the future. Policies that require a verified Client stop granting access at this time. Omit or set to null for a verification that holds until revoked.",
+                "example": "2025-04-01T00:00:00Z",
+                "format": "date-time",
+                "nullable": true,
+                "type": "string"
+              },
+              "note": {
+                "description": "Why the Client is verified",
+                "example": "Asset tag 4471, checked by IT",
+                "maxLength": 1024,
+                "nullable": true,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "title": "ClientVerifyRequest",
         "type": "object"
       },
       "SantaDeviceListResponse": {
@@ -16648,6 +16762,7 @@
     "/clients/{id}/verify": {
       "put": {
         "callbacks": {},
+        "description": "Verifies a Client, until `expires_at` when one is given. Verifying a Client again on the terms it is verified under changes nothing. Other terms, or a verification that has expired, start a new verification, listed under `/clients/{id}/verifications`.\n",
         "operationId": "PortalAPI.ClientController.verify",
         "parameters": [
           {
@@ -16661,6 +16776,17 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientVerifyRequest"
+              }
+            }
+          },
+          "description": "Verification Attributes",
+          "required": false
+        },
         "responses": {
           "200": {
             "content": {
@@ -16735,6 +16861,27 @@
               }
             },
             "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "detail": "The request body failed validation.",
+                  "status": 422,
+                  "title": "Unprocessable Content",
+                  "type": "about:blank",
+                  "validation_errors": {
+                    "name": [
+                      "can't be blank"
+                    ]
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationProblemDetails"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           },
           "429": {
             "content": {
@@ -20600,6 +20747,142 @@
         "summary": "Create Resource",
         "tags": [
           "Resources"
+        ]
+      }
+    },
+    "/clients/{client_id}/verifications": {
+      "get": {
+        "callbacks": {},
+        "description": "Lists every period the Client spent verified, most recent first. At most one of them has not been revoked; it is `active` until it expires.\n",
+        "operationId": "PortalAPI.ClientVerificationController.index",
+        "parameters": [
+          {
+            "description": "Client ID",
+            "example": "00000000-0000-0000-0000-000000000000",
+            "in": "path",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Limit Verifications returned",
+            "example": 10,
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Next/Prev page cursor",
+            "in": "query",
+            "name": "page_cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientVerificationListResponse"
+                }
+              }
+            },
+            "description": "Client Verification List Response"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "detail": "The request could not be processed.",
+                  "status": 400,
+                  "title": "Bad Request",
+                  "type": "about:blank"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "detail": "Authentication credentials were missing or invalid.",
+                  "status": 401,
+                  "title": "Unauthorized",
+                  "type": "about:blank"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "detail": "You do not have permission to perform this action.",
+                  "status": 403,
+                  "title": "Forbidden",
+                  "type": "about:blank"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "detail": "The requested resource could not be found.",
+                  "status": 404,
+                  "title": "Not Found",
+                  "type": "about:blank"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "example": {
+                  "detail": "Rate limit exceeded. Retry after the time indicated in the Retry-After header.",
+                  "status": 429,
+                  "title": "Too Many Requests",
+                  "type": "about:blank"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          }
+        },
+        "summary": "List Verifications for a Client",
+        "tags": [
+          "Clients"
         ]
       }
     },

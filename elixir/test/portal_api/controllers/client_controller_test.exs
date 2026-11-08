@@ -1,5 +1,6 @@
 defmodule PortalAPI.ClientControllerTest do
   use PortalAPI.ConnCase, async: true
+  import Ecto.Query, only: [from: 2]
   alias Portal.Device
 
   import Portal.AccountFixtures
@@ -669,6 +670,81 @@ defmodule PortalAPI.ClientControllerTest do
 
       assert resp["data"]["id"] == client.id
       assert resp["data"]["verified_at"]
+      assert is_nil(resp["data"]["verification_expires_at"])
+    end
+
+    test "verifies a client until expires_at with a note", %{
+      conn: conn,
+      actor: actor,
+      client: client
+    } do
+      expires_at = DateTime.utc_now() |> DateTime.add(30, :day) |> DateTime.truncate(:second)
+
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put(~p"/clients/#{client}/verify",
+          verification: %{expires_at: DateTime.to_iso8601(expires_at), note: "Asset tag 4471"}
+        )
+
+      assert %{"data" => data} = json_response(conn, 200)
+      assert data["verified_at"]
+      assert {:ok, verification_expires_at, 0} = DateTime.from_iso8601(data["verification_expires_at"])
+      assert DateTime.compare(verification_expires_at, expires_at) == :eq
+
+      assert [verification] = Repo.all(from(v in Portal.DeviceVerification, where: v.device_id == ^client.id))
+      assert verification.device_id == client.id
+      assert verification.note == "Asset tag 4471"
+    end
+
+    test "keeps the verification when verified again on the same terms", %{
+      conn: conn,
+      actor: actor,
+      client: client
+    } do
+      conn = conn |> authorize_conn(actor) |> put_req_header("content-type", "application/json")
+
+      assert %{"data" => %{"verified_at" => verified_at}} =
+               conn |> put(~p"/clients/#{client}/verify") |> json_response(200)
+
+      assert %{"data" => %{"verified_at" => ^verified_at}} =
+               conn |> put(~p"/clients/#{client}/verify") |> json_response(200)
+
+      assert [_verification] = Repo.all(from(v in Portal.DeviceVerification, where: v.device_id == ^client.id))
+    end
+
+    test "returns validation errors for an expiry in the past", %{
+      conn: conn,
+      actor: actor,
+      client: client
+    } do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put(~p"/clients/#{client}/verify",
+          verification: %{expires_at: "2020-01-01T00:00:00Z"}
+        )
+
+      assert %{"status" => 422, "validation_errors" => %{"expires_at" => ["must be in the future"]}} =
+               json_response(conn, 422)
+
+      refute Repo.get_by!(Device, id: client.id).verified_at
+    end
+
+    test "returns bad request when verification is not an object", %{
+      conn: conn,
+      actor: actor,
+      client: client
+    } do
+      conn =
+        conn
+        |> authorize_conn(actor)
+        |> put_req_header("content-type", "application/json")
+        |> put(~p"/clients/#{client}/verify", verification: "forever")
+
+      assert %{"status" => 400} = json_response(conn, 400)
     end
 
     test "returns not found for non-existent client", %{conn: conn, actor: actor} do
@@ -701,6 +777,27 @@ defmodule PortalAPI.ClientControllerTest do
 
       assert resp["data"]["id"] == client.id
       refute resp["data"]["verified_at"]
+    end
+
+    test "revokes the verification of a verified client", %{
+      conn: conn,
+      actor: actor,
+      client: client
+    } do
+      conn = conn |> authorize_conn(actor) |> put_req_header("content-type", "application/json")
+
+      expires_at = DateTime.utc_now() |> DateTime.add(1, :day) |> DateTime.to_iso8601()
+
+      conn
+      |> put(~p"/clients/#{client}/verify", verification: %{expires_at: expires_at})
+      |> json_response(200)
+
+      assert %{"data" => data} = conn |> put(~p"/clients/#{client}/unverify") |> json_response(200)
+      assert is_nil(data["verified_at"])
+      assert is_nil(data["verification_expires_at"])
+
+      assert [verification] = Repo.all(from(v in Portal.DeviceVerification, where: v.device_id == ^client.id))
+      assert verification.revoked_at
     end
 
     test "returns not found for non-existent client", %{conn: conn, actor: actor} do

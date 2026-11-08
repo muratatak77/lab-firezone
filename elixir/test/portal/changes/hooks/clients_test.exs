@@ -128,6 +128,69 @@ defmodule Portal.Changes.Hooks.ClientsTest do
       assert :ok == on_update(0, old_data, data)
       assert Repo.get_by(Portal.PolicyAuthorization, id: inbound.id)
     end
+
+    test "update deletes policy authorizations when the verification is cut short" do
+      account = account_fixture()
+      client = client_fixture(account: account, verified_at: DateTime.utc_now())
+
+      old_data = %{
+        "id" => client.id,
+        "type" => "client",
+        "verified_at" => "2023-10-01T00:00:00Z",
+        "verification_expires_at" => "2030-01-01T00:00:00Z",
+        "account_id" => client.account_id
+      }
+
+      data = Map.put(old_data, "verification_expires_at", "2029-01-01T00:00:00Z")
+
+      policy_authorization = policy_authorization_fixture(client: client, account: account)
+
+      assert :ok == on_update(0, old_data, data)
+      refute Repo.get_by(Portal.PolicyAuthorization, id: policy_authorization.id)
+    end
+
+    test "update deletes policy authorizations when an open-ended verification gets an expiry" do
+      account = account_fixture()
+      client = client_fixture(account: account, verified_at: DateTime.utc_now())
+
+      old_data = %{
+        "id" => client.id,
+        "type" => "client",
+        "verified_at" => "2023-10-01T00:00:00Z",
+        "verification_expires_at" => nil,
+        "account_id" => client.account_id
+      }
+
+      data = Map.put(old_data, "verification_expires_at", "2030-01-01T00:00:00Z")
+
+      policy_authorization = policy_authorization_fixture(client: client, account: account)
+
+      assert :ok == on_update(0, old_data, data)
+      refute Repo.get_by(Portal.PolicyAuthorization, id: policy_authorization.id)
+    end
+
+    test "update keeps policy authorizations when the verification is extended" do
+      account = account_fixture()
+      client = client_fixture(account: account, verified_at: DateTime.utc_now())
+
+      old_data = %{
+        "id" => client.id,
+        "type" => "client",
+        "verified_at" => "2023-10-01T00:00:00Z",
+        "verification_expires_at" => "2029-01-01T00:00:00Z",
+        "account_id" => client.account_id
+      }
+
+      policy_authorization = policy_authorization_fixture(client: client, account: account)
+
+      data = Map.put(old_data, "verification_expires_at", "2030-01-01T00:00:00Z")
+      assert :ok == on_update(0, old_data, data)
+      assert Repo.get_by(Portal.PolicyAuthorization, id: policy_authorization.id)
+
+      data = Map.put(old_data, "verification_expires_at", nil)
+      assert :ok == on_update(0, old_data, data)
+      assert Repo.get_by(Portal.PolicyAuthorization, id: policy_authorization.id)
+    end
   end
 
   describe "delete/1" do

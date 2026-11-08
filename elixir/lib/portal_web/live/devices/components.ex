@@ -1046,6 +1046,14 @@ defmodule PortalWeb.Devices.Components do
           </:info>
           <.device_verified_status device={@device} />
         </.device_detail_row>
+        <.device_detail_row
+          :if={is_nil(@device.last_attested_at) and @device.verification_expires_at}
+          label="Verified Until"
+        >
+          <span class="text-xs text-body">
+            <Core.relative_datetime datetime={@device.verification_expires_at} />
+          </span>
+        </.device_detail_row>
         <.device_detail_row label="Version">
           <.version
             current={@device.last_seen_version}
@@ -1313,13 +1321,22 @@ defmodule PortalWeb.Devices.Components do
     }
   end
 
-  defp trust_state(%{verified_at: verified_at}) when not is_nil(verified_at) do
-    %{
-      label: "Verified",
-      icon: "ri-shield-check-line",
-      class: "text-success bg-success-light",
-      title: "An admin vouched for the values this Device reports."
-    }
+  defp trust_state(%{verified_at: verified_at} = device) when not is_nil(verified_at) do
+    if Portal.Device.verified?(device) do
+      %{
+        label: "Verified",
+        icon: "ri-shield-check-line",
+        class: "text-success bg-success-light",
+        title: "An admin vouched for the values this Device reports."
+      }
+    else
+      %{
+        label: "Verification expired",
+        icon: "ri-shield-line",
+        class: "text-warning bg-warning-light",
+        title: "An admin vouched for the values this Device reports, but the verification has expired."
+      }
+    end
   end
 
   defp trust_state(_client), do: nil
@@ -1381,8 +1398,15 @@ defmodule PortalWeb.Devices.Components do
     do: :attested_unverify
 
   defp device_action(%{device: %{verified_at: nil}}), do: :verify
-  defp device_action(%{confirm_unverify_device: true}), do: :confirm_unverify
-  defp device_action(_assigns), do: :unverify
+
+  # An expired verification no longer counts, so it is verified again rather than revoked.
+  defp device_action(%{device: device} = assigns) do
+    cond do
+      Portal.Device.verification_expired?(device) -> :verify
+      assigns[:confirm_unverify_device] -> :confirm_unverify
+      true -> :unverify
+    end
+  end
 
   defp attested_action_icon(:attested_verify), do: "ri-shield-check-line"
   defp attested_action_icon(_action), do: "ri-prohibited-line"

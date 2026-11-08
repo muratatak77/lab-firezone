@@ -960,6 +960,10 @@ defmodule Portal.Safe do
   def permit(_action, Portal.SiteDevice, :account_admin_user), do: :ok
   def permit(_action, Portal.SiteDevice, :api_client), do: :ok
 
+  # DeviceVerification permissions - verifying a device is an admin decision
+  def permit(_action, Portal.DeviceVerification, :account_admin_user), do: :ok
+  def permit(_action, Portal.DeviceVerification, :api_client), do: :ok
+
   # PolicyAuthorization permissions - all actor types can read and create policy_authorizations
   def permit(:read, Portal.PolicyAuthorization, _), do: :ok
   def permit(:insert, Portal.PolicyAuthorization, _), do: :ok

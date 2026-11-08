@@ -70,6 +70,7 @@ defmodule Portal.Device do
           last_attested_cert_issuer: binary() | nil,
           last_attested_at: DateTime.t() | nil,
           verified_at: DateTime.t() | nil,
+          verification_expires_at: DateTime.t() | nil,
           inserted_at: DateTime.t(),
           updated_at: DateTime.t()
         }
@@ -118,6 +119,9 @@ defmodule Portal.Device do
     # `attested?` presence attribute).
     field :last_attested_at, :utc_datetime_usec
     field :verified_at, :utc_datetime_usec
+    # When the verification stops counting, NULL when it holds until revoked.
+    # Policies read the two together, see `verified?/2`.
+    field :verification_expires_at, :utc_datetime_usec
 
     # Gateway-only
     belongs_to :site, Portal.Site
@@ -190,6 +194,10 @@ defmodule Portal.Device do
     |> check_constraint(:type, name: :devices_type_check)
     |> check_constraint(:actor_id, name: :device_type_client_fields)
     |> check_constraint(:site_id, name: :device_type_gateway_fields)
+    |> check_constraint(:verification_expires_at,
+      name: :verification_expires_at_requires_verified_at,
+      message: "requires the device to be verified"
+    )
     |> unique_firezone_id_constraint()
     |> unique_constraint(:ipv4, name: :devices_account_id_ipv4_index)
     |> unique_constraint(:ipv6, name: :devices_account_id_ipv6_index)
@@ -285,11 +293,13 @@ defmodule Portal.Device do
   end
 
   defp validate_gateway_verification(changeset) do
-    if is_nil(get_field(changeset, :verified_at)) do
-      changeset
-    else
-      add_error(changeset, :verified_at, "can only be set for client devices")
-    end
+    Enum.reduce(~w[verified_at verification_expires_at]a, changeset, fn field, changeset ->
+      if is_nil(get_field(changeset, field)) do
+        changeset
+      else
+        add_error(changeset, field, "can only be set for client devices")
+      end
+    end)
   end
 
   # Empty / whitespace-only inputs collapse to nil so users can clear the field by
@@ -319,6 +329,24 @@ defmodule Portal.Device do
         changeset
     end
   end
+
+  @doc """
+  Whether an admin's verification of the device holds at `now`: it was
+  verified and the verification has not expired.
+  """
+  @spec verified?(t(), DateTime.t()) :: boolean()
+  def verified?(device, now \\ DateTime.utc_now())
+  def verified?(%__MODULE__{verified_at: nil}, _now), do: false
+  def verified?(%__MODULE__{verification_expires_at: nil}, _now), do: true
+
+  def verified?(%__MODULE__{verification_expires_at: expires_at}, now),
+    do: DateTime.after?(expires_at, now)
+
+  @doc "Whether the device was verified but the verification has since expired."
+  @spec verification_expired?(t(), DateTime.t()) :: boolean()
+  def verification_expired?(device, now \\ DateTime.utc_now())
+  def verification_expired?(%__MODULE__{verified_at: nil}, _now), do: false
+  def verification_expired?(device, now), do: not verified?(device, now)
 
   # Gateway device helpers
 

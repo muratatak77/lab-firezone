@@ -35,6 +35,7 @@ defmodule PortalAPI.Schemas.Gateway do
                :site_id,
                :type,
                :updated_at,
+               :verification_expires_at,
                :verified_at
              ]}
     OpenApiSpex.schema(%{

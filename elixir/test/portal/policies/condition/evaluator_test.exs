@@ -309,6 +309,32 @@ defmodule Portal.Policies.EvaluatorTest do
       assert fetch_conformation_expiration(condition, unverified_client, nil) == :error
     end
 
+    test "is with values [\"true\"] expires with the verification" do
+      expires_at = DateTime.add(DateTime.utc_now(), 1, :day)
+
+      client = %Portal.Device{
+        type: :client,
+        verified_at: DateTime.utc_now(),
+        verification_expires_at: expires_at
+      }
+
+      condition = %{property: :client_verified, operator: :is, values: ["true"]}
+
+      assert fetch_conformation_expiration(condition, client, nil) == {:ok, expires_at}
+    end
+
+    test "is with values [\"true\"] returns error when the verification has expired" do
+      client = %Portal.Device{
+        type: :client,
+        verified_at: DateTime.add(DateTime.utc_now(), -2, :day),
+        verification_expires_at: DateTime.add(DateTime.utc_now(), -1, :day)
+      }
+
+      condition = %{property: :client_verified, operator: :is, values: ["true"]}
+
+      assert fetch_conformation_expiration(condition, client, nil) == :error
+    end
+
     test "is with values other than [\"true\"] always returns ok" do
       verified_client = %Portal.Device{type: :client, verified_at: DateTime.utc_now()}
       unverified_client = %Portal.Device{type: :client, verified_at: nil}

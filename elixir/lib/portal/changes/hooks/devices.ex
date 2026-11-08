@@ -23,10 +23,10 @@ defmodule Portal.Changes.Hooks.Devices do
       device = struct_from_params(Portal.Device, data)
       change = %Change{lsn: lsn, op: :update, old_struct: old_device, struct: device}
 
-      # Unverifying a client device - delete associated policy_authorizations
+      # Authorizations granted while verified carry the old expiry at the latest,
+      # so they are deleted when the verification is revoked or cut short.
       # changed on the base while this PR was open (1794116973)
-      if device.type == :client and
-           not is_nil(old_device.verified_at) and is_nil(device.verified_at) do
+      if device.type == :client and verification_narrowed?(old_device, device) do
         Database.delete_policy_authorizations_for_device(device)
       end
 
@@ -45,6 +45,14 @@ defmodule Portal.Changes.Hooks.Devices do
 
     PubSub.Changes.broadcast(device.account_id, :devices, change)
   end
+
+  defp verification_narrowed?(%{verified_at: nil}, _device), do: false
+  defp verification_narrowed?(_old_device, %{verified_at: nil}), do: true
+  defp verification_narrowed?(_old_device, %{verification_expires_at: nil}), do: false
+  defp verification_narrowed?(%{verification_expires_at: nil}, _device), do: true
+
+  defp verification_narrowed?(old_device, device),
+    do: DateTime.before?(device.verification_expires_at, old_device.verification_expires_at)
 
   defp latest_session_only_change?(old_data, data) when is_map(old_data) and is_map(data) do
     changed = for {key, value} <- data, Map.get(old_data, key) != value, do: key

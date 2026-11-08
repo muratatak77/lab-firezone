@@ -472,6 +472,7 @@ defmodule PortalWeb.Devices do
     selected_device = %{
       socket.assigns.selected_device
       | verified_at: updated_client.verified_at,
+        verification_expires_at: updated_client.verification_expires_at,
         updated_at: updated_client.updated_at
     }
 
@@ -547,7 +548,6 @@ defmodule PortalWeb.Devices do
   defmodule Database do
     import Ecto.Changeset
     import Ecto.Query
-    import Portal.Changeset
     import Portal.Repo.Query
     alias Portal.{Presence.Devices, Safe}
     alias Portal.Device
@@ -673,21 +673,15 @@ defmodule PortalWeb.Devices do
     end
 
     @spec verify_device(Portal.Device.t(), Portal.Authentication.Subject.t()) ::
-            {:ok, Portal.Device.t()} | {:error, Ecto.Changeset.t()}
+            {:ok, Portal.Device.t()} | {:error, term()}
     def verify_device(device, subject) do
-      device
-      |> change()
-      |> put_default_value(:verified_at, DateTime.utc_now())
-      |> update_device(subject)
+      Portal.Devices.verify_client(device, %{}, subject)
     end
 
     @spec remove_device_verification(Portal.Device.t(), Portal.Authentication.Subject.t()) ::
-            {:ok, Portal.Device.t()} | {:error, Ecto.Changeset.t()}
+            {:ok, Portal.Device.t()} | {:error, term()}
     def remove_device_verification(device, subject) do
-      device
-      |> change()
-      |> put_change(:verified_at, nil)
-      |> update_device(subject)
+      Portal.Devices.unverify_client(device, subject)
     end
 
     @spec delete_device(Portal.Device.t(), Portal.Authentication.Subject.t()) ::
@@ -809,12 +803,16 @@ defmodule PortalWeb.Devices do
 
     # A device that attested is badged "Attested" rather than "Verified" however
     # its verified_at reads, so the two options have to be exclusive here too or
-    # the filter would disagree with the panel.
+    # the filter would disagree with the panel. An expired verification counts
+    # as none, as it does for policies.
     def filter_by_attestation(queryable, "verified") do
+      now = DateTime.utc_now()
+
       {queryable,
        dynamic(
          [devices: devices],
-         not is_nil(devices.verified_at) and is_nil(devices.last_attested_at)
+         not is_nil(devices.verified_at) and is_nil(devices.last_attested_at) and
+           (is_nil(devices.verification_expires_at) or devices.verification_expires_at > ^now)
        )}
     end
 
@@ -823,10 +821,13 @@ defmodule PortalWeb.Devices do
     end
 
     def filter_by_attestation(queryable, "none") do
+      now = DateTime.utc_now()
+
       {queryable,
        dynamic(
          [devices: devices],
-         is_nil(devices.verified_at) and is_nil(devices.last_attested_at)
+         is_nil(devices.last_attested_at) and
+           (is_nil(devices.verified_at) or devices.verification_expires_at <= ^now)
        )}
     end
 

@@ -197,6 +197,24 @@ defmodule Portal.DeviceFixtures do
   end
 
   @doc """
+  Inserts a verification period of a client, the history row
+  `Portal.Devices.verify_client/3` writes next to the client's `verified_at`.
+  """
+  def device_verification_fixture(%Portal.Device{type: :client} = client, attrs \\ %{}) do
+    attrs = Enum.into(attrs, %{})
+
+    %Portal.DeviceVerification{
+      account_id: client.account_id,
+      device_id: client.id,
+      verified_at: Map.get(attrs, :verified_at, DateTime.utc_now()),
+      expires_at: Map.get(attrs, :expires_at),
+      revoked_at: Map.get(attrs, :revoked_at),
+      note: Map.get(attrs, :note)
+    }
+    |> Portal.Repo.insert!()
+  end
+
+  @doc """
   Verify a device (sets verified_at timestamp).
   """
   def verify_device(device) do

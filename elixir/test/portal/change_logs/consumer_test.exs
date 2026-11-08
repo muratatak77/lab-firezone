@@ -49,6 +49,10 @@ defmodule Portal.ChangeLogs.ConsumerTest do
       assert "account_slugs" in tables
     end
 
+    test "includes device verifications in the audit publication", %{tables: tables} do
+      assert "device_verifications" in tables
+    end
+
     test "includes the provider log sink tables but not the delivery machinery", %{
       tables: tables
     } do
