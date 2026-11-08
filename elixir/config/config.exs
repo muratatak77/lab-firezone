@@ -108,6 +108,7 @@ config :portal, Portal.ChangeLogs.Consumer,
     okta_directories
     google_directories
     devices
+    device_verifications
     sites
     gateway_tokens
     policies

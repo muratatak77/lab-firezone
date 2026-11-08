@@ -156,7 +156,18 @@ defmodule PortalAPI.Schemas.Client do
           type: :string,
           format: :"date-time",
           nullable: true,
-          description: "Client verification timestamp"
+          description:
+            "When an admin verified the Client. Set to the start of the current verification " <>
+              "and kept once it expires, so check `verification_expires_at` too."
+        },
+        verification_expires_at: %Schema{
+          example: "2025-04-01T00:00:00Z",
+          type: :string,
+          format: :"date-time",
+          nullable: true,
+          description:
+            "When the Client's verification stops counting. Null when the Client is not " <>
+              "verified or its verification holds until revoked."
         },
         public_key: %Schema{
           example: "WdKAyoA45xJllRUYnFhI5+Y4EjSTs50MzYYHfrIhVAc=",
@@ -261,6 +272,7 @@ defmodule PortalAPI.Schemas.Client do
         :online,
         :public_key,
         :updated_at,
+        :verification_expires_at,
         :verified_at
       ]
     })

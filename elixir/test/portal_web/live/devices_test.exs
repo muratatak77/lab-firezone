@@ -11,6 +11,8 @@ defmodule PortalWeb.DevicesTest do
     end
   end
 
+  import Ecto.Query, only: [from: 2]
+
   alias Portal.{Device, Repo}
   alias Portal.Changes.Change
 
@@ -156,6 +158,25 @@ defmodule PortalWeb.DevicesTest do
           refute has_element?(lv, "#device-#{client.id}")
         end
       end
+    end
+
+    test "counts an expired verification as no trust level", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      expired = expired_verification_client_fixture(account: account, actor: actor, name: "Old Mac")
+      conn = authorize_conn(conn, actor)
+
+      {:ok, lv, _html} =
+        live(conn, ~p"/#{account}/devices?#{%{"devices_filter[attestation]" => "verified"}}")
+
+      refute has_element?(lv, "#device-#{expired.id}")
+
+      {:ok, lv, _html} =
+        live(conn, ~p"/#{account}/devices?#{%{"devices_filter[attestation]" => "none"}}")
+
+      assert has_element?(lv, "#device-#{expired.id}")
     end
 
     test "a device that attested cannot be verified by hand", %{
@@ -480,12 +501,55 @@ defmodule PortalWeb.DevicesTest do
       assert html =~ "Device &quot;#{client.name}&quot; was verified."
       assert html =~ "Verified"
       assert updated_client.verified_at
+      assert [verification] = Repo.all(from(v in Portal.DeviceVerification, where: v.device_id == ^client.id))
+      assert verification.device_id == client.id
       refute has_element?(lv, "button[phx-click='verify_device']", "Verify")
       assert has_element?(
                lv,
                "button[phx-click='confirm_unverify_device']",
                "Revoke verification"
              )
+    end
+
+    test "offers to verify a client again once its verification has expired", %{
+      conn: conn,
+      account: account,
+      actor: actor
+    } do
+      client = expired_verification_client_fixture(account: account, actor: actor, name: "Old Mac")
+
+      {:ok, lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/devices/#{client.id}")
+
+      assert html =~ "Verification expired"
+      assert html =~ "Verified Until"
+      refute has_element?(lv, "button[phx-click='confirm_unverify_device']")
+
+      html = render_click(lv, "verify_device")
+      updated_client = Repo.get_by!(Device, account_id: account.id, id: client.id)
+
+      assert html =~ "Device &quot;#{client.name}&quot; was verified."
+      refute html =~ "Verification expired"
+      assert Device.verified?(updated_client)
+      assert is_nil(updated_client.verification_expires_at)
+    end
+
+    test "shows when a verification expires", %{conn: conn, account: account, actor: actor} do
+      client =
+        %{account: account, actor: actor, name: "Contractor Laptop"}
+        |> verified_client_fixture()
+        |> Ecto.Changeset.change(verification_expires_at: DateTime.add(DateTime.utc_now(), 3, :day))
+        |> Repo.update!()
+
+      {:ok, _lv, html} =
+        conn
+        |> authorize_conn(actor)
+        |> live(~p"/#{account}/devices/#{client.id}")
+
+      assert html =~ "Verified Until"
+      refute html =~ "Verification expired"
     end
 
     test "shows unverify confirmation and cancels", %{
@@ -1732,5 +1796,17 @@ defmodule PortalWeb.DevicesTest do
       render_click(lv, "close_panel")
       assert_patch(lv, ~p"/#{account}/devices?#{filter}")
     end
+  end
+
+  defp expired_verification_client_fixture(attrs) do
+    verified_at = DateTime.add(DateTime.utc_now(), -30, :day)
+    expires_at = DateTime.add(DateTime.utc_now(), -1, :day)
+
+    attrs
+    |> Map.new()
+    |> Map.put(:verified_at, verified_at)
+    |> client_fixture()
+    |> Ecto.Changeset.change(verification_expires_at: expires_at)
+    |> Repo.update!()
   end
 end

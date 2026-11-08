@@ -23,6 +23,7 @@ defmodule PortalAPI.Scopes do
     PortalAPI.MembershipController => :groups,
     PortalAPI.ExternalIdentityController => :external_identities,
     PortalAPI.ClientController => :clients,
+    PortalAPI.ClientVerificationController => :clients,
     PortalAPI.ClientTokenController => :client_tokens,
     PortalAPI.SiteController => :sites,
     PortalAPI.GatewayController => :gateways,

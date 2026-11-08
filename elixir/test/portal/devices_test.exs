@@ -180,6 +180,205 @@ defmodule Portal.DevicesTest do
     end
   end
 
+  describe "verify_client/3" do
+    setup do
+      account = account_fixture()
+      client = client_fixture(account: account)
+      subject = admin_subject_fixture(account: account)
+
+      %{account: account, client: client, subject: subject}
+    end
+
+    test "verifies a client until revoked and records the verification", %{
+      client: client,
+      subject: subject
+    } do
+      assert {:ok, %Device{} = verified} = Devices.verify_client(client, %{}, subject)
+
+      assert verified.verified_at
+      assert is_nil(verified.verification_expires_at)
+      assert Device.verified?(verified)
+
+      assert [verification] = verifications(client)
+      assert verification.verified_at == verified.verified_at
+      assert is_nil(verification.expires_at)
+      assert is_nil(verification.revoked_at)
+      assert is_nil(verification.note)
+    end
+
+    test "verifies a client until expires_at with a note", %{client: client, subject: subject} do
+      expires_at = DateTime.utc_now() |> DateTime.add(30, :day) |> DateTime.truncate(:second)
+
+      assert {:ok, verified} =
+               Devices.verify_client(
+                 client,
+                 %{"expires_at" => DateTime.to_iso8601(expires_at), "note" => "  Asset tag 4471  "},
+                 subject
+               )
+
+      assert DateTime.compare(verified.verification_expires_at, expires_at) == :eq
+
+      assert [verification] = verifications(client)
+      assert DateTime.compare(verification.expires_at, expires_at) == :eq
+      assert verification.note == "Asset tag 4471"
+    end
+
+    test "changes nothing when verified again on the same terms", %{
+      client: client,
+      subject: subject
+    } do
+      attrs = %{"expires_at" => DateTime.add(DateTime.utc_now(), 1, :day), "note" => "Lab"}
+
+      assert {:ok, first} = Devices.verify_client(client, attrs, subject)
+      assert {:ok, second} = Devices.verify_client(first, attrs, subject)
+
+      assert second.verified_at == first.verified_at
+      assert [_verification] = verifications(client)
+    end
+
+    test "keeps a verification recorded before expiries existed", %{client: client, subject: subject} do
+      verified_at = DateTime.add(DateTime.utc_now(), -10, :day)
+      client = client |> Ecto.Changeset.change(verified_at: verified_at) |> Repo.update!()
+      device_verification_fixture(client, verified_at: verified_at)
+
+      assert {:ok, verified} = Devices.verify_client(client, %{}, subject)
+
+      assert DateTime.compare(verified.verified_at, verified_at) == :eq
+      assert [_verification] = verifications(client)
+    end
+
+    test "revokes the current verification when verified on other terms", %{
+      client: client,
+      subject: subject
+    } do
+      assert {:ok, first} = Devices.verify_client(client, %{}, subject)
+
+      expires_at = DateTime.utc_now() |> DateTime.add(7, :day) |> DateTime.truncate(:second)
+
+      assert {:ok, second} =
+               Devices.verify_client(first, %{"expires_at" => expires_at}, subject)
+
+      assert DateTime.compare(second.verification_expires_at, expires_at) == :eq
+      assert DateTime.compare(second.verified_at, first.verified_at) == :gt
+
+      assert [current, previous] = verifications(client)
+      assert is_nil(current.revoked_at)
+      assert DateTime.compare(current.expires_at, expires_at) == :eq
+      assert DateTime.compare(previous.revoked_at, second.verified_at) == :eq
+    end
+
+    test "starts a new verification once the current one has expired", %{
+      client: client,
+      subject: subject
+    } do
+      verified_at = DateTime.add(DateTime.utc_now(), -10, :day)
+      expires_at = DateTime.add(DateTime.utc_now(), -1, :day)
+
+      client =
+        client
+        |> Ecto.Changeset.change(verified_at: verified_at, verification_expires_at: expires_at)
+        |> Repo.update!()
+
+      expired = device_verification_fixture(client, verified_at: verified_at, expires_at: expires_at)
+
+      assert {:ok, verified} = Devices.verify_client(client, %{}, subject)
+
+      assert Device.verified?(verified)
+      assert is_nil(verified.verification_expires_at)
+      assert Repo.get_by!(Portal.DeviceVerification, id: expired.id).revoked_at
+    end
+
+    test "refuses an expiry that is not in the future", %{client: client, subject: subject} do
+      past = DateTime.add(DateTime.utc_now(), -1, :minute)
+
+      assert {:error, changeset} = Devices.verify_client(client, %{"expires_at" => past}, subject)
+      assert %{expires_at: ["must be in the future"]} = errors_on(changeset)
+
+      assert is_nil(Repo.get_by!(Device, id: client.id).verified_at)
+      assert verifications(client) == []
+    end
+
+    test "refuses a note longer than 1024 characters", %{client: client, subject: subject} do
+      note = String.duplicate("a", 1025)
+
+      assert {:error, changeset} = Devices.verify_client(client, %{"note" => note}, subject)
+      assert %{note: ["should be at most 1024 character(s)"]} = errors_on(changeset)
+    end
+
+    test "is refused to actors that are not admins" do
+      account = account_fixture()
+      client = client_fixture(account: account)
+      subject = subject_fixture(account: account, actor: %{type: :account_user, account: account})
+
+      assert {:error, :unauthorized} = Devices.verify_client(client, %{}, subject)
+
+      assert is_nil(Repo.get_by!(Device, id: client.id).verified_at)
+      assert verifications(client) == []
+    end
+  end
+
+  describe "unverify_client/2" do
+    setup do
+      account = account_fixture()
+      client = client_fixture(account: account)
+      subject = admin_subject_fixture(account: account)
+
+      %{account: account, client: client, subject: subject}
+    end
+
+    test "revokes the verification of a client", %{client: client, subject: subject} do
+      expires_at = DateTime.add(DateTime.utc_now(), 1, :day)
+      {:ok, client} = Devices.verify_client(client, %{"expires_at" => expires_at}, subject)
+
+      assert {:ok, unverified} = Devices.unverify_client(client, subject)
+
+      assert is_nil(unverified.verified_at)
+      assert is_nil(unverified.verification_expires_at)
+
+      assert [verification] = verifications(client)
+      assert verification.revoked_at
+    end
+
+    test "leaves a client that is not verified as it is", %{client: client, subject: subject} do
+      assert {:ok, unverified} = Devices.unverify_client(client, subject)
+
+      assert is_nil(unverified.verified_at)
+      assert verifications(client) == []
+    end
+  end
+
+  describe "list_verifications/3" do
+    test "lists the verifications of the client, most recent first" do
+      account = account_fixture()
+      client = client_fixture(account: account)
+      other_client = client_fixture(account: account)
+      subject = admin_subject_fixture(account: account)
+
+      now = DateTime.utc_now()
+
+      older =
+        device_verification_fixture(client,
+          verified_at: DateTime.add(now, -2, :day),
+          revoked_at: DateTime.add(now, -1, :day)
+        )
+
+      newer = device_verification_fixture(client, verified_at: now)
+      device_verification_fixture(other_client)
+
+      assert {:ok, [first, second], _metadata} = Devices.list_verifications(client, subject)
+      assert first.id == newer.id
+      assert second.id == older.id
+    end
+  end
+
+  defp verifications(client) do
+    from(v in Portal.DeviceVerification,
+      where: v.device_id == ^client.id,
+      order_by: [desc: v.verified_at]
+    )
+    |> Repo.all()
+  end
+
   describe "owner_name/1" do
     test "is the name of people and nothing for service accounts" do
       assert Devices.owner_name(%Portal.Actor{type: :account_user, name: "Jamil"}) == "Jamil"

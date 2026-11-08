@@ -126,6 +126,7 @@ defmodule PortalAPI.Router do
     resources "/clients", ClientController, except: [:new, :edit, :create]
     put "/clients/:id/verify", ClientController, :verify
     put "/clients/:id/unverify", ClientController, :unverify
+    get "/clients/:client_id/verifications", ClientVerificationController, :index
 
     get "/logs", LogController, :index
     get "/logs/:log_id", LogController, :show

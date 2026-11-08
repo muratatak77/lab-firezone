@@ -2354,6 +2354,49 @@ defmodule PortalAPI.Client.ChannelTest do
       assert payload == resource.id
     end
 
+    test "for client updates deletes resources once the verification has expired",
+         %{
+           client: client,
+           actor: actor,
+           account: account,
+           subject: subject
+         } do
+      identity_fixture(actor: actor, account: account)
+      group = group_fixture(account: account)
+      site = site_fixture(account: account)
+      resource = dns_resource_fixture(account: account, site: site, ip_stack: :ipv4_only)
+
+      policy_fixture(
+        account: account,
+        group: group,
+        resource: resource,
+        conditions: [%{property: :client_verified, operator: :is, values: ["true"]}]
+      )
+
+      membership_fixture(account: account, actor: actor, group: group)
+
+      verified_client = verify_device(client)
+      socket = join_channel(verified_client, subject)
+      assert_push "init", %{resources: resources}
+      assert Enum.any?(resources, &(&1.id == resource.id))
+
+      # Only the expiry changes: the verification started long ago and has lapsed
+      expired_client = %{
+        verified_client
+        | verification_expires_at: DateTime.add(DateTime.utc_now(), -1, :minute)
+      }
+
+      send(socket.channel_pid, %Changes.Change{
+        lsn: 100,
+        op: :update,
+        old_struct: broadcast_struct(verified_client),
+        struct: broadcast_struct(expired_client)
+      })
+
+      assert_push "resource_deleted", payload
+      assert payload == resource.id
+    end
+
     test "for policies requiring attestation grants only the connection that attested",
          %{
            client: client,

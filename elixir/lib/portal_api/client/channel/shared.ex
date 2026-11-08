@@ -2398,7 +2398,8 @@ defmodule PortalAPI.Client.Channel.Shared do
       end
 
     # Changes in client verification can affect the list of allowed resources
-    if old_client.verified_at != client.verified_at do
+    if old_client.verified_at != client.verified_at or
+         old_client.verification_expires_at != client.verification_expires_at do
       Cache.Client.recompute_connectable_resources(
         socket.assigns.cache,
         socket.assigns.client,

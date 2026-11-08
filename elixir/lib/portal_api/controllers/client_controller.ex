@@ -8,8 +8,6 @@ defmodule PortalAPI.ClientController do
   alias PortalAPI.Schemas.ProblemDetails
   alias Portal.Presence.Devices
   alias __MODULE__.Database
-  import Ecto.Changeset
-  import Portal.Changeset
 
   tags(["Clients"])
 
@@ -221,6 +219,12 @@ defmodule PortalAPI.ClientController do
   # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
   operation(:verify,
     summary: "Verify Client",
+    description: """
+    Verifies a Client, until `expires_at` when one is given. Verifying a Client \
+    again on the terms it is verified under changes nothing. Other terms, or \
+    a verification that has expired, start a new verification, listed under \
+    `/clients/{id}/verifications`.
+    """,
     parameters: [
       id: [
         in: :path,
@@ -229,25 +233,39 @@ defmodule PortalAPI.ClientController do
         example: "00000000-0000-0000-0000-000000000000"
       ]
     ],
+    request_body:
+      {"Verification Attributes", "application/json", PortalAPI.Schemas.ClientVerification.Request,
+       required: false},
     responses:
       [ok: {"Client Response", "application/json", PortalAPI.Schemas.Client.Response}] ++
-        ProblemDetails.responses([:bad_request, :unauthorized, :too_many_requests, :not_found])
+        ProblemDetails.responses([
+          :bad_request,
+          :unauthorized,
+          :too_many_requests,
+          :not_found,
+          :unprocessable_entity
+        ])
   )
 
   # coveralls-ignore-stop
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
-  def verify(conn, %{"id" => id}) do
+  def verify(conn, %{"id" => id} = params) do
     subject = conn.assigns.subject
 
-    with {:ok, client} <- Database.fetch_client(id, subject),
-         changeset = client |> change() |> put_default_value(:verified_at, DateTime.utc_now()),
-         {:ok, client} <- Database.verify_client(changeset, subject) do
+    with {:ok, attrs} <- verification_attrs(params),
+         {:ok, client} <- Database.fetch_client(id, subject),
+         {:ok, client} <- Portal.Devices.verify_client(client, attrs, subject) do
+      client = Devices.preload_presence([client]) |> List.first()
       json(conn, JSON.encode(client, schema: PortalAPI.Schemas.Client.GetSchema))
     else
       error -> Error.handle(conn, error)
     end
   end
+
+  defp verification_attrs(%{"verification" => attrs}) when is_map(attrs), do: {:ok, attrs}
+  defp verification_attrs(%{"verification" => _attrs}), do: {:error, :bad_request}
+  defp verification_attrs(_params), do: {:ok, %{}}
 
   # coveralls-ignore-start - OpenApiSpex operation specs are compile-time, not executable
   operation(:unverify,
@@ -272,8 +290,8 @@ defmodule PortalAPI.ClientController do
     subject = conn.assigns.subject
 
     with {:ok, client} <- Database.fetch_client(id, subject),
-         changeset = client |> change() |> put_change(:verified_at, nil),
-         {:ok, client} <- Database.remove_client_verification(changeset, subject) do
+         {:ok, client} <- Portal.Devices.unverify_client(client, subject) do
+      client = Devices.preload_presence([client]) |> List.first()
       json(conn, JSON.encode(client, schema: PortalAPI.Schemas.Client.GetSchema))
     else
       error -> Error.handle(conn, error)
@@ -473,30 +491,6 @@ defmodule PortalAPI.ClientController do
 
         {:error, reason} ->
           {:error, reason}
-      end
-    end
-
-    def verify_client(changeset, subject) do
-      case Safe.scoped(changeset, subject) |> Safe.update() do
-        {:ok, updated_client} ->
-          {:ok, Devices.preload_presence([updated_client]) |> List.first()}
-
-        # coveralls-ignore-start - defensive: Safe.update on a server-built changeset cannot fail
-        {:error, reason} ->
-          {:error, reason}
-          # coveralls-ignore-stop
-      end
-    end
-
-    def remove_client_verification(changeset, subject) do
-      case Safe.scoped(changeset, subject) |> Safe.update() do
-        {:ok, updated_client} ->
-          {:ok, Devices.preload_presence([updated_client]) |> List.first()}
-
-        # coveralls-ignore-start - defensive: Safe.update on a server-built changeset cannot fail
-        {:error, reason} ->
-          {:error, reason}
-          # coveralls-ignore-stop
       end
     end
 

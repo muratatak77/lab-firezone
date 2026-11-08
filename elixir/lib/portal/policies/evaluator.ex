@@ -170,13 +170,14 @@ defmodule Portal.Policies.Evaluator do
           operator: :is,
           values: ["true"]
         },
-        %Device{type: :client, verified_at: verified_at},
+        %Device{type: :client} = client,
         _auth_provider_id
       ) do
-    if is_nil(verified_at) do
-      :error
+    # A verification that expires ends the access it grants at the same time.
+    if Device.verified?(client, current_time()) do
+      {:ok, client.verification_expires_at}
     else
-      {:ok, nil}
+      :error
     end
   end
 
