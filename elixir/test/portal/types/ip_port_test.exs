@@ -29,7 +29,7 @@ defmodule Portal.Types.IPPortTest do
                   port: 65_535
                 }}
 
-      assert cast("1.1.1.1:65536") == {:error, [message: "is invalid"]}
+      assert cast("1.1.1.1:65536") == {:error, [message: "is not valid"]}
     end
   end
 
