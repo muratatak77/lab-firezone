@@ -25,6 +25,7 @@ defmodule Portal.Changes.Hooks.Devices do
 
       # Authorizations granted while verified carry the old expiry at the latest,
       # so they are deleted when the verification is revoked or cut short.
+      # changed on the base while this PR was open (1794110250)
       if device.type == :client and verification_narrowed?(old_device, device) do
         Database.delete_policy_authorizations_for_device(device)
       end
