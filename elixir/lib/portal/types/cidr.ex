@@ -169,3 +169,5 @@ defmodule Portal.Types.CIDR do
 
   def to_string(%Postgrex.INET{} = inet), do: Portal.Types.INET.to_string(inet)
 end
+
+# Lab note.
