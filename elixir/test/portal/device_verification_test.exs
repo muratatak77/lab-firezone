@@ -31,6 +31,15 @@ defmodule Portal.DeviceVerificationTest do
       assert Ecto.Changeset.get_field(changeset, :note) == "Lab"
     end
 
+    test "treats a blank note as no note", %{now: now} do
+      for note <- ["", "   "] do
+        changeset = DeviceVerification.terms_changeset(%{"note" => note}, now)
+
+        assert changeset.valid?
+        assert is_nil(Ecto.Changeset.get_field(changeset, :note))
+      end
+    end
+
     test "refuses an expiry that is not in the future", %{now: now} do
       changeset = DeviceVerification.terms_changeset(%{"expires_at" => now}, now)
 

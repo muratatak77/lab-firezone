@@ -76,6 +76,10 @@ defmodule Portal.Devices do
   Verifying a client again on the terms it is already verified under changes
   nothing, so the call is idempotent. Different terms, or a verification that
   has expired, revoke the current verification and start a new one.
+
+  Returns `{:ok, client}` with the client as it is verified now, or
+  `{:error, reason}`, for example an invalid terms changeset or
+  `:unauthorized`.
   """
   @spec verify_client(Device.t(), map(), Authentication.Subject.t()) ::
           {:ok, Device.t()} | {:error, term()}
@@ -91,6 +95,9 @@ defmodule Portal.Devices do
   @doc """
   Revokes a client's verification. A client that is not verified is left as
   it is.
+
+  Returns `{:ok, client}` with the client as it is now unverified, or
+  `{:error, reason}`, for example `:unauthorized`.
   """
   @spec unverify_client(Device.t(), Authentication.Subject.t()) ::
           {:ok, Device.t()} | {:error, term()}
@@ -106,7 +113,12 @@ defmodule Portal.Devices do
     end)
   end
 
-  @doc "Lists the verifications of a client, most recent first."
+  @doc """
+  Lists the verifications of a client, most recent first.
+
+  Returns `{:ok, verifications, metadata}`, with the pagination metadata for
+  the page, or `{:error, reason}`, for example `:unauthorized`.
+  """
   @spec list_verifications(Device.t(), Authentication.Subject.t(), Keyword.t()) ::
           {:ok, [DeviceVerification.t()], Portal.Repo.Paginator.Metadata.t()} | {:error, term()}
   defdelegate list_verifications(client, subject, opts \\ []), to: Database

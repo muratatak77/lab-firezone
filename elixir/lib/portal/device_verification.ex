@@ -46,13 +46,18 @@ defmodule Portal.DeviceVerification do
 
   @doc """
   Casts the terms an admin verifies a device under: when the verification
-  expires, if ever, and a note on why the device was trusted.
+  expires, if ever, and a note on why the device was trusted. A blank note,
+  empty or only whitespace, counts as no note.
+
+  Returns the changeset, which is invalid when the expiry is not in the
+  future or the note is too long.
   """
   @spec terms_changeset(map(), DateTime.t()) :: Ecto.Changeset.t()
   def terms_changeset(attrs, %DateTime{} = now) do
     %__MODULE__{}
     |> cast(attrs, [:expires_at, :note])
     |> trim_change(:note)
+    |> blank_note_to_nil()
     |> validate_change(:expires_at, fn :expires_at, expires_at ->
       if DateTime.after?(expires_at, now), do: [], else: [expires_at: "must be in the future"]
     end)
@@ -78,10 +83,20 @@ defmodule Portal.DeviceVerification do
     )
   end
 
+  defp blank_note_to_nil(changeset) do
+    update_change(changeset, :note, fn
+      "" -> nil
+      note -> note
+    end)
+  end
+
   @doc """
   Where the verification stands at `now`. A verification that had already
   expired when it was revoked, for example because the device was verified
   again afterwards, counts as expired.
+
+  Returns `:active` while the verification is in effect, `:expired` once its
+  expiry has passed, and `:revoked` when it was revoked before expiring.
   """
   @spec status(t(), DateTime.t()) :: :active | :expired | :revoked
   def status(%__MODULE__{} = verification, now \\ DateTime.utc_now()) do
