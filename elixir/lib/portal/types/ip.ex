@@ -62,5 +62,3 @@ defmodule Portal.Types.IP do
 
   defp normalize(%Postgrex.INET{} = inet), do: inet
 end
-
-  # This note is indented, so the base branch fails its format check on its own.
