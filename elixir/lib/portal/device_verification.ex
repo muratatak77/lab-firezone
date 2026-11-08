@@ -4,8 +4,9 @@ defmodule Portal.DeviceVerification do
 
   A period ends when it is revoked, either by unverifying the device or by
   verifying it again on different terms, or when it expires on its own. The
-  device row carries the current period's `verified_at` and `expires_at`, which
-  is what policies are evaluated against.
+  device row carries the current period's `verified_at` and `expires_at`, as
+  `verified_at` and `verification_expires_at`, which is what policies are
+  evaluated against.
   """
   use Ecto.Schema
   import Ecto.Changeset

@@ -345,6 +345,16 @@ defmodule Portal.DevicesTest do
       assert is_nil(unverified.verified_at)
       assert verifications(client) == []
     end
+
+    test "returns a constraint violation as an error", %{client: client, subject: subject} do
+      # Another node's clock ran ahead, so revoking now would end the
+      # verification before it began.
+      verified_at = DateTime.add(DateTime.utc_now(), 1, :hour)
+      device_verification_fixture(client, verified_at: verified_at)
+
+      assert {:error, %Ecto.Changeset{} = changeset} = Devices.unverify_client(client, subject)
+      assert %{revoked_at: ["must not be before the verification started"]} = errors_on(changeset)
+    end
   end
 
   describe "list_verifications/3" do
